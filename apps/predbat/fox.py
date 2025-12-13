@@ -1387,7 +1387,7 @@ class FoxAPI(ComponentBase):
             if hasBattery and hasScheduler and capacity > 0:
                 batteries.append(sn.lower())
                 # Check if this battery inverter also has PV
-                if hasPV:
+                if hasPV and sn != "60KG103053QB033":
                     pvs.append(sn.lower())
 
         # Find any PV inverters without batteries when the battery doesn't see the PV
