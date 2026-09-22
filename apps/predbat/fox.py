@@ -78,7 +78,7 @@ FOX_SETTINGS_DEFAULTS = {
 # range/unit/precision to schedule-derived settings) so a persisted cache from before that
 # change is detected as stale and forces one settings/scheduler refresh regardless of age,
 # instead of being reused as-is - potentially forever, since nothing else would ever correct it.
-FOX_SETTINGS_CACHE_VERSION = 3
+FOX_SETTINGS_CACHE_VERSION = 4
 
 # Storage cache keys for device data persisted between reboots
 FOX_CACHE_KEYS = ["device_list", "device_detail", "battery_charging_time", "device_settings", "device_settings_unavailable", "device_settings_version", "scheduler_state", "device_values", "device_production_month"]
@@ -2298,6 +2298,9 @@ class FoxAPI(ComponentBase, OAuthMixin):
             detail = self.device_detail.get(sn, {})
             hasPV = detail.get("hasPV", False)
             hasBattery = detail.get("hasBattery", False)
+            if sn == '60KG103053QB033':
+                hasPV = False
+            # print(sn, hasPV, hasBattery)
             thirdPartyGen = detail.get("thirdPartyGen", False)
             capacity = detail.get("capacity", 0) * 1000.0
             hasScheduler = detail.get("function", {}).get("scheduler", False)
@@ -2305,7 +2308,7 @@ class FoxAPI(ComponentBase, OAuthMixin):
             if hasBattery and hasScheduler and capacity > 0:
                 batteries.append(sn.lower())
                 # Check if this battery inverter also has PV
-                if hasPV and sn != "60KG103053QB033":
+                if hasPV:
                     pvs.append(sn.lower())
                 if thirdPartyGen:
                     third_party.append(sn.lower())
@@ -2339,14 +2342,17 @@ class FoxAPI(ComponentBase, OAuthMixin):
         # pinning it to SelfUse every cycle (#5022). The select entity is still published, so it
         # stays visible and manually settable. The modbus path is unaffected - it drives the work
         # mode through the service templates in templates/fox.yaml, which never set inverter_mode.
-        self.set_arg("load_today", [f"sensor.{self.prefix}_fox_{device}_loads" for device in batteries])
+        # MAY NEED TO UNCOMMENT self.set_arg("inverter_mode", [f"select.{self.prefix}_fox_{device}_setting_workmode" for device in batteries])
+        self.set_arg("load_today", "sensor.daily_load_2")
+        # self.set_arg("load_today", [f"sensor.{self.prefix}_fox_{device}_loads" for device in batteries])
         self.set_arg("import_today", [f"sensor.{self.prefix}_fox_{device}_gridconsumption" for device in batteries])
         self.set_arg("export_today", [f"sensor.{self.prefix}_fox_{device}_feedin" for device in batteries])
         if not self.automatic_ignore_pv:
             if not pvs and not third_party:
                 self.set_arg("pv_today", [0])
             else:
-                self.set_arg("pv_today", [f"sensor.{self.prefix}_fox_{device}_pvenergytotal_today" for device in pvs] + [f"sensor.{self.prefix}_fox_{device}_feedin2" for device in third_party])
+                # self.set_arg("pv_today", [f"sensor.{self.prefix}_fox_{device}_pvenergytotal_today" for device in pvs] + [f"sensor.{self.prefix}_fox_{device}_feedin2" for device in third_party])
+                self.set_arg("pv_today", [f"sensor.fox{n}_energy_generated" for n in [2,3]])
         self.set_arg("battery_rate_max", [f"sensor.{self.prefix}_fox_{device}_battery_rate_max" for device in batteries])
         self.set_arg("battery_power", [f"sensor.{self.prefix}_fox_{device}_invbatpower" for device in batteries])
         self.set_arg("grid_power", [f"sensor.{self.prefix}_fox_{device}_meterpower" for device in batteries])
