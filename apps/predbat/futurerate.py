@@ -1,36 +1,64 @@
+"""Future energy rate prediction from Nord Pool and similar APIs.
+
+Fetches wholesale energy prices and calibrates them against actual retail
+tariff rates to predict future import/export prices beyond the current
+Octopus tariff period.
+"""
+
 from datetime import datetime, timedelta
 import requests
 import json
 import copy
 
-from config import TIME_FORMAT
+from const import TIME_FORMAT
+from ha import run_async
 from utils import dp1, dp2, minute_data
 
 TIME_FORMAT_NORD = "%d-%m-%YT%H:%M:%S%z"
 
 
 class FutureRate:
+    """Future energy rate prediction from Nord Pool wholesale prices.
+
+    Fetches wholesale prices and calibrates them against actual retail
+    rates to predict import/export prices beyond the current tariff period.
+    """
+
     def __init__(self, base):
         self.base = base
         self.record_status = base.record_status
         self.plan_interval_minutes = base.plan_interval_minutes
         self.log = base.log
         self.get_arg = base.get_arg
-        self.midnight = base.midnight
+        self.set_arg = base.set_arg
         self.midnight_utc = base.midnight_utc
         self.forecast_days = base.forecast_days
         self.minutes_now = base.minutes_now
         self.forecast_plan_hours = base.forecast_plan_hours
         self.time_abs_str = base.time_abs_str
-        self.futurerate_url_cache = base.futurerate_url_cache
+        self.get_state_wrapper = base.get_state_wrapper
+
+        self.storage = base.components.get_component("storage") if base.components else None
+        self.futurerate_url_cache = {}
+        if self.storage:
+            cached = run_async(self.storage.load("futurerate", "url_cache"))
+            if isinstance(cached, dict):
+                self.futurerate_url_cache = cached
+
+        futurerate_adjust_auto = self.get_arg("futurerate_adjust_auto", False)
+        if futurerate_adjust_auto:
+            import_agile, export_agile = self.import_export_is_agile()
+            # Change settings based on auto
+            self.set_arg("futurerate_adjust_import", import_agile)
+            self.set_arg("futurerate_adjust_export", export_agile)
 
     def futurerate_calibrate(self, real_mdata, mdata, is_import, peak_start_minutes, peak_end_minutes):
         """
         Calibrate nordpool data
         """
         if is_import:
-            best_diff_multiply = 2.0
-            best_diff_add_peak = 7
+            best_diff_multiply = 2.2
+            best_diff_add_peak = 12.0
             best_diff_add_all = 0
             mult_range = [x / 100 for x in range(180, 240, 2)]
         else:
@@ -140,6 +168,30 @@ class FutureRate:
 
         return calibrated_data
 
+    def import_export_is_agile(self):
+        # Figure out if we have Agile on import or export before deciding which to adjust
+        import_tariff = None
+        import_agile = False
+        import_entity = self.get_arg("metric_octopus_import", default=None, indirect=False)
+        if import_entity:
+            import_tariff = self.get_state_wrapper(import_entity, attribute="tariff")
+            if not import_tariff:
+                import_tariff = self.get_state_wrapper(import_entity, attribute="tariff_code")
+        if import_tariff and "agile" in import_tariff.lower():
+            import_agile = True
+
+        export_tariff = None
+        export_agile = False
+        export_entity = self.get_arg("metric_octopus_export", default=None, indirect=False)
+        if export_entity:
+            export_tariff = self.get_state_wrapper(export_entity, attribute="tariff")
+            if not export_tariff:
+                export_tariff = self.get_state_wrapper(export_entity, attribute="tariff_code")
+        if export_tariff and "agile" in export_tariff.lower():
+            export_agile = True
+        self.log("FutureRate: Detected import tariff {} agile {} export tariff {} agile {}".format(import_tariff, import_agile, export_tariff, export_agile))
+        return import_agile, export_agile
+
     def futurerate_analysis_new(self, url_template, rate_import_real, rate_export_real):
         """
         Convert new Futurerate data to minute data
@@ -178,9 +230,7 @@ class FutureRate:
             self.record_status("Warn: Error downloading futurerate data from cloud, no multiAreaEntries", debug=url, had_errors=True)
             return {}, {}
 
-        prev_time_date_start = None
         prev_time_date_end = None
-        prev_duration = 0
         prev_rate_import = 0
         prev_rate_export = 0
 
@@ -237,9 +287,7 @@ class FutureRate:
                     extracted_keys.append(time_date_start)
                     extracted_data[time_date_start] = item
 
-            prev_time_date_start = time_date_start
             prev_time_date_end = time_date_end
-            prev_duration = minutes_end - minutes_start
             prev_rate_import = rate_import
             prev_rate_export = rate_export
 
@@ -253,7 +301,6 @@ class FutureRate:
 
         adjust_import = self.get_arg("futurerate_adjust_import", False)
         adjust_export = self.get_arg("futurerate_adjust_export", False)
-
         mdata_import = self.futurerate_calibrate(rate_import_real if adjust_import else {}, mdata_import, is_import=True, peak_start_minutes=peak_start_minutes, peak_end_minutes=peak_end_minutes)
         mdata_export = self.futurerate_calibrate(rate_export_real if adjust_export else {}, mdata_export, is_import=False, peak_start_minutes=peak_start_minutes, peak_end_minutes=peak_end_minutes)
 
@@ -277,9 +324,13 @@ class FutureRate:
         if not url:
             return {}, {}
 
-        self.log("Fetching futurerate data from {}".format(url))
-
         if "DATE" in url:
+            import_agile = self.get_arg("futurerate_adjust_import", False)
+            export_agile = self.get_arg("futurerate_adjust_export", False)
+            if not import_agile and not export_agile:
+                self.log("FutureRate: No futurerate adjustment enabled, skipping futurerate analysis")
+                return {}, {}
+            self.log("Fetching futurerate data from {}".format(url))
             return self.futurerate_analysis_new(url, rate_import_real, rate_export_real)
         else:
             print("Warning: Old futurerate URL, you must update this in apps.yaml")
@@ -289,10 +340,13 @@ class FutureRate:
         """
         Clean up futurerate data
         """
+        # The host's naive clock, matching how the stamps below are written - and how they were
+        # written by earlier versions, whose cache is loaded back from storage on upgrade.
+        midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         current_keys = list(self.futurerate_url_cache.keys())
         for url in current_keys[:]:
             stamp = self.futurerate_url_cache[url]["stamp"]
-            if stamp < self.midnight:
+            if stamp < midnight:
                 del self.futurerate_url_cache[url]
 
     def download_futurerate_data(self, url):
@@ -305,11 +359,12 @@ class FutureRate:
 
         # Check the cache first
         now = datetime.now()
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
         if url in self.futurerate_url_cache:
             stamp = self.futurerate_url_cache[url]["stamp"]
             pdata = self.futurerate_url_cache[url]["data"]
-            update_time_since_midnight = stamp - self.midnight
-            now_since_midnight = now - self.midnight
+            update_time_since_midnight = stamp - midnight
+            now_since_midnight = now - midnight
             age = now - stamp
             needs_update = False
 
@@ -328,7 +383,7 @@ class FutureRate:
                 return pdata
 
         # Retry up to 3 minutes
-        for retry in range(3):
+        for _retry in range(3):
             pdata = self.download_futurerate_data_func(url)
             if pdata:
                 break
@@ -346,15 +401,17 @@ class FutureRate:
         if pdata == "empty":
             pdata = {}
 
-        # Cache New Octopus data
+        # Cache new futurerate data and persist to storage
         self.futurerate_url_cache[url] = {}
         self.futurerate_url_cache[url]["stamp"] = now
         self.futurerate_url_cache[url]["data"] = pdata
+        if self.storage:
+            run_async(self.storage.save("futurerate", "url_cache", self.futurerate_url_cache, format="yaml", expiry=None))
         return pdata
 
     def download_futurerate_data_func(self, url):
         try:
-            r = requests.get(url)
+            r = requests.get(url, timeout=120)
         except Exception as e:
             self.log("Warn: Error downloading futurerate data from URL {}, request exception {}".format(url, e))
             self.record_status("Warn: Error downloading futurerate data from cloud", debug=url, had_errors=True)

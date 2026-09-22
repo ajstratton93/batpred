@@ -1,6 +1,6 @@
 # -----------------------------------------------------------------------------
 # Predbat Home Battery System
-# Copyright Trefor Southwell 2024 - All Rights Reserved
+# Copyright Trefor Southwell 2026 - All Rights Reserved
 # This application maybe used for personal use only and not for commercial use
 # -----------------------------------------------------------------------------
 # fmt off
@@ -8,8 +8,10 @@
 # pylint: disable=line-too-long
 # pylint: disable=attribute-defined-outside-init
 
-from utils import calc_percent_limit
+import time
+
 from tests.test_infra import reset_rates, reset_inverter, update_rates_import, update_rates_export
+from tests.test_kernel_parity import kernel_available
 from prediction import Prediction
 from compare import Compare
 
@@ -17,12 +19,12 @@ from compare import Compare
 def run_optimise_all_windows(
     name,
     my_predbat,
-    charge_window_best=[],
-    export_window_best=[],
+    charge_window_best=None,
+    export_window_best=None,
     pv_amount=0,
     load_amount=0,
-    expect_charge_limit=[],
-    expect_export_limit=[],
+    expect_charge_limit=None,
+    expect_export_limit=None,
     expect_best_price=0.0,
     rate_import=10.0,
     rate_export=5.5,
@@ -34,6 +36,14 @@ def run_optimise_all_windows(
     best_soc_keep_weight=0.5,
     second_pass=False,
 ):
+    if expect_export_limit is None:
+        expect_export_limit = []
+    if expect_charge_limit is None:
+        expect_charge_limit = []
+    if export_window_best is None:
+        export_window_best = []
+    if charge_window_best is None:
+        charge_window_best = []
     print("Starting optimise all windows test {}".format(name))
     end_record = my_predbat.forecast_minutes
     failed = False
@@ -58,8 +68,24 @@ def run_optimise_all_windows(
     for minute in range(0, my_predbat.forecast_minutes, 5):
         pv_step[minute] = pv_amount / (60 / 5)
         load_step[minute] = load_amount / (60 / 5)
+    my_predbat.load_minutes_step = load_step
+    my_predbat.load_minutes_step10 = load_step
+    my_predbat.pv_forecast_minute_step = pv_step
+    my_predbat.pv_forecast_minute10_step = pv_step
     my_predbat.prediction = Prediction(my_predbat, pv_step, pv_step, load_step, load_step)
-    my_predbat.debug_enable = True
+
+    pv_step = {}
+    load_step = {}
+    for minute in range(0, my_predbat.forecast_minutes, 5):
+        pv_step[minute] = pv_amount / (60 / 5)
+        load_step[minute] = load_amount / (60 / 5)
+    my_predbat.prediction = Prediction(my_predbat, pv_step, pv_step, load_step, load_step)
+    # Debug is off so the Python engine and the C++ kernel run identical workloads (debug blocks kernel dispatch)
+    my_predbat.debug_enable = False
+
+    if getattr(my_predbat, "prediction_kernel_enable", False) and not getattr(my_predbat.prediction, "kernel_handle", 0):
+        print("ERROR: Test {} expected the C++ prediction kernel but it is not available".format(name))
+        return True
 
     charge_limit_best = [0 for n in range(len(charge_window_best))]
     export_limits_best = [100 for n in range(len(export_window_best))]
@@ -70,7 +96,6 @@ def run_optimise_all_windows(
     )
     # Save plan
     my_predbat.charge_limit_best = charge_limit_best
-    my_predbat.charge_limit_percent_best = calc_percent_limit(charge_limit_best, my_predbat.soc_max)
     my_predbat.export_limits_best = export_limits_best
     my_predbat.charge_window_best = charge_window_best
     my_predbat.export_window_best = export_window_best
@@ -89,7 +114,6 @@ def run_optimise_all_windows(
 
     # Save plan
     my_predbat.charge_limit_best = charge_limit_best
-    my_predbat.charge_limit_percent_best = calc_percent_limit(charge_limit_best, my_predbat.soc_max)
     my_predbat.export_limits_best = export_limits_best
     my_predbat.charge_window_best = charge_window_best
     my_predbat.export_window_best = export_window_best
@@ -123,9 +147,37 @@ def run_optimise_all_windows(
     return failed
 
 
-def run_optimise_all_windows_tests(my_predbat):
-    print("**** Running Optimise all windows tests ****")
+def run_optimise_all_windows_kernel_tests(my_predbat):
+    """Run the optimise all windows tests with the C++ kernel
+
+    Both runs must pass their normal assertions; the kernel run dispatches every supported
+    prediction to the C++ kernel. Returns True on failure.
+    """
+
+    available, required_failure = kernel_available()
+    failed = False
+    if available:
+        start = time.time()
+        failed |= run_optimise_all_windows_tests(my_predbat, prediction_kernel=True)
+        kernel_time = time.time() - start
+        print("Optimise all windows tests (C++ kernel) took {} seconds".format(round(kernel_time, 2)))
+    else:
+        start = time.time()
+        failed |= run_optimise_all_windows_tests(my_predbat)
+        python_time = time.time() - start
+        print("Optimise all windows tests (Python engine) took {} seconds".format(round(python_time, 2)))
+    return failed
+
+
+def run_optimise_all_windows_tests(my_predbat, prediction_kernel=False):
+    print("**** Running Optimise all windows tests{} ****".format(" (C++ prediction kernel enabled)" if prediction_kernel else ""))
     reset_inverter(my_predbat)
+    my_predbat.prediction_kernel_enable = prediction_kernel
+    # reset_rates() uses rate_scan(print=False) which deliberately skips the rate_min_forward
+    # recalculation, so a stale forward-min from a previous test (e.g. the Compare test's real
+    # tariffs) would leak into compute_metric's battery residual value and change the plan.
+    # Production is unaffected: fetch always ends with rate_scan(print=True) which recomputes it.
+    my_predbat.rate_min_forward = {}
     failed = False
 
     charge_window_best = [{"start": my_predbat.minutes_now, "end": my_predbat.minutes_now + 60, "average": 10.0}]
@@ -222,13 +274,13 @@ def run_optimise_all_windows_tests(my_predbat):
         return failed
 
     # Optimise charge limit
-    best_soc, best_metric, best_cost, best_soc_min, best_soc_min_minute, best_keep, best_cycle, best_carbon, best_import = my_predbat.optimise_charge_limit(
+    best_soc, best_metric, best_cost, best_soc_min, best_soc_min_minute, best_keep, best_cycle, best_carbon, best_import, best_metric_plan = my_predbat.optimise_charge_limit(
         0, len(expect_charge_limit), expect_charge_limit, charge_window_best, export_window_best, expect_export_limit, all_n=None, end_record=my_predbat.end_record
     )
     before_best_metric = best_metric
     my_predbat.isCharging = True
     my_predbat.isCharging_Target = 100
-    best_soc, best_metric, best_cost, best_soc_min, best_soc_min_minute, best_keep, best_cycle, best_carbon, best_import = my_predbat.optimise_charge_limit(
+    best_soc, best_metric, best_cost, best_soc_min, best_soc_min_minute, best_keep, best_cycle, best_carbon, best_import, best_metric_plan = my_predbat.optimise_charge_limit(
         0, len(expect_charge_limit), expect_charge_limit, charge_window_best, export_window_best, expect_export_limit, all_n=None, end_record=my_predbat.end_record
     )
 
@@ -273,8 +325,37 @@ def run_optimise_all_windows_tests(my_predbat):
         {"id": "double", "name": "Double Load", "config": {"load_scaling": 2.0}},
     ]
     my_predbat.args["compare_list"] = compare_tariffs
+
     compare = Compare(my_predbat)
+    # Use mock calculate plan here
+    orig_calculate_plan = my_predbat.calculate_plan
+    orig_run_prediction = my_predbat.run_prediction
+
+    # Create a mock function for calculate_plan with proper closure
+    def mock_calculate_plan_closure(recompute, debug_mode, publish):
+        # Mock out calculate plan to avoid actual calculation during tests
+        my_predbat.log("Mock calculate_plan called with recompute={}, debug_mode={}, publish={}".format(recompute, debug_mode, publish))
+        # Set minimal valid structures for comparison tests
+        my_predbat.charge_window_best = []
+        my_predbat.export_window_best = []
+        my_predbat.charge_limit_best = []
+        my_predbat.export_limits_best = []
+        # Mark plan as valid
+        my_predbat.plan_valid = True
+        return
+
+    # Create a mock function for run_prediction with proper closure
+    def mock_run_prediction_closure(*args, **kwargs):
+        # Mock out run_prediction to avoid actual prediction during tests
+        # Return dummy values in the expected format
+        # (metric, import_kwh_battery, import_kwh_house, export_kwh, soc_min, soc, soc_min_minute, battery_cycle, metric_keep, final_iboost, final_carbon_g)
+        return (100.0, 10.0, 20.0, 5.0, 10.0, 50.0, 0, 0.5, 0.0, 0.0, 0.0)
+
+    my_predbat.calculate_plan = mock_calculate_plan_closure
+    my_predbat.run_prediction = mock_run_prediction_closure
     compare.run_all(debug=True, fetch_sensor=False)
+    my_predbat.calculate_plan = orig_calculate_plan
+    my_predbat.run_prediction = orig_run_prediction
 
     results = compare.comparisons
     if len(results) != 2:
@@ -296,4 +377,5 @@ def run_optimise_all_windows_tests(my_predbat):
     #        print("ERROR: Expected result 1 cost to be 231.0 but got {}".format(result1['cost']))
     #        failed = True
 
+    my_predbat.prediction_kernel_enable = False
     return failed

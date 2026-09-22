@@ -1,7 +1,12 @@
-aiohttp
+aiofiles
+aiohttp>=3.12
+aiomqtt
 coverage
 matplotlib
+numpy==2.3.5
 pre-commit
+prometheus-client
+protobuf
 pyjwt
 pytz
 requests

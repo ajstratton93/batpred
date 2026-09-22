@@ -2,17 +2,20 @@
 
 Home battery prediction and automatic charging for Home Assistant supporting multiple inverters including:
 
-- GivEnergy Hybrid, AC and AIO
-- Solis
-- Solax
-- Sunsynk
+- Deye (Cloud)
+- Enphase (Cloud)
+- Fox (Local & Cloud)
+- GivEnergy Hybrid, AC, AIO and EMS (Local & Cloud)
 - Huawei
-- SolarEdge
-- Fox
-- Sofar
 - LuxPower
+- SolarEdge
+- Solax (Local & Cloud)
+- Solis Cloud
+- Sofar
 - Solar Assistant
+- Sunsynk
 - Sigenergy Sigenstor
+- Tesla Powerwall
 
 Also known by some as Batpred or Batman!
 
@@ -23,7 +26,7 @@ Also known by some as Batpred or Batman!
 Please see [License](https://github.com/springfall2008/batpred/blob/main/License.md)
 
 ```text
-Copyright (c) Trefor Southwell April 2025 - All rights reserved
+Copyright (c) Trefor Southwell 2025-2026 - All rights reserved
 This software may be used at no cost for personal use only
 No warranty is given, either expressed or implied
 ```
@@ -31,13 +34,27 @@ No warranty is given, either expressed or implied
 For support please raise a GitHub ticket or use the Facebook Group: [Predbat](https://www.facebook.com/groups/1477599886299106) and
 watch my [YouTube Channel](https://www.youtube.com/@springfall2008)
 
+- Use my referral code for Octopus Energy: <https://share.octopus.energy/jolly-eel-176>
+- Use my referral code for Axle Energy (UK): <https://vpp.axle.energy/landing/grid?ref=R-VWIICRSA>
+
 Some inverters have their own groups e.g.:
 
 - [GivTCP](https://www.facebook.com/groups/615579009972782)
 - [Solis](https://www.facebook.com/groups/288045168816481)
 
-If you want to buy me a beer then please use [Paypal](https://paypal.me/predbat?country.x=GB&locale.x=en_GB) or [Github sponsor](https://github.com/springfall2008)
+If you want to buy me a beer then please use [Paypal](https://paypal.me/predbat?country.x=GB&locale.x=en_GB) or [GitHub sponsor](https://github.com/springfall2008)
 ![image](https://github.com/springfall2008/batpred/assets/48591903/b3a533ef-0862-4e0b-b272-30e254f58467)
+
+If you are finding Home Assistant and Predbat too difficult to set up yourself there is now [PredBat Cloud](https://predbat.com/) which is a paid for version of Predbat hosted in the cloud.
+Please note that while I have given permission for PredBat Cloud to operate under license, PredBat will remain open source for personal use.
+
+## Not sure whether it is worth it yet?
+
+[What If](annual-prediction.md) projects a full year of electricity costs through the same
+planning engine, comparing no PV or battery against PV alone, PV with a battery on a
+timer, and PV with a battery run by Predbat — then works out the install cost and how long
+each takes to pay back. It needs no hardware and no configured Predbat, so you can try
+sizes and tariffs before buying anything.
 
 ## Taster
 
@@ -65,7 +82,7 @@ Power charts can show you how the prediction maps to your inverter:
 ![image](https://github.com/springfall2008/batpred/assets/48591903/a84c8de0-4f6a-48a6-81c8-09b0f7828563)
 
 You can model iBoost or similar solar diverters, this will be shown on your plan and you can even use it to trigger smart devices e.g.
-an emersion heater based on energy rates.
+an immersion heater based on energy rates.
 
 ![image](https://github.com/springfall2008/batpred/assets/48591903/758d380c-4cfa-4e92-b53a-167496bf888c)
 

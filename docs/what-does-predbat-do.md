@@ -6,18 +6,25 @@ It runs every 5 minutes and, by default, forecasts 48 hours ahead (configurable 
 with the plan typically covering at least 24 hours after the first charge slot (forecast_plan_hours).
 
 Predbat will automatically decide when to charge and discharge your battery to achieve the best (lowest) cost spend within the parameters you have set.
-It uses the solar production forecast from Solcast combined with your historical energy usage to make this prediction.
+It uses the solar production forecast from Solcast, Open-Meteo, or Forecast.solar combined with your historical energy usage to make this prediction.
 
 - The output is a prediction of the battery levels, solar generation, house load, charging activity, discharging activity, costs and import and export amounts based on (by default) 30-minute slots.
-- Costs are based on energy pricing data, either manually configured (e.g. 7p from 11pm-4pm and 35p otherwise) or by using the Octopus Energy integration
+- Costs are based on energy pricing data, either manually configured (e.g. 7p from 11pm-4pm and 35p otherwise) or taken from your supplier
+    - Octopus Energy, either directly through their API or via the Home Assistant integration.
+    - Kraken, for EDF and E.ON Next.
+    - Energidataservice and Strømligning for Denmark, Nordpool and other spot-rate sensors elsewhere - see [Energy rates](energy-rates.md).
     - Both import and export rates are supported.
-    - Intelligent Octopus is also supported and takes into account allocated charging slots.  
-- The solar forecast used is the central scenario from Solcast/Forecast.solar (50%) with a configurable weighting towards the more pessimistic (10%) scenario.
+    - Intelligent Octopus is also supported and takes into account allocated charging slots.
+    - [Axle VPP](energy-rates.md#axle-vpp) export events are supported, with Predbat standing aside for the duration of an event.
+- The solar forecast used is the central scenario from Solcast/Open-Meteo/Forecast.solar (50%) with a configurable weighting towards the more pessimistic (10%) scenario.
 - Predbat automatically programs your inverter with the appropriate charging and discharging controls. Both Hybrid inverters and AC-coupled inverters are supported by Predbat.
 - Automatic planning of export slots is also supported, when enabled Predbat can start a forced discharge of the battery if the export rates are high and you have spare capacity.
 - Historical load data is used to predict your consumption, optionally car charging load can be filtered out of this data.
 - Predbat can be configured to manage the charging of your EV or to use a Solar Diverter, and take into account these loads on the house during these periods.
 - Multiple inverter support is included but depends on all inverters running in lockstep.
+- Load can be predicted from your history, or by a [neural network trained on it](load-ml.md) that also learns time-of-day and day-of-week patterns.
+- [Compare](compare.md) prices your actual usage against different tariffs, so you can see whether switching would pay.
+- [What If](annual-prediction.md) projects a whole year under four scenarios — no PV or battery, PV only, PV and battery on a timer, and PV and battery with Predbat — and works out install costs and payback. It needs no hardware and no configured Predbat, so it answers "is this worth buying?" as well as "was mine worth it?".
 
 ## Terminology
 
@@ -44,6 +51,12 @@ The inverter also converts AC power from the grid into DC to charge a battery.
 - **Slot** - A period of time where Predbat acts e.g. charging. In Predbat everything is a multiple of 5 minutes
     - Charge slots are always in multiples of the [plan interval duration](energy-rates.md#plan-interval), default is 30 minutes, and align to the interval time boundaries to match the way energy rates are allocated
     - Discharge slots can be any multiple of 5 minutes and always finish on a plan interval (default 30-minute) boundary.
+- **Low-rate slot** - A time period where the import rate is below a threshold, making it suitable for charging.
+By default Predbat automatically calculates this threshold based on future import rates.
+You can adjust the threshold using **input_number.predbat_rate_low_threshold** (_expert mode_) - see [Battery margins and metrics options](customisation.md#battery-margins-and-metrics-options).
+- **High-rate slot** - A time period where the export rate is above a threshold, making it suitable for forced export.
+By default Predbat automatically calculates this threshold based on future export rates.
+You can adjust the threshold using **input_number.predbat_rate_high_threshold** (_expert mode_) - see [Battery margins and metrics options](customisation.md#battery-margins-and-metrics-options).
 - **Loss** - Refers to energy lost in your system due to heat or other factors.
 
 - **PV10** - A prediction of the 10% scenario for solar, this is like a worst case, occurs 1 in 10 days
@@ -97,6 +110,10 @@ If there is a shortfall of generated solar power to meet the house load, the bat
 - **Hold exporting** - The plan was to force export but the minimum battery level was reached and thus the battery is kept in Demand mode.
 If the battery level again gets above the threshold it will be changed back to Export mode.
 
+- **Cross-charging** - On a multi-inverter system, at least one inverter is in a charge-side state (Charging, Freeze charging or Hold charging) while another is in an export-side state (Exporting, Freeze exporting or Hold exporting) at the same time. This includes the case where both sides are merely holding at their target (e.g. Hold charging + Hold exporting), with no current actually flowing, not just active charging/exporting.
+This is shown explicitly rather than the headline status just reflecting whichever inverter was processed last, so real disagreement between inverters is visible instead of hidden.
+If inverters only disagree on sub-state within the same side (e.g. one still actively Charging while another has reached Hold charging), the most active sub-state is shown instead, since Cross-charging specifically means disagreement across the charge/export divide, not within one side.
+
 - **Hold for car** and **Demand, Hold for car** - A car is charging (either Predbat-led or Octopus-led), the battery is in Demand mode,
 but is set to prevent discharging into the car (requires **switch.predbat_car_charging_from_battery** to be set to On).
 
@@ -104,7 +121,9 @@ but is set to prevent discharging into the car (requires **switch.predbat_car_ch
 
 - **Read-Only** - Predbat is in [read-only mode](customisation.md#manual-control), the plan will be produced and updated but no instructions will be sent to the inverter to charge or discharge.
 
-- **[Alert]** will be appended to the Predbat status if an [Alert is active](apps-yaml.md#alert-system).
+- **Read-Only (Axle)** - Predbat is in [read-only mode for the duration of an Axle VPP export event](energy-rates.md#axle-vpp), and will automatically return to a normal execution mode at the end of the Axle event.
+
+- **[Alert]** will be appended to the Predbat status if an [Alert is active](apps-yaml.md#weather-alert-system).
 
 - **Calibration** - The inverter is calibrating the batteries.
 On GivEnergy systems the battery state of charge (SoC) level has to be calibrated by performing a full battery discharge and then a full charge

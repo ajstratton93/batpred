@@ -1,6 +1,6 @@
 # -----------------------------------------------------------------------------
 # Predbat Home Battery System
-# Copyright Trefor Southwell 2024 - All Rights Reserved
+# Copyright Trefor Southwell 2026 - All Rights Reserved
 # This application maybe used for personal use only and not for commercial use
 # -----------------------------------------------------------------------------
 # fmt off
@@ -47,6 +47,7 @@ def test_plugin_startup_order(my_predbat):
             test_predbat.expose_config = MagicMock()
             test_predbat.run_time_loop = MagicMock()
             test_predbat.ha_interface = MagicMock()
+            test_predbat.publish_last_started = MagicMock()
             test_predbat.prefix = "test"
             test_predbat.had_errors = False
             test_predbat.dashboard_index = []

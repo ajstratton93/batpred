@@ -1,6 +1,6 @@
 # -----------------------------------------------------------------------------
 # Predbat Home Battery System
-# Copyright Trefor Southwell 2024 - All Rights Reserved
+# Copyright Trefor Southwell 2026 - All Rights Reserved
 # This application maybe used for personal use only and not for commercial use
 # -----------------------------------------------------------------------------
 # fmt off
@@ -10,7 +10,19 @@
 # fmt on
 import time
 import requests
+import os
+import re
+import shutil
+import socket
+import tempfile
 from components import Components
+
+
+def _free_port():
+    """Ask the OS for a TCP port nobody is listening on."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
 
 
 def run_test_web_if(my_predbat):
@@ -19,46 +31,488 @@ def run_test_web_if(my_predbat):
     """
     failed = 0
     print("**** Running web interface test ****\n")
-    orig_ha_if = my_predbat.ha_interface
-    my_predbat.components = Components(my_predbat)
-    my_predbat.components.initialize()
-    my_predbat.components.start("ha_interface")
-    my_predbat.components.start("db")
-    my_predbat.components.start("web")
-    ha = my_predbat.ha_interface
 
-    # Fetch page from 127.0.0.1:5052
-    for page in ["/", "/dash", "/plan", "/config", "/apps", "/charts", "/compare", "/log", "/entity", "/components", "/browse"]:
-        print("Fetch page {}".format(page))
-        address = "http://127.0.0.1:5052" + page
-        res = requests.get(address)
+    # Create temp directory and copy apps.yaml
+    original_dir = os.getcwd()
+    temp_dir = tempfile.mkdtemp(prefix="predbat_test_")
+    print(f"Using temporary directory: {temp_dir}")
+
+    try:
+        # Copy apps.yaml to temp directory
+        if os.path.exists("apps.yaml"):
+            shutil.copy("apps.yaml", os.path.join(temp_dir, "apps.yaml"))
+        # Create dummy predbat.log
+        with open(os.path.join(temp_dir, "predbat.log"), "w") as f:
+            f.write("Predbat debug log\n")
+
+        # Change to temp directory
+        os.chdir(temp_dir)
+
+        orig_ha_if = my_predbat.ha_interface
+        # Listen on whatever port is free rather than the default: another test run, or a Predbat
+        # left running in a second session, would otherwise answer these requests instead
+        web_port = _free_port()
+        base_url = f"http://127.0.0.1:{web_port}"
+        print(f"Web interface test listening on {base_url}")
+        my_predbat.args["web_port"] = web_port
+        my_predbat.components = Components(my_predbat)
+        my_predbat.components.initialize()
+        my_predbat.components.start("ha_interface")
+        my_predbat.components.start("db")
+        my_predbat.components.start("web")
+        ha = my_predbat.ha_interface
+
+        # Inject fake credentials so we can verify live apps.yaml masking below. Two kinds:
+        # one the key-name substrings catch, and one only the component registry's "secret"
+        # flag catches - an account number reads like ordinary config, so before the flag
+        # existed this download served it in the clear.
+        my_predbat.args["octopus_api_key"] = "test_secret_value"
+        my_predbat.args["octopus_api_account"] = "test_account_number"
+
+        # Define all registered endpoints from web.py
+        # Format: (method, path)
+        all_endpoints = [
+            ("GET", "/"),
+            ("GET", "/plan"),
+            ("GET", "/log"),
+            ("GET", "/apps"),
+            ("POST", "/apps"),
+            ("GET", "/charts"),
+            ("GET", "/config"),
+            ("GET", "/entity"),
+            ("POST", "/entity"),
+            ("POST", "/config"),
+            ("GET", "/dash"),
+            ("POST", "/dash"),
+            ("GET", "/components"),
+            ("GET", "/component_entities"),
+            ("POST", "/component_restart"),
+            ("GET", "/component_config"),
+            ("POST", "/component_config_save"),
+            ("GET", "/debug_yaml"),
+            ("GET", "/debug_log"),
+            ("GET", "/debug_apps"),
+            ("GET", "/debug_apps_live"),
+            ("GET", "/debug_plan"),
+            ("GET", "/compare"),
+            ("POST", "/compare"),
+            ("GET", "/apps_editor"),
+            ("POST", "/apps_editor"),
+            ("GET", "/apps_editor_checksum"),
+            ("POST", "/plan_override"),
+            ("POST", "/rate_override"),
+            ("POST", "/restart"),
+            ("POST", "/inverter_refresh"),
+            ("GET", "/api/state"),
+            ("GET", "/api/ping"),
+            ("POST", "/api/state"),
+            ("POST", "/api/service"),
+            ("GET", "/api/log"),
+            ("GET", "/api/entities"),
+            ("POST", "/api/login"),
+            ("GET", "/browse"),
+            ("GET", "/download"),
+            ("GET", "/internals"),
+            ("GET", "/api/internals"),
+            ("GET", "/api/internals/download"),
+            ("GET", "/api/status"),
+            ("GET", "/metrics"),
+            ("GET", "/metrics/json"),
+            ("GET", "/metrics_dashboard"),
+        ]
+
+        # Track accessed endpoints
+        accessed_endpoints = set()
+
+        # Fetch all GET pages from the test's web port
+        for method, page in all_endpoints:
+            if method != "GET":
+                continue
+            print("Fetch page {}".format(page))
+            address = base_url + page
+
+            # Add required parameters for endpoints that need them
+            params = {}
+            if page == "/component_config":
+                params = {"component_name": "web"}
+            elif page == "/download":
+                params = {"file": "apps.yaml"}
+
+            if params:
+                res = requests.get(address, params=params)
+            else:
+                res = requests.get(address)
+
+            # /api/ping returns 500 when Predbat isn't fully initialised (expected in test)
+            # /metrics and /metrics/json return 503 when prometheus_client is not installed
+            # Other endpoints may return 400 for missing optional params, which is fine
+            acceptable_statuses = [200]
+            if page == "/api/ping":
+                acceptable_statuses.append(500)
+            if page in ("/metrics", "/metrics/json"):
+                acceptable_statuses.append(503)
+            if res.status_code in acceptable_statuses:
+                accessed_endpoints.add(("GET", page))
+            else:
+                print("ERROR: Unexpected status from {} got {} value {}".format(address, res.status_code, res.text))
+                failed = 1
+
+        # A component that failed to load shows on /components as an error, with its reason, and is
+        # not hidden with the disabled ones - otherwise a configured component would silently vanish
+        print("Test GET /components with a component that could not be loaded")
+        address = base_url + "/components"
+
+        def _error_total(page):
+            """The error count from the page's totals line (other components may already be in error here)."""
+            match = re.search(r"(\d+) Error</span>", page)
+            return int(match.group(1)) if match else None
+
+        before = _error_total(requests.get(address).text)
+        # Stand the db component down for one request, as if its module had failed to import
+        db_component = my_predbat.components.components["db"]
+        my_predbat.components.components["db"] = None
+        my_predbat.components.component_errors["db"] = "No module named 'google.protobuf' <unloaded>"
+        try:
+            res = requests.get(address)
+        finally:
+            my_predbat.components.component_errors.pop("db", None)
+            my_predbat.components.components["db"] = db_component
+        page = res.text
+        after = _error_total(page)
         if res.status_code != 200:
-            print("ERROR: Failed to fetch from page {} got status {} value {}".format(address, res.status_code, res.text))
+            print("ERROR: /components with a load error returned {}".format(res.status_code))
+            failed = 1
+        elif before is None or after != before + 1:
+            print("ERROR: /components counted {} errors with a component that failed to load, expected {}".format(after, before + 1 if before is not None else "?"))
+            failed = 1
+        elif "No module named &#x27;google.protobuf&#x27; &lt;unloaded&gt;" not in page:
+            print("ERROR: /components did not show the escaped load error")
+            failed = 1
+        elif '<div class="component-card error" data-disabled="false">' not in page:
+            print("ERROR: /components did not render the component that failed to load as an error card")
+            failed = 1
+        cleared = requests.get(address).text
+        if _error_total(cleared) != before or "google.protobuf" in cleared:
+            print("ERROR: /components still reported the cleared load error")
             failed = 1
 
-    # Perform a post to /compare page with data for form 'compareform' value 'run'
-    print("**** Running test: Fetch page /compare with post")
+        # Test POST endpoints
+        print("\n**** Testing POST endpoints ****")
 
-    address = "http://127.0.0.1:5052/compare"
-    data = {"run": "run"}
-    res = requests.post(address, data=data)
-    if res.status_code != 200:
-        print("ERROR: Failed to post to pagepage {} got status {} value {}".format(address, res.status_code, res.text))
-        failed = 1
-    time.sleep(0.1)
-    # Get service data
-    entity_id = "switch.predbat_compare_active"
-    result = ha.get_state(entity_id)
+        # Test /compare POST
+        print("Test POST /compare")
+        address = base_url + "/compare"
+        data = {"run": "run"}
+        res = requests.post(address, data=data)
+        if res.status_code != 200:
+            print("ERROR: Failed to post to /compare got status {} value {}".format(res.status_code, res.text))
+            failed = 1
+        else:
+            accessed_endpoints.add(("POST", "/compare"))
 
-    if result != "on":
-        print("ERROR: Compare tariffs not triggered - expected {} got {}".format("on", result))
-        failed = 1
+        time.sleep(0.1)
 
-    # Run stop as task as we need to await it
-    my_predbat.create_task(my_predbat.components.stop("ha_interface"))
-    my_predbat.create_task(my_predbat.components.stop("web"))
-    my_predbat.create_task(my_predbat.components.stop("db"))
-    time.sleep(0.1)
-    my_predbat.components = Components(my_predbat)
-    my_predbat.ha_interface = orig_ha_if
+        # Test /api/state POST
+        print("Test POST /api/state")
+        address = base_url + "/api/state"
+        data = {"entity_id": "sensor.predbat_status", "state": "Idle"}
+        res = requests.post(address, json=data)
+        # Accept 200 (success) or 500 (entity doesn't exist in test)
+        if res.status_code in [200, 500]:
+            accessed_endpoints.add(("POST", "/api/state"))
+        else:
+            print("ERROR: Unexpected response from /api/state: {} - {}".format(res.status_code, res.text))
+            failed = 1
+
+        # Test /api/service POST
+        print("Test POST /api/service")
+        address = base_url + "/api/service"
+        # Correct format: service field should be full service name like "switch.turn_on"
+        data = {"service": "switch/turn_on", "data": {"entity_id": "switch.predbat_active"}}
+        res = requests.post(address, json=data)
+        if res.status_code in [200]:  # May fail if service doesn't exist in test
+            accessed_endpoints.add(("POST", "/api/service"))
+        else:
+            print("ERROR: Unexpected response from /api/service: {} - {}".format(res.status_code, res.text))
+            failed = 1
+
+        # Test /config POST
+        print("Test POST /config")
+        address = base_url + "/config"
+        data = {"set_read_only": "true"}
+        res = requests.post(address, data=data)
+        if res.status_code in [200]:  # Redirects are OK
+            accessed_endpoints.add(("POST", "/config"))
+        else:
+            print("ERROR: Unexpected response from /config: {} - {}".format(res.status_code, res.text))
+            failed = 1
+
+        # Test /dash POST
+        print("Test POST /dash")
+        address = base_url + "/dash"
+        data = {"mode": "Monitor"}
+        res = requests.post(address, data=data)
+        if res.status_code in [200]:
+            accessed_endpoints.add(("POST", "/dash"))
+        else:
+            print("ERROR: Unexpected response from /dash: {} - {}".format(res.status_code, res.text))
+            failed = 1
+
+        # Test /entity POST
+        print("Test POST /entity")
+        address = base_url + "/entity"
+        data = {"entity_id": "switch.predbat_active", "value": "on"}
+        res = requests.post(address, data=data)
+        if res.status_code in [200]:
+            accessed_endpoints.add(("POST", "/entity"))
+        else:
+            print("ERROR: Unexpected response from /entity: {} - {}".format(res.status_code, res.text))
+            failed = 1
+
+        # Test /apps POST
+        print("Test POST /apps")
+        address = base_url + "/apps"
+        data = {"apps_content": "test: value"}
+        res = requests.post(address, data=data)
+        if res.status_code in [200]:
+            accessed_endpoints.add(("POST", "/apps"))
+        else:
+            print("ERROR: Unexpected response from /apps: {} - {}".format(res.status_code, res.text))
+            failed = 1
+
+        # Test /apps_editor POST
+        print("Test POST /apps_editor")
+        address = base_url + "/apps_editor"
+        data = {"dummy": "data"}
+        res = requests.post(address, data=data)
+        if res.status_code in [200]:
+            accessed_endpoints.add(("POST", "/apps_editor"))
+        else:
+            print("ERROR: Unexpected response from /apps_editor: {} - {}".format(res.status_code, res.text))
+            failed = 1
+
+        # Test /plan_override POST
+        print("Test POST /plan_override")
+        address = base_url + "/plan_override"
+        data = {"time": "00:00", "action": "Clear"}
+        res = requests.post(address, data=data)
+        if res.status_code in [200]:
+            accessed_endpoints.add(("POST", "/plan_override"))
+        else:
+            print("ERROR: Unexpected response from /plan_override: {} - {}".format(res.status_code, res.text))
+            failed = 1
+
+        # Test /rate_override POST
+        print("Test POST /rate_override")
+        address = base_url + "/rate_override"
+        data = {"time": "00:00", "rate": "15", "action": "Clear SOC"}
+        res = requests.post(address, data=data)
+        if res.status_code in [200]:
+            accessed_endpoints.add(("POST", "/rate_override"))
+        else:
+            print("ERROR: Unexpected response from /rate_override: {} - {}".format(res.status_code, res.text))
+            failed = 1
+
+        # Test /restart POST
+        print("Test POST /restart")
+        address = base_url + "/restart"
+        res = requests.post(address, data={})
+        if res.status_code in [200]:
+            accessed_endpoints.add(("POST", "/restart"))
+        else:
+            print("ERROR: Unexpected response from /restart: {} - {}".format(res.status_code, res.text))
+            failed = 1
+
+        # Test /inverter_refresh POST
+        print("Test POST /inverter_refresh")
+        address = base_url + "/inverter_refresh"
+        my_predbat.inverter_data_last_fetch = "sentinel"  # Set to something non-None first
+        res = requests.post(address, data={})
+        if res.status_code in [200]:
+            accessed_endpoints.add(("POST", "/inverter_refresh"))
+            if my_predbat.inverter_data_last_fetch is not None:
+                print("ERROR: /inverter_refresh did not reset inverter_data_last_fetch to None")
+                failed = 1
+        else:
+            print("ERROR: Unexpected response from /inverter_refresh: {} - {}".format(res.status_code, res.text))
+            failed = 1
+
+        # Test /component_restart POST
+        print("Test POST /component_restart")
+        address = base_url + "/component_restart"
+        data = {"component": "db"}
+        res = requests.post(address, data=data)
+        if res.status_code in [200]:
+            accessed_endpoints.add(("POST", "/component_restart"))
+        else:
+            print("ERROR: Unexpected response from /component_restart: {} - {}".format(res.status_code, res.text))
+            failed = 1
+
+        # Test /component_config_save POST
+        print("Test POST /component_config_save")
+        address = base_url + "/component_config_save"
+        # Correct format: JSON with component_name, changes, deletions
+        data = {"component_name": "web", "changes": {}, "deletions": []}
+        res = requests.post(address, json=data)
+        if res.status_code in [200]:  # May fail if component doesn't support config changes
+            accessed_endpoints.add(("POST", "/component_config_save"))
+        else:
+            print("ERROR: Unexpected response from /component_config_save: {} - {}".format(res.status_code, res.text))
+            failed = 1
+
+        # Test /api/login POST
+        print("Test POST /api/login")
+        address = base_url + "/api/login"
+        data = {"token": "invalid_token"}
+        res = requests.post(address, json=data)
+        if res.status_code in [200]:  # Expect auth failure
+            accessed_endpoints.add(("POST", "/api/login"))
+        else:
+            print("ERROR: Unexpected response from /api/login: {} - {}".format(res.status_code, res.text))
+            failed = 1
+
+        print("\n**** Verifying compare tariffs functionality ****")
+        time.sleep(0.1)
+        # Get service data
+        entity_id = "switch.predbat_compare_active"
+        result = ha.get_state(entity_id)
+
+        if result != "on":
+            print("ERROR: Compare tariffs not triggered - expected {} got {}".format("on", result))
+            failed = 1
+
+        print("\n**** Verifying live apps.yaml masking ****")
+        # A bare request (no masked param) must default to masked - a direct/copied URL
+        # should never leak credentials without an explicit opt-in.
+        res = requests.get(base_url + "/debug_apps_live")
+        if res.status_code != 200 or "test_secret_value" in res.text or "xxx" not in res.text:
+            print("ERROR: Default /debug_apps_live request was not masked")
+            failed = 1
+        if "test_account_number" in res.text:
+            print("ERROR: Default /debug_apps_live request served a registry-flagged account number in the clear")
+            failed = 1
+
+        res = requests.get(base_url + "/debug_apps_live", params={"masked": "0"})
+        if res.status_code != 200 or "test_secret_value" not in res.text:
+            print("ERROR: Unmasked /debug_apps_live (masked=0) did not contain the expected credential value")
+            failed = 1
+        if "test_account_number" not in res.text:
+            print("ERROR: Unmasked /debug_apps_live (masked=0) dropped the account number - the opt-out must still return everything")
+            failed = 1
+
+        res = requests.get(base_url + "/debug_apps_live", params={"masked": "1"})
+        if res.status_code != 200 or "test_secret_value" in res.text or "xxx" not in res.text:
+            print("ERROR: Masked /debug_apps_live did not redact the expected credential value")
+            failed = 1
+        # The registry flag has to reach this route too, not just the debug yaml and MCP.
+        if "test_account_number" in res.text:
+            print("ERROR: Masked /debug_apps_live did not redact the registry-flagged account number")
+            failed = 1
+
+        # The file download sits next to the live one and is what people attach to bug reports,
+        # so a bare request must be redacted too - it used to serve apps.yaml verbatim.
+        # The credentials go into the file on disk, not just my_predbat.args: this route serves
+        # the file, and the shipped test apps.yaml has no credential in it, so comparing raw
+        # against redacted text would pass whether or not anything was actually redacted.
+        print("\n**** Verifying apps.yaml file download masking ****")
+        with open("apps.yaml", "a") as handle:
+            handle.write("\n  solcast_api_key: FILE-CREDENTIAL-VALUE\n  octopus_api_account: FILE-ACCOUNT-NUMBER\n")
+
+        res = requests.get(base_url + "/debug_apps")
+        if res.status_code != 200:
+            print("ERROR: Default /debug_apps request failed: {}".format(res.status_code))
+            failed = 1
+        else:
+            if "FILE-CREDENTIAL-VALUE" in res.text:
+                print("ERROR: Default /debug_apps served a credential from the file in the clear")
+                failed = 1
+            # The registry flag has to reach the file download too, not just the live one.
+            if "FILE-ACCOUNT-NUMBER" in res.text:
+                print("ERROR: Default /debug_apps served a registry-flagged account number in the clear")
+                failed = 1
+            if "xxx" not in res.text:
+                print("ERROR: Default /debug_apps returned no redaction marker at all")
+                failed = 1
+            # Redacting the text rather than the parsed args is the point - the download should
+            # still read like the user's own file.
+            if "module: predbat" not in res.text:
+                print("ERROR: /debug_apps no longer returns the user's apps.yaml content")
+                failed = 1
+
+        res = requests.get(base_url + "/debug_apps", params={"masked": "0"})
+        if res.status_code != 200:
+            print("ERROR: Unmasked /debug_apps (masked=0) failed: {}".format(res.status_code))
+            failed = 1
+        elif "FILE-CREDENTIAL-VALUE" not in res.text or "FILE-ACCOUNT-NUMBER" not in res.text:
+            print("ERROR: Unmasked /debug_apps (masked=0) did not return the file as written")
+            failed = 1
+
+        # The editor is deliberately NOT masked, on both halves. It shows the real file so a
+        # credential can be edited at all, and it writes back exactly what was submitted - if
+        # redaction ever leaked into this path it would save 'xxx' over the user's real
+        # credentials the first time they touched an unrelated setting. Downloads redact;
+        # the editor must not.
+        print("\n**** Verifying the apps.yaml editor is not masked ****")
+        res = requests.get(base_url + "/apps_editor")
+        if res.status_code != 200:
+            print("ERROR: /apps_editor request failed: {}".format(res.status_code))
+            failed = 1
+        else:
+            if "FILE-CREDENTIAL-VALUE" not in res.text or "FILE-ACCOUNT-NUMBER" not in res.text:
+                print("ERROR: /apps_editor masked a credential - the user cannot edit what it will not show them")
+                failed = 1
+
+        editor_content = "pred_bat:\n  module: predbat\n  class: PredBat\n  solcast_api_key: EDITOR-WRITTEN-KEY\n  octopus_api_account: EDITOR-WRITTEN-ACCOUNT\n"
+        res = requests.post(base_url + "/apps_editor", data={"apps_content": editor_content})
+        if res.status_code != 200:
+            print("ERROR: /apps_editor save failed: {}".format(res.status_code))
+            failed = 1
+        else:
+            with open("apps.yaml", "r") as handle:
+                written = handle.read()
+            if "EDITOR-WRITTEN-KEY" not in written or "EDITOR-WRITTEN-ACCOUNT" not in written:
+                print("ERROR: /apps_editor did not write the submitted credentials verbatim:\n{}".format(written))
+                failed = 1
+            if "xxx" in written:
+                print("ERROR: /apps_editor wrote a redaction marker into apps.yaml, destroying real credentials")
+                failed = 1
+
+        # Check endpoint coverage
+        print("\n**** Checking endpoint coverage ****")
+        untested_endpoints = []
+        for endpoint in all_endpoints:
+            if endpoint not in accessed_endpoints:
+                untested_endpoints.append(endpoint)
+
+        if untested_endpoints:
+            print("\nWARNING: The following endpoints were not tested:")
+            for method, path in sorted(untested_endpoints):
+                print(f"  {method:6s} {path}")
+            print(f"\nTotal: {len(untested_endpoints)} untested endpoints out of {len(all_endpoints)}")
+            print(f"Coverage: {len(accessed_endpoints)}/{len(all_endpoints)} ({100*len(accessed_endpoints)//len(all_endpoints)}%)")
+            failed = 1
+        else:
+            if failed == 0:
+                print("\nSUCCESS: All endpoints were tested successfully!")
+            else:
+                print("\nFAILED: All endpoints were accessed but some tests failed. Please review the errors above.")
+
+        # Run stop as task as we need to await it
+        my_predbat.create_task(my_predbat.components.stop("ha_interface"))
+        my_predbat.create_task(my_predbat.components.stop("web"))
+        my_predbat.create_task(my_predbat.components.stop("db"))
+        my_predbat.args.pop("web_port", None)
+        time.sleep(0.1)
+        my_predbat.components = Components(my_predbat)
+        my_predbat.ha_interface = orig_ha_if
+
+    finally:
+        # Clean up: return to original directory and remove temp dir
+        os.chdir(original_dir)
+        try:
+            shutil.rmtree(temp_dir)
+            print(f"\nCleaned up temporary directory: {temp_dir}")
+        except Exception as e:
+            print(f"\nWarning: Failed to clean up temp directory {temp_dir}: {e}")
+
     return failed

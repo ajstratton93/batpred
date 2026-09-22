@@ -18,23 +18,76 @@ add comments or approve it.
 
 ## Unit level testing
 
-Note you will need to install python_matplotlib (e.g. brew install python_matplotlib or pip install matplotlib)
-
 Predbat now has some unit-level tests, to run them on your local machine:
 
 1. Create a test directory somewhere
 2. Copy `apps.yaml` to your test area
 3. Copy the files from github <https://github.com/springfall2008/batpred/tree/main/coverage> to this area
 4. Extract cases.tgz
-5. Have /Volumes/add_configs/6adb4f0d_predbat point to your Predbat add-on directory or edit run_all to change the path
+5. Have /Volumes/app_configs/6adb4f0d_predbat point to your Predbat app directory or edit run_all to change the path
 6. Run run_all
 
-If the tests fail then debug them.
+You can add --quick to run just the faster tests. If the tests fail then debug them.
 
-For coverage analysis installed the 'coverage' library with Python
+When a model scenario fails, a plot of its SoC and metric is written to `<scenario_name>.png` in the working directory. Add `--plot` to also open that plot on screen. It's off by default because displaying it blocks until you close the window, which would stall an unattended or CI run - a failing test would look like a hang rather than reporting the failure.
 
-1. run run_cov
+For coverage analysis install the 'coverage' library with Python, or use the version installed from `requirements.txt`.
+
+1. ./run_cov --quick
 2. Open `htmlcov/index.html` in your web browser
+
+### Finding test order dependencies
+
+All tests run against one shared `PredBat`/Home Assistant fixture (see `create_predbat()` in `unit_test.py`), so a test that mutates shared state and doesn't fully restore it can make a *later* test fail - a bug in the test suite itself, not in Predbat (see issue [#5079](https://github.com/springfall2008/batpred/issues/5079)). These only show up when the two tests happen to run in that order, so a clean `./run_all` doesn't prove there isn't one lurking.
+
+`./run_shuffle` fuzzes the test order looking for these:
+
+- `./run_shuffle --hunt --quick` - one-liner: keep trying shuffled orderings until a failure is found, narrow it down to the minimal pair of tests that reproduces it, print that repro command, and record the pair in `tools/shuffle_fuzz_known_pairs.txt` so the next run looks for a *different* one instead of rediscovering the same pair. This is the normal way to run it.
+- `./run_all --shuffle [--shuffle-seed N]` - run the full suite (or whatever `--test`/`-k` selects) in a random order directly, without the fuzzing wrapper. Useful for a one-off check or replaying a specific `--shuffle-seed` a `--hunt` run reported.
+- `./run_shuffle --bisect <SHUFFLE_SEED>` - given a shuffle-seed that's known to fail, narrow down which earlier test caused it, without hunting for a new one.
+- `./run_shuffle --campaign N` - repeat hunt-and-bisect for `N` independent rounds and print a frequency table of which (culprit, victim) pairs recur, to tell a common leak apart from a one-off ordering artefact.
+
+A found pair only proves shared state leaked between two tests - it doesn't say by itself whether the fix belongs in the culprit test's cleanup, or whether it exposed a real gap in the production code the victim test exercises (e.g. a missing bounds check that would also matter outside of tests). Check both before assuming it's "just" a test hygiene issue.
+
+This is too slow for a per-commit CI gate (each hunt attempt is a full shuffled suite run, and a failure needs a further round of bisection on top), but cheap to run periodically or before a release.
+
+## The C++ prediction kernel
+
+Predbat has an experimental compiled C++ "kernel" (`apps/predbat/prediction_kernel.cpp`) that is a fast, bit-for-bit-identical mirror of the Python simulation engine (`Prediction.run_prediction()` in `apps/predbat/prediction.py`). It's used to speed up the huge number of scenario evaluations run during planning. It's controlled by the `prediction_kernel_enable` `apps.yaml` setting (see [apps-yaml.md](apps-yaml.md#prediction_kernel_enable)), Off by default while it's tested more widely.
+
+### Building it locally
+
+You don't need a compiler to run Predbat or the normal test suite - if no compiled kernel is present, Predbat transparently falls back to the Python engine.
+
+To build a kernel for your own machine (for local testing):
+
+```bash
+bash apps/predbat/build_kernel.sh
+```
+
+This produces `apps/predbat/prediction_kernel_lib.so`, built with `g++`/`clang`, no external dependencies. It's not committed to the repository (see `.gitignore`).
+
+Predbat also ships pre-built binaries for each supported platform/architecture (`apps/predbat/prediction_kernel_lib_<arch>.so`), which **are** committed to the repository so they're delivered by Predbat's self-update mechanism. These are produced by a separate cross-compilation script using [zig](https://ziglang.org/) as the toolchain:
+
+```bash
+bash apps/predbat/build_kernel_cross.sh
+```
+
+A GitHub Actions job (`kernel-binaries` in `.github/workflows/code-quality.yml`) runs this automatically on every pull request and commits any changed binaries back to the PR branch - similar to how `pre-commit.ci` auto-fixes formatting issues. You shouldn't normally need to run the cross-build script yourself.
+
+### Testing the kernel
+
+Three test targets exercise the kernel:
+
+- `./run_all --test kernel_parity` - dual-runs a large set of deterministic edge cases and seeded random scenarios through both engines and asserts the results match to within `1e-6`
+- `./run_all --test model_kernel` - runs the standard model test suite (`./run_all --test model`) with the kernel enabled
+- `./run_all --test optimise_windows_kernel` - runs the optimiser test suite with and without the kernel, checking results match and reporting the speedup
+
+These automatically build a local kernel via `build_kernel.sh` if one isn't already present, and skip (or fail, if `PREDBAT_KERNEL_REQUIRED=1` is set, as it is in CI) if the build fails.
+
+### Keeping the two engines in sync
+
+**This is important:** if you change the behaviour of the hot loop in `Prediction.run_prediction()`, you must mirror the change in `prediction_kernel.cpp`, and bump both `KERNEL_PARITY_REVISION` (in `apps/predbat/prediction_kernel.py`) and `PK_PARITY_REVISION` (in `apps/predbat/prediction_kernel.cpp`). This isn't just good practice - it's enforced: the two revision numbers are checked when the kernel loads, and a mismatch disables the kernel (falling back to Python) rather than risking silently divergent results. Run `./run_all --test kernel_parity` before submitting any change to `prediction.py`'s simulation loop.
 
 ## Editing the code
 
@@ -150,8 +203,8 @@ and creating HTML files from those files. `mkdocs` can be used locally for previ
 but is also used as part of the documentation build process that publishes
 the official documentation site.
 
-The publishing of the documentation is triggered by a GitHub action,
-as defined in `.github/workflows/main.yml`.
+The publishing of the documentation is triggered by a GitHub action when a release is published,
+as defined in `.github/workflows/publish-docs.yml`.
 
 In short, after configuring the build environment, `mkdocs` builds the
 site then pushes the HTML produced to the `gh-pages` branch,
@@ -274,7 +327,7 @@ again (still unstaged).
 Running `pre-commit` automatically:
 
 - If you run `pre-commit install` in a terminal window it will install a pre-commit hook -
-this is a file which tells `git` to run some code for each type you do a
+this is a file which tells `git` to run some code each time you do a
 particular action (a pre-commit hook runs at the start of processing
 a commit, but there are other hooks e.g. pre-push).
 
@@ -288,11 +341,11 @@ automated checks that it will do on commits.
 #### Running the checks from within GitHub
 
 When commits are done on pull requests, and in any other scenarios
-added to the `on` section of`.github/workflows/linting.yml`,
+added to the `on` section of `.github/workflows/code-quality.yml`,
 the GitHub Actions in that file will run.
 
 In particular, the [pre-commit.ci lite](https://pre-commit.ci/lite.html)
-action will run. This uses the code [here](https://github.com/pre-commit-ci/lite-action)
+action will run. This uses the [pre-commit code](https://github.com/pre-commit-ci/lite-action)
 to run the same checks that get run locally
 (as described in the `.pre-commit-config.yaml` file).
 

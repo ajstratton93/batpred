@@ -1,6 +1,6 @@
 # -----------------------------------------------------------------------------
 # Predbat Home Battery System
-# Copyright Trefor Southwell 2025 - All Rights Reserved
+# Copyright Trefor Southwell 2026 - All Rights Reserved
 # This application maybe used for personal use only and not for commercial use
 # -----------------------------------------------------------------------------
 # fmt off
@@ -8,10 +8,173 @@
 # pylint: disable=line-too-long
 # pylint: disable=attribute-defined-outside-init
 
-from datetime import datetime, timedelta
-from prediction import wrapped_run_prediction_single, Prediction
+from datetime import datetime, timedelta, timezone
+from utils import unpack_export_limit
+from const import PREDBAT_MAX_CARS, MINUTE_WATT
+from prediction import Prediction
+import sys
+import matplotlib
+
+# Force the non-interactive Agg backend unless --plot was passed; otherwise merely importing
+# pyplot activates a GUI backend (bouncing the dock icon on macOS) even though plt.show() is
+# normally gated behind PLOT_ENABLED and not called in typical runs. Checked against sys.argv
+# directly since this import runs before argparse.
+if "--plot" not in sys.argv:
+    matplotlib.use("Agg")
 from matplotlib import pyplot as plt
+import asyncio
 import numpy as np
+from unittest.mock import MagicMock
+
+# Whether a failure plot is displayed on screen as well as written to a PNG. Off by default and
+# turned on by the harness --plot flag: plt.show() blocks until the window is closed, so leaving
+# it on makes a failing run hang rather than report.
+PLOT_ENABLED = False
+
+
+def set_plot_enabled(enabled):
+    """
+    Enable or disable on-screen display of failure plots
+    """
+    global PLOT_ENABLED
+    PLOT_ENABLED = bool(enabled)
+
+
+def run_async(coro):
+    """Helper function to run async coroutines in sync test functions"""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
+
+
+def create_aiohttp_mock_response(status=200, json_data=None, json_exception=None):
+    """Create a mock aiohttp response object"""
+    mock_response = MagicMock()
+    mock_response.status = status
+
+    if json_exception:
+        # If a JSON exception is explicitly provided
+        async def raise_json_exception():
+            raise json_exception
+
+        mock_response.json = raise_json_exception
+    elif json_data is not None:
+        # If JSON data is provided
+        async def return_json():
+            return json_data
+
+        mock_response.json = return_json
+    else:
+        # Default: return empty dict
+        async def return_empty_json():
+            return {}
+
+        mock_response.json = return_empty_json
+
+    # Setup async context manager
+    async def aenter(self):
+        return mock_response
+
+    async def aexit(self, *args):
+        pass
+
+    mock_response.__aenter__ = aenter
+    mock_response.__aexit__ = aexit
+    return mock_response
+
+
+def _make_mock_context(mock_response):
+    """Wrap a single mock response in an async context manager (as returned by session.get/post)."""
+    mock_context = MagicMock()
+
+    async def aenter(*args, **kwargs):
+        return mock_response
+
+    async def aexit(*args):
+        return None
+
+    mock_context.__aenter__ = aenter
+    mock_context.__aexit__ = aexit
+    return mock_context
+
+
+def create_aiohttp_mock_session(mock_response=None, exception=None):
+    """Helper to create a mock aiohttp ClientSession.
+
+    ``mock_response`` may be a single response (every get/post call returns it) or a
+    list of responses consumed in order across successive get/post calls — useful when
+    the code under test reuses one ``ClientSession`` (or a patched constructor returning
+    the same mock) across a retry loop, e.g. a 401 followed by a successful retry.
+    """
+    mock_session = MagicMock()
+
+    if exception:
+        # Raise exception when trying to perform request
+        mock_session.get = MagicMock(side_effect=exception)
+        mock_session.post = MagicMock(side_effect=exception)
+    else:
+        if mock_response is None:
+            mock_response = create_aiohttp_mock_response()
+
+        if isinstance(mock_response, list):
+            # Independent iterators for get/post so either (or both) can be driven in sequence.
+            mock_session.get = MagicMock(side_effect=[_make_mock_context(resp) for resp in mock_response])
+            mock_session.post = MagicMock(side_effect=[_make_mock_context(resp) for resp in mock_response])
+        else:
+            mock_context = _make_mock_context(mock_response)
+
+            # Setup both GET and POST methods
+            mock_session.get = MagicMock(return_value=mock_context)
+            mock_session.post = MagicMock(return_value=mock_context)
+
+    async def session_aenter(*args):
+        return mock_session
+
+    async def session_aexit(*args):
+        return None
+
+    mock_session.__aenter__ = session_aenter
+    mock_session.__aexit__ = session_aexit
+
+    return mock_session
+
+
+class FakeComponentTask:
+    """Stand-in for the threading.Thread Components.start() creates, reporting itself alive."""
+
+    def is_alive(self):
+        """The fake task never dies, so Components.is_alive() is left to judge the component."""
+        return True
+
+
+class FakeInverterComponent:
+    """Stand-in for a registered inverter component reporting a given current health.
+
+    Lives here rather than in the individual test suites because both test_components.py and
+    test_inverter.py need one, and the health surface it mirrors (ComponentBase.get_error_count /
+    api_started / last_updated_time) changes shape rarely but across both suites when it does.
+    """
+
+    def __init__(self, errors=0, api_started=True, updated_recently=True):
+        """Record the health this fake component should report back."""
+        self.count_errors = errors
+        self.api_started = api_started
+        self.updated_recently = updated_recently
+
+    def get_error_count(self):
+        """Errors recorded so far, as ComponentBase.get_error_count() reports them."""
+        return self.count_errors
+
+    def is_alive(self):
+        """Current health, as ComponentBase.is_alive() reports it."""
+        return self.api_started and self.updated_recently
+
+    def last_updated_time(self):
+        """Time of the last successful operation, or None if never succeeded."""
+        return datetime.now(timezone.utc) if self.updated_recently else None
 
 
 class DummyInverter:
@@ -41,7 +204,13 @@ class TestHAInterface:
         self.dummy_items = {}
         self.service_store_enable = False
         self.service_store = []
+        self.service_store_fail = set()
         self.db_primary = False
+        # Set by create_predbat() so set_state_external() can route a CONFIG_ITEMS entity's
+        # change through the real switch/input_number/select service simulation, the same way
+        # HAInterface.set_state_external() does. None for the handful of narrower component
+        # tests that build a TestHAInterface() directly without a base to wire it to.
+        self.base = None
 
     def get_service_store(self):
         stored_service = self.service_store
@@ -55,16 +224,17 @@ class TestHAInterface:
         state = 0.0
         for count in range(int(days * 24 * 60 / self.step)):
             point = start + timedelta(minutes=count * self.step)
-            point_str = point.strftime("%Y-%m-%dT%H:%M:%SZ")
             history.append({"state": state, "last_changed": point})
         self.history = history
 
-    def get_state(self, entity_id, default=None, attribute=None, refresh=False):
+    def get_state(self, entity_id=None, default=None, attribute=None, refresh=False, raw=False):
         if not entity_id:
-            return {}
+            return self.get_all_state()
         elif entity_id in self.dummy_items:
             result = self.dummy_items[entity_id]
-            if isinstance(result, dict):
+            if raw:
+                return result
+            elif isinstance(result, dict):
                 if attribute:
                     result = result.get(attribute, "")
                 else:
@@ -76,16 +246,41 @@ class TestHAInterface:
             return result
         else:
             # print("Getting state: {} attribute {} => default {} ".format(entity_id, attribute, default))
-            if attribute:
-                return ""
+            return default
+
+    def get_all_state(self):
+        """
+        Build the whole-state dict shape the real HAInterface.get_state() returns when called
+        with no entity_id: {entity_id: {"state", "attributes", "last_changed"}}.
+
+        dummy_items stores each entity as either a bare state value, or (via set_state()/the
+        test 'set_entity' helpers) a dict with 'state' plus every attribute as a flat sibling key
+        - not nested under an 'attributes' key the way the real interface stores it. This
+        reshapes each entry into the real shape on the way out, so callers of get_state() with no
+        entity_id (e.g. agent_tools.py's search_entities/get_entity_state) see the same contract
+        in tests as they do against a live Predbat.
+        """
+        all_state = {}
+        for entity_id, item in self.dummy_items.items():
+            if isinstance(item, dict):
+                state = item.get("state")
+                attributes = {key: value for key, value in item.items() if key not in ("state", "last_changed")}
+                last_changed = item.get("last_changed")
             else:
-                return default
+                state = item
+                attributes = {}
+                last_changed = None
+            all_state[entity_id] = {"state": state, "attributes": attributes, "last_changed": last_changed}
+        return all_state
 
     def call_service(self, service, **kwargs):
         print("Calling service: {} {}".format(service, kwargs))
         if self.service_store_enable:
             self.service_store.append([service, kwargs])
-            return None
+            # Services in service_store_fail simulate a service that doesn't exist (e.g. testing a
+            # try-new-service-then-fall-back-to-old caller) - everything else succeeds, matching real
+            # HA behaviour for a registered service call.
+            return None if service in self.service_store_fail else True
 
         if service == "number/set_value":
             entity_id = kwargs.get("entity_id", None)
@@ -114,6 +309,18 @@ class TestHAInterface:
                 print("Warn: Service for entity {} not a select".format(entity_id))
             elif entity_id in self.dummy_items:
                 self.dummy_items[entity_id] = kwargs.get("option", None)
+        elif service == "time/set_value":
+            entity_id = kwargs.get("entity_id", None)
+            if not entity_id.startswith("time."):
+                print("Warn: Service for entity {} not a time".format(entity_id))
+            elif entity_id in self.dummy_items:
+                self.dummy_items[entity_id] = kwargs.get("time", None)
+        elif service == "input_datetime/set_datetime":
+            entity_id = kwargs.get("entity_id", None)
+            if not entity_id.startswith("input_datetime."):
+                print("Warn: Service for entity {} not an input_datetime".format(entity_id))
+            elif entity_id in self.dummy_items:
+                self.dummy_items[entity_id] = kwargs.get("time", kwargs.get("datetime", kwargs.get("date", None)))
         return None
 
     def set_state(self, entity_id, state, attributes=None):
@@ -125,6 +332,45 @@ class TestHAInterface:
             self.dummy_items[entity_id] = state
         # print("Item now: {}".format(self.dummy_items[entity_id]))
         return None
+
+    async def set_state_external(self, entity_id, state, attributes=None):
+        """
+        Mirror HAInterface.set_state_external(): when entity_id names a CONFIG_ITEMS entity,
+        route the change through the same switch/input_number/select service-call simulation
+        production code uses (self.base.trigger_callback), so a config switch flipped this way in
+        a test actually updates config_index[name]["value"] - what get_ha_config() reads - the
+        same way a real turn_on/turn_off service call would, rather than only ever touching the
+        entity's raw display state the way set_state() does.
+
+        Anything that is not a CONFIG_ITEMS entity, or when self.base was never wired up (the
+        narrower component tests that build a TestHAInterface() directly, with no base), falls
+        back to set_state()'s plain state write.
+        """
+        if self.base is not None:
+            for item in getattr(self.base, "CONFIG_ITEMS", []):
+                if item.get("entity") != entity_id:
+                    continue
+                old_value = item.get("value")
+                if old_value is None:
+                    old_value = item.get("default")
+                if old_value == state:
+                    return
+                item_type = item.get("type", "")
+                service_data = {"domain": item_type}
+                if item_type == "switch":
+                    service_data["service"] = "turn_on" if state else "turn_off"
+                    service_data["service_data"] = {"entity_id": entity_id}
+                elif item_type == "input_number":
+                    service_data["service"] = "set_value"
+                    service_data["service_data"] = {"entity_id": entity_id, "value": state}
+                elif item_type == "select":
+                    service_data["service"] = "select_option"
+                    service_data["service_data"] = {"entity_id": entity_id, "option": state}
+                else:
+                    break
+                await self.base.trigger_callback(service_data)
+                return
+        self.set_state(entity_id, state, attributes)
 
     def get_history(self, entity_id, now=None, days=30):
         # print("Getting history for {}".format(entity_id))
@@ -142,6 +388,186 @@ class TestInverter:
         pass
 
 
+class MockConfigProvider:
+    """
+    Mock configuration provider for testing fetch_config_options.
+    Provides a reusable way to mock get_arg() calls with test configuration.
+    """
+
+    def __init__(self):
+        self.config = self.get_default_config()
+
+    def get_default_config(self):
+        """
+        Return default test configuration values
+        """
+        return {
+            "debug_enable": True,
+            "plan_debug": False,
+            "forecast_hours": 48,
+            "num_cars": 2,
+            "calculate_plan_every": 10,
+            "calculate_savings_max_charge_slots": 2,
+            "holiday_days_left": 0,
+            "holiday_load_scaling": 0.7,
+            "load_forecast_only": False,
+            "days_previous": [7, 14],
+            "days_previous_weight": [1.0, 0.5],
+            "days_previous_auto": False,
+            "metric_min_improvement": 0.1,
+            "metric_min_improvement_export": 0.2,
+            "metric_min_improvement_swap": 0.3,
+            "metric_min_improvement_plan": 0.4,
+            "metric_min_improvement_export_freeze": 0.5,
+            "metric_battery_cycle": 0.6,
+            "metric_self_sufficiency": 0.7,
+            "metric_future_rate_offset_import": 0.8,
+            "metric_future_rate_offset_export": 0.9,
+            "metric_inday_adjust_damping": 1.0,
+            "metric_pv_calibration_enable": True,
+            "metric_dynamic_load_adjust": 0.5,
+            "rate_low_threshold": 0.75,
+            "rate_high_threshold": 1.25,
+            "inverter_soc_reset": False,
+            "metric_battery_value_scaling": 1.0,
+            "notify_devices": ["notify"],
+            "pv_scaling": 1.0,
+            "pv_metric10_weight": 0.5,
+            "calculate_pv90_plan": False,
+            "pv_metric90_weight": 0.0,
+            "load_scaling": 1.0,
+            "load_scaling10": 1.0,
+            "load_scaling90": 1.0,
+            "charge_scaling10": 1.0,
+            "load_scaling_saving": 0.8,
+            "load_scaling_free": 0.9,
+            "battery_rate_max_scaling": 1.0,
+            "battery_rate_max_scaling_discharge": 1.0,
+            "metric_cloud_enable": False,
+            "metric_load_divergence_enable": True,
+            "battery_capacity_nominal": 10.0,
+            "battery_loss": 0.05,
+            "battery_loss_discharge": 0.05,
+            "inverter_loss": 0.05,
+            "inverter_hybrid": False,
+            "base_load": 100,
+            "import_export_scaling": 1.0,
+            "best_soc_min": 0.0,
+            "best_soc_max": 10.0,
+            "best_soc_keep": 1.0,
+            "best_soc_keep_weight": 1.0,
+            "inverter_set_charge_before": True,
+            "octopus_intelligent_charging": False,
+            "octopus_intelligent_ignore_unplugged": False,
+            "octopus_intelligent_consider_full": False,
+            "car_charging_planned": "no",
+            "car_charging_now": "no",
+            "car_charging_plan_smart": False,
+            "car_charging_plan_max_price": 0.0,
+            "car_charging_plan_time": "07:00:00",
+            "car_charging_battery_size": 100.0,
+            "car_charging_rate": 7400,
+            "car_charging_limit": 100.0,
+            "car_charging_exclusive": False,
+            "car_charging_from_battery": False,
+            "car_charging_planned_response": ["yes", "on", "enable", "true"],
+            "car_charging_now_response": ["yes", "on", "enable", "true"],
+            "combine_rate_threshold": 1.0,
+            "combine_export_slots": True,
+            "combine_charge_slots": True,
+            "set_read_only": False,
+            "axle_control": False,
+            "set_reserve_enable": True,
+            "set_export_freeze": True,
+            "set_charge_freeze": True,
+            "set_charge_low_power": False,
+            "set_export_low_power": False,
+            "charge_low_power_margin": 10,
+            "set_status_notify": False,
+            "set_inverter_notify": False,
+            "set_export_freeze_only": False,
+            "set_charge_freeze_only": False,
+            "set_discharge_during_charge": True,
+            "set_freeze_export_during_demand": False,
+            "mode": "Control charge & discharge",
+            "calculate_export_oncharge": True,
+            "calculate_export_on_pv": True,
+            "calculate_second_pass": True,
+            "calculate_inday_adjustment": True,
+            "calculate_import_low_export": True,
+            "calculate_export_high_import": True,
+            "balance_inverters_enable": False,
+            "balance_inverters_charge": True,
+            "balance_inverters_discharge": True,
+            "balance_inverters_crosscharge": True,
+            "balance_inverters_threshold_charge": 1.0,
+            "balance_inverters_threshold_discharge": 1.0,
+            "load_filter_modal": True,
+            "carbon_enable": False,
+            "carbon_metric": 0,
+            "iboost_enable": False,
+            "iboost_gas": 4.0,
+            "iboost_gas_export": 4.0,
+            "iboost_smart": False,
+            "iboost_smart_min_length": 60,
+            "iboost_on_export": False,
+            "iboost_prevent_discharge": False,
+            "iboost_solar": False,
+            "iboost_solar_excess": 1.0,
+            "iboost_rate_threshold": 10.0,
+            "iboost_rate_threshold_export": 10.0,
+            "iboost_charging": False,
+            "iboost_gas_scale": 1.0,
+            "iboost_max_energy": 3.0,
+            "iboost_max_power": 3000,
+            "iboost_min_power": 500,
+            "iboost_min_soc": 0.0,
+            "iboost_today": 0.0,
+            "iboost_value_scaling": 1.0,
+            "iboost_energy_subtract": False,
+            "car_charging_hold": True,
+            "car_energy_reported_load": True,
+            "car_charging_manual_soc": False,
+            "car_charging_threshold": 60.0,
+            "car_charging_energy_scale": 1.0,
+            "forecast_plan_hours": 8,
+            "inverter_clock_skew_start": 0,
+            "inverter_clock_skew_end": 0,
+            "inverter_clock_skew_discharge_start": 0,
+            "inverter_clock_skew_discharge_end": 0,
+            "set_window_minutes": 0,
+            # Car charging config for each car (postfix _0, _1, etc.)
+            "car_charging_rate_0": 7.4,
+            "car_charging_rate_1": 7.4,
+            "car_charging_rate_2": 7.4,
+            "car_charging_rate_3": 7.4,
+            "car_charging_rate_4": 7.4,
+            "car_charging_rate_5": 7.4,
+            "car_charging_rate_6": 7.4,
+            "car_charging_rate_7": 7.4,
+            "car_charging_battery_size_0": 100.0,
+            "car_charging_battery_size_1": 100.0,
+            "car_charging_limit_0": 100.0,
+            "car_charging_limit_1": 100.0,
+            "car_charging_plan_time_0": "07:00:00",
+            "car_charging_plan_time_1": "07:00:00",
+            "car_charging_plan_smart_0": False,
+            "car_charging_plan_smart_1": False,
+            "car_charging_plan_max_price_0": 0.0,
+            "car_charging_plan_max_price_1": 0.0,
+            "car_charging_exclusive_0": False,
+            "car_charging_exclusive_1": False,
+            "car_charging_from_battery_0": False,
+            "car_charging_from_battery_1": False,
+        }
+
+    def get_arg(self, key, default=None, index=None, indirect=True):
+        """
+        Mock get_arg method that returns values from config dict
+        """
+        return self.config.get(key, default)
+
+
 def reset_rates(my_predbat, ir, xr):
     my_predbat.combine_charge_slots = True
     for minute in range(my_predbat.forecast_minutes + my_predbat.minutes_now):
@@ -149,6 +575,8 @@ def reset_rates(my_predbat, ir, xr):
         my_predbat.rate_export[minute] = xr
     my_predbat.rate_export_min = xr
     my_predbat.rate_scan(my_predbat.rate_import, print=False)
+    my_predbat.rate_min_base = my_predbat.rate_min
+    my_predbat.rate_max_base = my_predbat.rate_max
     my_predbat.rate_scan_export(my_predbat.rate_export, print=False)
 
 
@@ -163,6 +591,8 @@ def reset_rates2(my_predbat, ir, xr):
             my_predbat.rate_export[minute] = xr * 2
     my_predbat.rate_export_min = xr
     my_predbat.rate_scan(my_predbat.rate_import, print=False)
+    my_predbat.rate_min_base = my_predbat.rate_min
+    my_predbat.rate_max_base = my_predbat.rate_max
     my_predbat.rate_scan_export(my_predbat.rate_export, print=False)
 
 
@@ -180,10 +610,18 @@ def update_rates_export(my_predbat, export_window_best):
     my_predbat.rate_scan_export(my_predbat.rate_export, print=False)
 
 
+# The fixture's clock: noon. create_predbat() pins minutes_now/now_utc from it so a standalone run
+# behaves like the suite, reset_inverter re-asserts the same value after its scenarios, and modules
+# that want to check their own clock import it rather than restating the literal - so the three can
+# never silently diverge (#5026).
+FIXTURE_MINUTES_NOW = 12 * 60
+
+
 def reset_inverter(my_predbat):
     my_predbat.inverter_limit = 1 / 60.0
     my_predbat.num_inverters = 1
     my_predbat.export_limit = 10 / 60.0
+    my_predbat.pv_ac_limit = 0
     my_predbat.inverters = [TestInverter()]
     my_predbat.charge_window = []
     my_predbat.export_window = []
@@ -196,9 +634,8 @@ def reset_inverter(my_predbat):
     my_predbat.reserve_current = 0.0
     my_predbat.reserve_percent_current = 0.0
     my_predbat.battery_rate_max_charge = 1 / 60.0
+    my_predbat.battery_rate_max_charge_dc = 1 / 60.0
     my_predbat.battery_rate_max_discharge = 1 / 60.0
-    my_predbat.battery_rate_max_charge_scaled = 1 / 60.0
-    my_predbat.battery_rate_max_discharge_scaled = 1 / 60.0
     my_predbat.battery_rate_min = 0
     my_predbat.charge_rate_now = 1 / 60.0
     my_predbat.discharge_rate_now = 1 / 60.0
@@ -208,6 +645,7 @@ def reset_inverter(my_predbat):
     my_predbat.inverter_loss = 1.0
     my_predbat.battery_loss_discharge = 1.0
     my_predbat.inverter_hybrid = False
+    my_predbat.inverter_support_feedin_first = False
     my_predbat.battery_charge_power_curve = {}
     my_predbat.battery_discharge_power_curve = {}
     my_predbat.battery_rate_max_scaling = 1.0
@@ -216,8 +654,8 @@ def reset_inverter(my_predbat):
     my_predbat.num_cars = 0
     my_predbat.car_charging_slots[0] = []
     my_predbat.car_charging_from_battery = True
-    my_predbat.car_charging_limit = [100.0, 100.0, 100.0, 100.0]
-    my_predbat.car_charging_soc = [0, 0, 0, 0]
+    my_predbat.car_charging_limit = [100.0] * PREDBAT_MAX_CARS
+    my_predbat.car_charging_soc = [0] * PREDBAT_MAX_CARS
     my_predbat.iboost_enable = False
     my_predbat.iboost_solar = False
     my_predbat.iboost_gas = False
@@ -226,11 +664,24 @@ def reset_inverter(my_predbat):
     my_predbat.iboost_smart = False
     my_predbat.iboost_on_export = False
     my_predbat.iboost_prevent_discharge = False
-    my_predbat.minutes_now = 12 * 60
+    my_predbat.minutes_now = FIXTURE_MINUTES_NOW
     my_predbat.best_soc_keep = 0.0
     my_predbat.carbon_enable = 0
     my_predbat.inverter_soc_reset = True
-    my_predbat.car_charging_soc_next = [None for car_n in range(4)]
+    my_predbat.car_charging_soc_next = [None for car_n in range(PREDBAT_MAX_CARS)]
+    my_predbat.charge_limit_best = []
+    my_predbat.charge_window_best = []
+    my_predbat.export_limits_best = []
+    my_predbat.export_window_best = []
+    my_predbat.manual_charge_times = []
+    my_predbat.manual_demand_times = []
+    my_predbat.manual_export_times = []
+    my_predbat.manual_freeze_charge_times = []
+    my_predbat.manual_freeze_export_times = []
+    my_predbat.set_charge_window = True
+    my_predbat.set_export_window = True
+    my_predbat.set_charge_freeze = True
+    my_predbat.set_export_freeze = True
 
 
 def plot(name, prediction):
@@ -251,7 +702,12 @@ def plot(name, prediction):
     ax.set(xlabel="time (minutes)", ylabel="Value", title=name)
     ax.legend()
     plt.savefig("{}.png".format(name))
-    plt.show()
+    if PLOT_ENABLED:
+        plt.show()
+    else:
+        # plt.show() blocks until the window is closed, so a failing run would never terminate.
+        # Close the figure instead - matplotlib warns once more than 20 are left open.
+        plt.close(fig)
 
 
 def simple_scenario(
@@ -272,12 +728,15 @@ def simple_scenario(
     charge=0,
     charge_period_divide=1,
     discharge=100,
-    charge_window_best=[],
+    charge_window_best=None,
     charge_limit_best=None,
     inverter_loss=1.0,
+    inverter_freeze_export_discharge_rate=0.0,
     battery_rate_max_charge=1.0,
+    battery_rate_max_charge_dc=None,
     charge_car=0,
     car_charging_from_battery=True,
+    car_energy_reported_load=True,
     iboost_solar=False,
     iboost_solar_excess=False,
     iboost_gas=False,
@@ -295,6 +754,7 @@ def simple_scenario(
     keep=0.0,
     keep_weight=0.5,
     assert_keep=0.0,
+    assert_battery_cycle=None,
     save="best",
     quiet=False,
     iboost_rate_threshold=9999,
@@ -314,18 +774,27 @@ def simple_scenario(
     battery_temperature=20,
     set_export_freeze_only=False,
     inverter_can_charge_during_export=True,
+    inverter_support_feedin_first=False,
     prediction_handle=None,
     return_prediction_handle=False,
     ignore_failed=False,
     set_charge_freeze=True,
+    calculate_export_on_pv=True,
+    assert_clipped=0,
+    pv_ac_limit=0,
+    pv_hours=None,
 ):
     """
     No PV, No Load
     """
+    if charge_window_best is None:
+        charge_window_best = []
     if not quiet:
         print("Run scenario {}".format(name))
 
     battery_rate = 1.0 if with_battery else 0.0
+    if battery_rate_max_charge_dc is None:
+        battery_rate_max_charge_dc = battery_rate_max_charge
     my_predbat.battery_loss = battery_loss
     my_predbat.battery_loss_discharge = battery_loss
     my_predbat.battery_rate_max_scaling = battery_rate
@@ -374,17 +843,21 @@ def simple_scenario(
     my_predbat.inverter_hybrid = hybrid
     my_predbat.export_limit = export_limit / 60.0
     my_predbat.inverter_limit = inverter_limit / 60.0
+    my_predbat.pv_ac_limit = pv_ac_limit / 60.0
     my_predbat.reserve = reserve
     my_predbat.inverter_loss = inverter_loss
+    my_predbat.inverter_freeze_export_discharge_rate = inverter_freeze_export_discharge_rate / MINUTE_WATT
     my_predbat.battery_rate_max_charge = battery_rate_max_charge / 60.0
+    my_predbat.battery_rate_max_charge_dc = battery_rate_max_charge_dc / 60.0
     my_predbat.battery_rate_max_discharge = battery_rate_max_charge / 60.0
-    my_predbat.battery_rate_max_charge_scaled = battery_rate_max_charge / 60.0
-    my_predbat.battery_rate_max_discharge_scaled = battery_rate_max_charge / 60.0
+    my_predbat.battery_rate_max_export = battery_rate_max_charge / 60.0
     my_predbat.car_charging_from_battery = car_charging_from_battery
+    my_predbat.car_energy_reported_load = car_energy_reported_load
     my_predbat.set_charge_low_power = set_charge_low_power
     my_predbat.set_charge_window = set_charge_window
     my_predbat.set_charge_freeze = set_charge_freeze
     my_predbat.set_export_freeze_only = set_export_freeze_only
+    my_predbat.calculate_export_on_pv = calculate_export_on_pv
 
     my_predbat.iboost_enable = iboost_enable
     my_predbat.iboost_gas = iboost_gas
@@ -408,6 +881,7 @@ def simple_scenario(
     my_predbat.car_charging_soc[0] = car_soc
     my_predbat.car_charging_limit[0] = car_limit
     my_predbat.inverter_can_charge_during_export = inverter_can_charge_during_export
+    my_predbat.inverter_support_feedin_first = inverter_support_feedin_first
     my_predbat.charge_scaling10 = charge_scaling10
 
     if my_predbat.iboost_enable and (((not iboost_solar) and (not iboost_charging)) or iboost_smart):
@@ -431,11 +905,11 @@ def simple_scenario(
     load10_step = {}
 
     for minute in range(0, my_predbat.forecast_minutes, 5):
-        pv_step[minute] = pv_amount / (60 / 5) if not pv10 else 0
+        # pv_hours limits PV to the first N hours of the forecast, otherwise it runs at pv_amount all day
+        pv_now = 0 if (pv_hours is not None and minute >= pv_hours * 60) else pv_amount
+        pv_step[minute] = pv_now / (60 / 5) if not pv10 else 0
         load_step[minute] = load_amount / (60 / 5) if not pv10 else 0
-
-    for minute in range(0, my_predbat.forecast_minutes, 5):
-        pv10_step[minute] = pv_amount / (60 / 5) if pv10 else 0
+        pv10_step[minute] = pv_now / (60 / 5) if pv10 else 0
         load10_step[minute] = load_amount / (60 / 5) if pv10 else 0
 
     if charge_car:
@@ -445,10 +919,23 @@ def simple_scenario(
         my_predbat.num_cars = 0
         my_predbat.car_charging_slots[0] = []
 
+    # When the C++ prediction kernel is enabled, run kernel-supported scenarios with save=None so
+    # the prediction dispatches to the kernel and the scenario asserts validate the kernel results.
+    # Scenarios relying on save-run-only behaviour (low-power charge, standing charge) keep the
+    # Python engine as those never apply to optimisation scenario runs.
+    kernel_mode = bool(getattr(my_predbat, "prediction_kernel_enable", False))
+    kernel_eligible = kernel_mode and not (my_predbat.set_charge_window and my_predbat.set_charge_low_power) and my_predbat.metric_standing_charge == 0
+    if kernel_eligible and not quiet:
+        print("Scenario {} routed via the C++ prediction kernel".format(name))
+
     if prediction_handle:
         prediction = prediction_handle
     else:
         prediction = Prediction(my_predbat, pv_step, pv10_step, load_step, load10_step)
+
+    if kernel_eligible and not getattr(prediction, "kernel_handle", 0):
+        print("ERROR: Scenario {} expected the C++ prediction kernel but it is not available".format(name))
+        return (True, prediction) if return_prediction_handle else True
 
     compute_charge_limit = False
     if charge_limit_best is None:
@@ -462,7 +949,9 @@ def simple_scenario(
     export_limit_best = []
     export_window_best = []
     if discharge < 100:
-        export_limit_best = [discharge]
+        # Callers express this as the packed percentage the encoding used to be (99 = freeze, a
+        # number = a target, with any fraction the export power) - normalise to an instruction
+        export_limit_best = [unpack_export_limit(discharge)]
         export_window_best = [{"start": my_predbat.minutes_now, "end": int(my_predbat.forecast_minutes / charge_period_divide) + my_predbat.minutes_now, "average": 0}]
     if save == "none":
         (
@@ -477,7 +966,7 @@ def simple_scenario(
             metric_keep,
             final_iboost,
             final_carbon_g,
-        ) = wrapped_run_prediction_single(charge_limit_best, charge_window_best, export_window_best, export_limit_best, pv10, end_record=(my_predbat.end_record), step=5)
+        ) = prediction.thread_run_prediction_single(charge_limit_best, charge_window_best, export_window_best, export_limit_best, pv10, end_record=(my_predbat.end_record), step=5)
     else:
         (
             metric,
@@ -497,7 +986,7 @@ def simple_scenario(
             iboost_running,
             iboost_running_solar,
             iboost_running_full,
-        ) = prediction.run_prediction(charge_limit_best, charge_window_best, export_window_best, export_limit_best, pv10, end_record=(my_predbat.end_record), save=save)
+        ) = prediction.run_prediction(charge_limit_best, charge_window_best, export_window_best, export_limit_best, pv10, end_record=(my_predbat.end_record), save=None if kernel_eligible else save)
         prediction.predict_soc = predict_soc
         prediction.car_charging_soc_next = car_charging_soc_next
         prediction.iboost_next = iboost_next
@@ -516,6 +1005,10 @@ def simple_scenario(
     if abs(final_soc - assert_final_soc) >= 0.1:
         if not ignore_failed:
             print("ERROR: Final SOC {} should be {}".format(final_soc, assert_final_soc))
+        failed = True
+    if assert_battery_cycle is not None and abs(battery_cycle - assert_battery_cycle) >= 0.001:
+        if not ignore_failed:
+            print("ERROR: Battery cycle {} should be {}".format(battery_cycle, assert_battery_cycle))
         failed = True
     if abs(final_iboost - assert_final_iboost) >= 0.1:
         if not ignore_failed:
@@ -541,6 +1034,13 @@ def simple_scenario(
         if not ignore_failed:
             print("ERROR: iBoost running full should be {}".format(assert_iboost_running_full))
         failed = True
+
+    if save != "none" and not kernel_eligible:
+        total_clipped = prediction.predict_clipped_best[max(prediction.predict_clipped_best.keys())] if prediction.predict_clipped_best else 0
+        if abs(total_clipped - assert_clipped) >= 0.9:
+            if not ignore_failed:
+                print("ERROR: Total clipped {} should be {}".format(total_clipped, assert_clipped))
+            failed = True
 
     if failed and not ignore_failed:
         (

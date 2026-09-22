@@ -1,6 +1,6 @@
 # -----------------------------------------------------------------------------
 # Predbat Home Battery System
-# Copyright Trefor Southwell 2024 - All Rights Reserved
+# Copyright Trefor Southwell 2026 - All Rights Reserved
 # This application maybe used for personal use only and not for commercial use
 # -----------------------------------------------------------------------------
 # fmt off
@@ -9,28 +9,68 @@
 # pylint: disable=attribute-defined-outside-init
 import os
 import json
+import time
 from compare import Compare
+from const import CLOUD_FACTOR_PV10
+from utils import export_limit_sort_key
 from prediction import Prediction
 from tests.test_infra import reset_inverter
-from utils import calc_percent_limit
 
 
-def run_single_debug(test_name, my_predbat, debug_file, expected_file=None, compare=False, debug=False):
+def _dump_state_before_plan(my_predbat, filename):
+    """Dump a JSON-comparable snapshot of predbat's member variables for cross-run-context comparison.
+
+    Only cleanly JSON-serialisable values are recorded as-is; everything else is recorded as its type name
+    (without memory addresses) so two snapshots can be diffed without noise.
+    """
+    state = {}
+    for key in sorted(my_predbat.__dict__.keys()):
+        if key.startswith("__"):
+            continue
+        value = my_predbat.__dict__[key]
+        if callable(value):
+            continue
+        try:
+            json.dumps(value)
+            state[key] = value
+        except (TypeError, ValueError, OverflowError):
+            try:
+                state[key] = "<{} len={}>".format(type(value).__name__, len(value))
+            except (TypeError, AttributeError):
+                state[key] = "<{}>".format(type(value).__name__)
+    with open(filename, "w") as handle:
+        json.dump(state, handle, indent=2, sort_keys=True)
+
+
+def run_single_debug(test_name, my_predbat, debug_file, expected_file=None, compare=False, debug=False, redo=False):
     print("**** Running debug test {} ****\n".format(debug_file))
-    if not expected_file:
-        re_do_rates = True
-        reset_load_model = True
-        reload_octopus_slots = True
-    else:
-        reset_load_model = False
-        re_do_rates = False
-        reload_octopus_slots = False
+    # Will recompute the rates, load model and octopus slots if redo is True. This is useful for debugging a single test case, but the
+    # debug_cases regression suite exercise the same code path and produce the same result.
+    re_do_rates = redo
+    reset_load_model = redo
+    reload_octopus_slots = redo
     load_override = 1.0
     my_predbat.load_user_config()
     failed = False
 
     print("**** Test {} ****".format(test_name))
     reset_inverter(my_predbat)
+    # Some derived state is neither saved in the debug yaml (so read_debug_yaml cannot restore it) nor
+    # reset by reset_inverter, so inside the full suite it leaks from a previous test and makes the debug
+    # plan depend on test ordering. Reset these to their standalone-run defaults so each case is
+    # deterministic regardless of what ran before:
+    #   - dynamic_load_baseline feeds the load model calculate_plan rebuilds (normally produced by
+    #     dynamic_load(), which only runs from update_pred, not the debug harness).
+    #   - battery_rate_max_export is the discharge power cap used in prediction; a leaked full-precision
+    #     value (vs the 0.0333 default) can flip the plan at a decision boundary.
+    #   - rate_max_base and rate_export_max_forward are the base-tariff terms battery_value_rate uses;
+    #     fetch rebuilds both every cycle in the product, but the debug harness never calls fetch, and
+    #     debug files written before those fields existed carry neither. Their absent-value defaults
+    #     send battery_value_rate back to rate_max / rate_export_max, which the debug file does carry.
+    my_predbat.dynamic_load_baseline = {}
+    my_predbat.battery_rate_max_export = 0.0333
+    my_predbat.rate_max_base = 0
+    my_predbat.rate_export_max_forward = {}
     my_predbat.read_debug_yaml(debug_file)
     my_predbat.config_root = "./"
     my_predbat.save_restore_dir = "./"
@@ -63,11 +103,9 @@ def run_single_debug(test_name, my_predbat, debug_file, expected_file=None, comp
         # my_predbat.combine_export_slots = False
         # my_predbat.set_export_freeze = False
         # my_predbat.inverter_loss = 0.97
-        # my_predbat.calculate_tweak_plan = False
 
         # my_predbat.inverter_loss = 0.97
         # my_predbat.calculate_second_pass = True
-        # my_predbat.calculate_tweak_plan = True
         # my_predbat.metric_battery_cycle = 2
         # my_predbat.carbon_enable = False
         # my_predbat.metric_battery_value_scaling = 0.50
@@ -85,7 +123,15 @@ def run_single_debug(test_name, my_predbat, debug_file, expected_file=None, comp
         # my_predbat.charge_limit_best[1] = 0
         # my_predbat.iboost_solar_excess = True
         # my_predbat.iboost_min_power = 500 / MINUTE_WATT
+        # my_predbat.calculate_export_on_pv = False
+        # my_predbat.export_more_solar = True
+        # my_predbat.prediction_kernel_enable = True
         pass
+    else:
+        # Fast pass for regression tests, no debug output
+        my_predbat.prediction_kernel_enable = True
+        my_predbat.plan_debug = False
+        my_predbat.debug_enable = False
 
     print("Charge scaling 10 {} load scaling 10 {}".format(my_predbat.charge_scaling10, my_predbat.load_scaling10))
 
@@ -106,9 +152,12 @@ def run_single_debug(test_name, my_predbat, debug_file, expected_file=None, comp
 
         # Find charging windows
         if my_predbat.rate_import:
-            # Find charging window
+            # Find charging window - mirrors fetch.py's fetch_sensor_data(), including the dawn
+            # light/dark split (#4699: this reimplementation used to omit pv_light_dark entirely,
+            # so a debug.yaml replay could never catch a regression in the split)
+            pv_light_dark = my_predbat.calc_pv_light_dark()
             print("rate scan window import threshold rate {}".format(my_predbat.rate_import_cost_threshold))
-            my_predbat.low_rates, lowest, highest = my_predbat.rate_scan_window(my_predbat.rate_import, 5, my_predbat.rate_import_cost_threshold, False, alt_rates=my_predbat.rate_export)
+            my_predbat.low_rates, lowest, highest = my_predbat.rate_scan_window(my_predbat.rate_import, 5, my_predbat.rate_import_cost_threshold, False, alt_rates=my_predbat.rate_export, pv_light_dark=pv_light_dark)
             # Update threshold automatically
             if my_predbat.rate_low_threshold == 0 and highest >= my_predbat.rate_min:
                 my_predbat.rate_import_cost_threshold = highest
@@ -127,6 +176,10 @@ def run_single_debug(test_name, my_predbat, debug_file, expected_file=None, comp
         return
 
     # Reset load model
+    # Mirror the load model rebuild done by calculate_plan (plan.py) so the original plan metric is
+    # evaluated against the same load data as the re-calculated plan - in particular load_scaling.
+    # Otherwise the two metrics printed by this harness differ by the load scaling and look like a
+    # plan regression when the plans are identical.
     if reset_load_model:
         print("Reset load model")
         my_predbat.load_minutes_step = my_predbat.step_data_history(
@@ -134,11 +187,13 @@ def run_single_debug(test_name, my_predbat, debug_file, expected_file=None, comp
             my_predbat.minutes_now,
             forward=False,
             scale_today=my_predbat.load_inday_adjustment,
-            scale_fixed=1.0 * load_override,
+            scale_fixed=my_predbat.load_scaling * load_override,
             type_load=True,
             load_forecast=my_predbat.load_forecast,
             load_scaling_dynamic=my_predbat.load_scaling_dynamic,
             cloud_factor=my_predbat.metric_load_divergence,
+            load_adjust=my_predbat.manual_load_adjust,
+            load_baseline=my_predbat.dynamic_load_baseline,
         )
         my_predbat.load_minutes_step10 = my_predbat.step_data_history(
             my_predbat.load_minutes,
@@ -150,10 +205,12 @@ def run_single_debug(test_name, my_predbat, debug_file, expected_file=None, comp
             load_forecast=my_predbat.load_forecast,
             load_scaling_dynamic=my_predbat.load_scaling_dynamic,
             cloud_factor=min(my_predbat.metric_load_divergence + 0.5, 1.0) if my_predbat.metric_load_divergence else None,
+            load_adjust=my_predbat.manual_load_adjust,
+            load_baseline=my_predbat.dynamic_load_baseline,
         )
         my_predbat.pv_forecast_minute_step = my_predbat.step_data_history(my_predbat.pv_forecast_minute, my_predbat.minutes_now, forward=True, cloud_factor=my_predbat.metric_cloud_coverage)
         my_predbat.pv_forecast_minute10_step = my_predbat.step_data_history(
-            my_predbat.pv_forecast_minute10, my_predbat.minutes_now, forward=True, cloud_factor=min(my_predbat.metric_cloud_coverage + 0.2, 1.0) if my_predbat.metric_cloud_coverage else None, flip=True
+            my_predbat.pv_forecast_minute10, my_predbat.minutes_now, forward=True, cloud_factor=min(my_predbat.metric_cloud_coverage + CLOUD_FACTOR_PV10, 1.0) if my_predbat.metric_cloud_coverage else None, flip=True
         )
 
     pv_step = my_predbat.pv_forecast_minute_step
@@ -172,7 +229,7 @@ def run_single_debug(test_name, my_predbat, debug_file, expected_file=None, comp
 
     if my_predbat.num_cars > 0 and my_predbat.octopus_slots:
         if reload_octopus_slots:
-            my_predbat.car_charging_slots[0] = my_predbat.load_octopus_slots(my_predbat.octopus_slots, my_predbat.octopus_intelligent_consider_full)
+            my_predbat.car_charging_slots[0] = my_predbat.load_octopus_slots(0, my_predbat.octopus_slots[0], my_predbat.octopus_intelligent_consider_full)
             print("Re-loaded car charging slots {}".format(my_predbat.car_charging_slots[0]))
         else:
             print("Current car charging slots {}".format(my_predbat.car_charging_slots[0]))
@@ -190,7 +247,6 @@ def run_single_debug(test_name, my_predbat, debug_file, expected_file=None, comp
 
     # Save plan
     # Pre-optimise all plan
-    my_predbat.charge_limit_percent_best = calc_percent_limit(my_predbat.charge_limit_best, my_predbat.soc_max)
     my_predbat.update_target_values()
     html_plan, raw_plan = my_predbat.publish_html_plan(pv_step, pv10_step, load_step, load10_step, my_predbat.end_record)
     filename = "plan_orig.html"
@@ -199,9 +255,15 @@ def run_single_debug(test_name, my_predbat, debug_file, expected_file=None, comp
 
     ## Calculate the plan
     my_predbat.plan_valid = False
+    # Dump the full predbat state just before calculate_plan so the same case can be compared across run
+    # contexts (full ./run_all suite vs standalone) to find any leaked/uninitialised state.
+    # _dump_state_before_plan(my_predbat, test_name + ".state.json")
     print("Re-calculate plan")
+    start_time = time.time()
     my_predbat.calculate_plan(recompute=True, debug_mode=debug)
-    print("Plan calculated")
+    calculate_plan_time = time.time() - start_time
+    my_predbat.last_calculate_plan_time = calculate_plan_time
+    print("Plan calculated in {} seconds".format(round(calculate_plan_time, 3)))
 
     # Predict
     my_predbat.log("> FINAL PLAN")
@@ -218,7 +280,15 @@ def run_single_debug(test_name, my_predbat, debug_file, expected_file=None, comp
     print("Wrote plan to {} metric {}".format(filename, metric))
 
     # Expected
-    actual_data = {"charge_limit_best": my_predbat.charge_limit_best, "charge_window_best": my_predbat.charge_window_best, "export_window_best": my_predbat.export_window_best, "export_limits_best": my_predbat.export_limits_best}
+    # The committed .expected.json goldens hold export limits as the bare packed numbers they were
+    # before the fields were split. Compare in that form deliberately - regenerating them would
+    # destroy their value as a regression against historical plans.
+    actual_data = {
+        "charge_limit_best": my_predbat.charge_limit_best,
+        "charge_window_best": my_predbat.charge_window_best,
+        "export_window_best": my_predbat.export_window_best,
+        "export_limits_best": [float(export_limit_sort_key(limit)) for limit in my_predbat.export_limits_best],
+    }
     actual_json = json.dumps(actual_data)
     if expected_file:
         print("Compare with {}".format(expected_file))
@@ -227,8 +297,10 @@ def run_single_debug(test_name, my_predbat, debug_file, expected_file=None, comp
             print("ERROR: Expected file {} does not exist".format(expected_file))
         else:
             expected_data = json.loads(open(expected_file).read())
-            expected_json = json.dumps(expected_data)
-            if actual_json != expected_json:
+            # Compare the parsed contents by value rather than the raw JSON strings. The plan values are
+            # numpy floats whose json repr differs from a plain Python float's, so a byte-for-byte string
+            # compare reports spurious mismatches even when the numbers are identical.
+            if json.loads(actual_json) != expected_data:
                 print("ERROR: Actual plan does not match expected plan")
                 failed = True
     # Write actual plan

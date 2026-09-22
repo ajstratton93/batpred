@@ -1,11 +1,19 @@
 # -----------------------------------------------------------------------------
 # Predbat Home Battery System
-# Copyright Trefor Southwell 2024 - All Rights Reserved
+# Copyright Trefor Southwell 2026 - All Rights Reserved
 # This application maybe used for personal use only and not for commercial use
 # -----------------------------------------------------------------------------
 # Database Engine for Predbat Home Battery System
 # This module handles all SQL Lite database operations.
 # -----------------------------------------------------------------------------
+
+
+"""SQLite database engine for entity state persistence.
+
+Provides the DatabaseEngine class that manages a local SQLite database
+for storing entity states and history, with automatic pruning of old
+data and deduplication of unchanged states.
+"""
 
 import sqlite3
 import json
@@ -15,6 +23,13 @@ TIME_FORMAT_DB = "%Y-%m-%dT%H:%M:%S.%f"
 
 
 class DatabaseEngine:
+    """SQLite database engine for entity state persistence.
+
+    Manages a local SQLite database for storing entity states and history
+    with automatic pruning, deduplication, and keep-level classification
+    (Intra-hour, Hourly, Daily).
+    """
+
     def __init__(self, base, db_days):
         self.base = base
         self.log = base.log
@@ -32,6 +47,7 @@ class DatabaseEngine:
         Close the database connection
         """
         if self.db:
+            self._commit_db()
             self.db.close()
             self.log("db_engine: Closed")
             self.db = None
@@ -43,6 +59,9 @@ class DatabaseEngine:
         self.db_cursor.execute("CREATE TABLE IF NOT EXISTS entities (entity_index INTEGER PRIMARY KEY AUTOINCREMENT, entity_name TEXT KEY UNIQUE)")
         self.db_cursor.execute("CREATE TABLE IF NOT EXISTS states (id INTEGER PRIMARY KEY AUTOINCREMENT, datetime TEXT KEY, entity_index INTEGER KEY, state TEXT, attributes TEXT, system TEXT, keep TEXT KEY)")
         self.db_cursor.execute("CREATE TABLE IF NOT EXISTS latest (entity_index INTEGER PRIMARY KEY, datetime TEXT KEY, state TEXT, attributes TEXT, system TEXT, keep TEXT KEY)")
+        # Create index for fast history queries (critical for performance)
+        self.db_cursor.execute("CREATE INDEX IF NOT EXISTS idx_states_entity_datetime ON states(entity_index, datetime)")
+        # Delete old data from states table
         self.db_cursor.execute(
             "DELETE FROM states WHERE datetime < ? AND keep != ?",
             (
@@ -50,7 +69,7 @@ class DatabaseEngine:
                 "D",
             ),
         )
-        self.db.commit()
+        self._commit_db()
 
     def _get_state_db(self, entity_id):
         """
@@ -97,6 +116,12 @@ class DatabaseEngine:
         rows = self.db_cursor.fetchall()
         return [row[0] for row in rows]
 
+    def _commit_db(self):
+        """
+        Commit changes to the database
+        """
+        self.db.commit()
+
     def _set_state_db(self, entity_id, state, attributes, timestamp):
         """
         Records the state of a predbat entity into the SQLLite database
@@ -105,9 +130,11 @@ class DatabaseEngine:
         state = str(state)
 
         # Put the entity_id into entities table if its not in already
-        self.db_cursor.execute("INSERT OR IGNORE INTO entities (entity_name) VALUES (?)", (entity_id,))
-        self.db.commit()
         entity_index = self._get_entity_index_db(entity_id)
+        if entity_index is None:
+            self.db_cursor.execute("INSERT OR IGNORE INTO entities (entity_name) VALUES (?)", (entity_id,))
+            self.db.commit()  # Commit to ensure the entity is added
+            entity_index = self._get_entity_index_db(entity_id)
 
         # Convert time to GMT+0
         now_utc = timestamp
@@ -137,7 +164,6 @@ class DatabaseEngine:
             last_state = last_record[1]
             last_attributes = last_record[2]
             last_system = last_record[3]
-            last_keep = last_record[4]
             if last_state == state and last_attributes == attributes_record_json and last_system == system_json:
                 return
 
@@ -185,7 +211,6 @@ class DatabaseEngine:
                     keep,
                 ),
             )
-            self.db.commit()
         except sqlite3.IntegrityError:
             self.log("Warn: SQL Integrity error inserting data for {}".format(entity_id))
 

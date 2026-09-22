@@ -10,7 +10,7 @@ pred_bat:
   prefix: predbat
 
   # XXX: This is a configuration template, delete this line once you edit your configuration
-  template: True
+  template: true
 
   # Timezone to work in
   timezone: Europe/London
@@ -24,9 +24,13 @@ pred_bat:
   # Can be auto for automatic, 0 for off or values 1-N for a fixed number
   threads: auto
 
+  # Number of log files to keep, including the live predbat.log (2-100, default 10)
+  # Rotated logs are predbat.01.log .. predbat.99.log
+  #log_count: 10
+
   # If you are using Predbat outside of HA then set the HA URL and Key (long lived access token here)
   #ha_url: 'http://homeassistant.local:8123'
-  #ha_key: 'xxx'
+  #ha_key: !secret ha_key
 
   # Set to auto-match with a GivEnergy serial number, but you can override the serial or the sensor names
   # if it doesn't work or if you have more than one inverter you will need to list both
@@ -44,6 +48,9 @@ pred_bat:
   # If you have three phase and one inverter per phase then you would need three load sensors
   #
   # For pv_today if you have multiple solar inverter inputs then you should include one entry for each inverter
+  #
+  # Only needed if you are NOT using givtcp_rest below - with REST set Predbat publishes these four
+  # itself from GivTCP's own daily totals and points itself at them.
   #
   load_today:
     - sensor.givtcp_{geserial}_load_energy_today_kwh
@@ -67,14 +74,16 @@ pred_bat:
   #
   #ge_cloud_data: False
   #ge_cloud_serial: '{geserial}'
-  #ge_cloud_key: 'xxxx'
+  #ge_cloud_key: !secret ge_cloud_key
+
+  # Fox direct cloud interface
+  #fox_key: !secret fox_key
+  #fox_automatic: True
+
   #
   # Controls/status - must by 1 per inverter
   #
   num_inverters: 1
-  #
-  # Run balance inverters every N seconds (0=disabled) - only for multi-inverter
-  balance_inverters_seconds: 60
   #
   # When set use the REST API rather than HA entity for control, should be more reliable/faster to control
   # Set one per inverter
@@ -83,19 +92,25 @@ pred_bat:
     - 'http://homeassistant.local:6345'
     - 'http://homeassistant.local:6346'
 
-  # When enabled automatic restart will restart the add-on if communication fails
-  # Example below is auto-restart for GivTCP add-on itself
+  # Set this to False to keep control of apps.yaml yourself - Predbat still publishes its GivTCP
+  # entities, but stops pointing the settings below at them, so you can name them by hand or point
+  # a setting somewhere else entirely. Defaults to True.
+  #givtcp_automatic: False
+
+  # When enabled automatic restart will restart the app if communication fails
+  # Example below is auto-restart for GivTCP app itself
   #auto_restart:
   #  - shell: 'rm -rf /homeassistant/GivTCP/*.pkl'
-  #  - service: hassio/addon_restart
-  #    addon: 533ea71a_givtcp
+  #  - service: hassio/app_restart
+  #    app: 533ea71a_givtcp
   #
   #  Example on how to restart the inverter via GivTCP
   #  - service: button.press
   #    entity_id: button.givtcp_{geserial}_reboot_invertor
 
-  # If not using REST then instead set the Control here (one for each inverter)
-  # You should keep this section even when using REST as a fallback if it fails and for charge curve calculations
+  # Only needed if you are NOT using givtcp_rest above - with REST set, Predbat publishes and
+  # configures all of these itself and anything you put here is overridden.
+  # Set one entry for each inverter.
   charge_rate:
     - number.givtcp_{geserial}_battery_charge_rate
     - number.givtcp2_{geserial2}_battery_charge_rate
@@ -138,6 +153,9 @@ pred_bat:
   charge_limit:
     - number.givtcp_{geserial}_target_soc
     - number.givtcp2_{geserial2}_target_soc
+  charge_limit_enable:
+    - switch.givtcp_{geserial}_enable_charge_target
+    - switch.givtcp2_{geserial2}_enable_charge_target
   scheduled_charge_enable:
     - switch.givtcp_{geserial}_enable_charge_schedule
     - switch.givtcp2_{geserial2}_enable_charge_schedule
@@ -232,7 +250,7 @@ pred_bat:
   # the default is 1.0 (full power)
   # The example below is from GE 9.5kwh battery with latest firmware and gen1 inverter
   #
-  # Predbat can compute this curve automatically if you have enough data, restart the add-on and look in the logfile for the data
+  # Predbat can compute this curve automatically if you have enough data, restart the app and look in the logfile for the data
   # once set here Predbat will no longer re-compute the curve.
   # Can also be set to 'auto' to just use the calculation curve, not recommended if you are using low power charging mode.
   #battery_charge_power_curve:
@@ -265,8 +283,17 @@ pred_bat:
 
   # Solcast cloud interface, set this or the local interface below
   #solcast_host: 'https://api.solcast.com.au/'
-  #solcast_api_key: 'xxxx'
+  #solcast_api_key: !secret solcast_api_key
   #solcast_poll_hours: 8
+
+  # Forecast Solar interface, set this or the local interface below
+  #forecast_solar:
+  #- postcode: 'SW1A 1AA'
+  #  kwp: 4.0
+  #  azimuth: 180
+  #  declination: 10
+  #  api_key: !secret forecast_solar_api_key
+  #  azimuth_zero_south: false  # Set to true if azimuth is already in Forecast.solar/Open-Meteo convention (0=South) rather than Predbat convention (0=North)
 
   # Set these to match solcast sensor names if not using the cloud interface
   # The regular expression (re:) makes the solcast bit optional
@@ -276,7 +303,20 @@ pred_bat:
   pv_forecast_d3: re:(sensor.(solcast_|)(pv_forecast_|)forecast_(day_3|d3))
   pv_forecast_d4: re:(sensor.(solcast_|)(pv_forecast_|)forecast_(day_4|d4))
 
-  # car_charging_energy defines an incrementing sensor which measures the charge added to your car
+  # Ohme EV charger cloud direct integration
+  #ohme_login: !secret ohme_login
+  #ohme_password: !secret ohme_password
+  # Register the Ohme charger with Predbat as a car (planned/SoC/energy sensors)
+  #ohme_automatic: True
+  # Let Predbat start and stop the charger according to its own car charging plan.
+  # Requires ohme_automatic, and is ignored when the Intelligent slots come from Ohme
+  #ohme_control: True
+  # Take the Octopus Intelligent car slots from Ohme rather than from Octopus directly.
+  # Leave unset to auto-detect an Intelligent tariff when ohme_automatic is on, or set
+  # it explicitly to True/False to override that decision
+  #ohme_automatic_octopus_intelligent: True
+
+  # car_charging_energy defines a daily incrementing sensor which measures the charge added to your car and resets to zero at midnight
   # is used for car_charging_hold feature to filter out car charging from the previous load data
   # Automatically set to detect Wallbox and Zappi, if it doesn't match manually enter your sensor name
   # Also adjust car_charging_energy_scale if it's not in kwH to fix the units
@@ -291,7 +331,7 @@ pred_bat:
   # Auto matches Zappi and Wallbox, or change it for your own
   # One entry per car
   car_charging_planned:
-    - 're:(sensor.wallbox_portal_status_description|sensor.myenergi_zappi_[0-9a-z]+_plug_status)'
+    - 're:(sensor.wallbox_portal_status_description|sensor.myenergi_zappi_[0-9a-z]+_plug_status|sensor.tesla_wall_connector_status)'
 
   car_charging_planned_response:
     - 'yes'
@@ -309,6 +349,7 @@ pred_bat:
     - 'locked'
     - 'plugged in'
     - 'waiting'
+    - 'waiting_car'
 
   # In some cases car planning is difficult (e.g. Ohme with Intelligent doesn't report slots)
   # The car charging now can be set to a sensor to indicate the car is charging and to plan
@@ -321,6 +362,7 @@ pred_bat:
     - 'yes'
     - 'on'
     - 'true'
+    - 'charging'
 
   # To make planned car charging more accurate, either using car_charging_planned or the Octopus Energy plugin,
   # specify your battery size in kwh, charge limit % and current car battery soc % sensors/values.
@@ -338,6 +380,12 @@ pred_bat:
   #car_charging_exclusive:
   #  - True
 
+  # Octopus Energy direct integration
+  #octopus_api_key: !secret octopus_api_key
+  #octopus_api_account: !secret octopus_api_account
+  #octopus_automatic: True
+
+  # Or if using bottle cap dave Home Assistant Octopus Energy plugin set the entities here
   # If you have Octopus intelligent, enable the intelligent slot information to add to pricing
   # Will automatically disable if not found, or comment out to disable fully
   # When enabled it overrides the 'car_charging_planned' feature and predict the car charging based on the intelligent plan (unless octopus intelligent charging is False)
@@ -354,20 +402,29 @@ pred_bat:
   # Set this to False if you use Octopus Intelligent slot for car planning but when on another tariff e.g. Agile
   #octopus_slot_low_rate: False
 
-  # Carbon Intensity data from National grid
-  carbon_intensity: 're:(sensor.carbon_intensity_uk)'
+  # Carbon Intensity data direct from National grid
+  #carbon_postcode: 'SW1A 1AA'
+  #carbon_automatic: true
+
+  # Or using Home Assistant sensor
+  #carbon_intensity: 're:(sensor.carbon_intensity_uk)'
 
   # Octopus saving session points to the saving session Sensor in the Octopus plugin, when enabled saving sessions will be at the assumed
   # Rate is read automatically from the add-in and converted to pence using the conversion rate below (default is 8)
-  octopus_saving_session: 're:(binary_sensor.octopus_energy([0-9a-z_]+|)_saving_session(s|))'
+  octopus_saving_session: 're:(event.octopus_energy([0-9a-z_]+|)_(saving_session_events?|power_down_events))'
   octopus_saving_session_octopoints_per_penny: 8
+  # Minimum octopoints_per_kwh an available saving session must offer for Predbat to auto-join it (default 0, joins any non-negative reward).
+  octopus_saving_session_min_octopoints_per_kwh: 0
 
   # Octopus free session points to the free session Sensor in the Octopus plugin
   # Note: You must enable this event sensor in the Octopus Integration in Home Assistant for it to work
-  octopus_free_session: 're:(event.octopus_energy_([0-9a-z_]+|)_octoplus_free_electricity_session_events)'
+  octopus_free_session: 're:(event.octopus_energy_([0-9a-z_]+|)_octoplus_(free_electricity_session_events|power_up_events))'
 
   # Alternative scraper from Octopus web site if the above is not working
   # octopus_free_url: 'http://octopus.energy/free-electricity'
+
+  # Enter your Axle VPP API key if you have signed up to the Axle service in the UK
+  # axle_api_key: !secret axle_api_key
 
   # Energy rates
   # Please set one of these three, if multiple are set then Octopus is used first, second rates_import/rates_export and latest basic metric
@@ -375,7 +432,7 @@ pred_bat:
   # Set import and export entity to point to the Octopus Energy plugin import and export sensors
   # automatically matches your meter number assuming you have only one (no need to edit the below)
   # Will be ignored if you don't have the sensor but will error if you do have one and it's incorrect
-  # NOTE: To get detailed energy rates you need to go in and manually enable the following events in HA
+  # Note: To get detailed energy rates you need to go in and manually enable the following events in HA
   #       event.octopus_energy_electricity_xxxxxxxx_previous_day_rates
   #       event.octopus_energy_electricity_xxxxxxxx_current_day_rates
   #       event.octopus_energy_electricity_xxxxxxxx_next_day_rates
@@ -433,22 +490,12 @@ pred_bat:
   #    rate: 112
   #    load_scaling: 0.8
 
-  # For pv estimate, leave blank for central estimate, or add 10 for 10% curve (worst case) or 90 or 90% curve (best case)
-  # If you use 10 then disable pv_metric10_weight below
-  # pv_estimate: 10
-
-  # Days previous is the number of days back to find historical load data
-  # Recommended is 7 to capture day of the week but 1 can also be used
-  # if you have more history you could use 7 and 14 (in a list) but the standard data in HA only lasts 10 days
+  # Days previous sets how many days of load history Predbat searches when forecasting your future house load.
+  # By default this uses a weighted-bucket forecast that automatically accounts for day-of-week, holiday mode
+  # and recency (days_previous_auto) - see the documentation for other options, such as picking specific
+  # days/weights instead, or using Load ML.
   days_previous:
     - 7
-
-  # Days previous weight can be used to control the weighting of the previous load points, the values are multiplied by their
-  # weights and then divided through by the total weight. E.g. if you used 1 and 0.5 then the first value would have 2/3rd of the weight and the second 1/3rd
-  # Include one value for each days_previous value, each weighting on a separate line.
-  # If any days_previous's that are not given a weighting they will assume a default weighting of 1.
-  days_previous_weight:
-    - 1
 
   # Number of hours forward to forecast, best left as-is unless you have specific reason
   forecast_hours: 48
@@ -471,13 +518,14 @@ pred_bat:
   # Multiple triggers can be set at once so in total you could use too much energy if all run
   # Creates an entity called 'binary_sensor.predbat_export_trigger_<name>' which will be turned On when the condition is valid
   # connect this to your automation to start whatever you want to trigger
-  export_triggers:
-     - name: 'large'
-       minutes: 60
-       energy: 1.0
-     - name: 'small'
-       minutes: 15
-       energy: 0.25
+  #
+  # export_triggers:
+  #   - name: 'large'
+  #     minutes: 60
+  #     energy: 1.0
+  #   - name: 'small'
+  #     minutes: 15
+  #     energy: 0.25
 
   # If you have a sensor that gives the energy consumed by your solar diverter then add it here
   # this will make the predictions more accurate. It should be an incrementing sensor, it can reset at midnight or not
@@ -563,7 +611,7 @@ pred_bat:
   #  - id: 'iflux'
   #    name: 'Intelligent Flux import/export'
   #    rates_import_octopus_url: 'https://api.octopus.energy/v1/products/INTELLI-FLUX-IMPORT-23-07-14/electricity-tariffs/E-1R-INTELLI-FLUX-IMPORT-23-07-14-{dno_region}/standard-unit-rates/'
-  #    rates_export_octopus_url: 'https://api.octopus.energy/v1/products/INTELLI-FLUX-EXPORT-23-07-14/electricity-tariffs/E-1R-INTELLI-FLUX-EXPORT-23-07-14-{dno_region}/standard-unit-rates/'
+  #    rates_export_octopus_url: 'https://api.octopus.energy/v1/products/INTELLI-FLUX-IMPORT-23-07-14/electricity-tariffs/E-1R-INTELLI-FLUX-IMPORT-23-07-14-{dno_region}/standard-unit-rates/'
 
   # Alert feeds - customise to your country and the alert types, severity and keep value
   #alerts:
@@ -585,3 +633,15 @@ pred_bat:
   #  - '+[car_charging_planned]'
   #  - '+[car_charging_soc]'
   #  - '{car_charging_now}'
+
+  # Redact additional values from predbat.log and debug dumps that Predbat cannot otherwise
+  # recognise as sensitive (an MPAN or similar identifier surfaced by a third-party HA
+  # integration's sensor, say) - see "Redaction in logs and debug files" in apps-yaml.md.
+  # redact_strings_labelled is a name -> value mapping, masked with your own label (e.g. <my_mpan>
+  # below); redact_strings is a bare list for when you don't need one, masked generically as
+  # <redact_strings>. As with any other setting, either can reference a value in secrets.yaml
+  # with !secret instead of writing it here directly.
+  #redact_strings_labelled:
+  #  my_mpan: "1234567890123"
+  #redact_strings:
+  #  - "1234567890123"

@@ -1,11 +1,19 @@
 # -----------------------------------------------------------------------------
 # Predbat Home Battery System
-# Copyright Trefor Southwell 2024 - All Rights Reserved
+# Copyright Trefor Southwell 2026 - All Rights Reserved
 # This application maybe used for personal use only and not for commercial use
 # -----------------------------------------------------------------------------
 # Database Manager for Predbat Home Battery System
 # This module handles all SQL Lite database operations.
 # -----------------------------------------------------------------------------
+
+
+"""Async database manager with IPC queue.
+
+Wraps DatabaseEngine in an async-safe ComponentBase with thread-bridged
+IPC queue for database operations. Ensures thread-safe access to SQLite
+from multiple async contexts.
+"""
 
 from datetime import timedelta, datetime, timezone
 import asyncio
@@ -15,8 +23,17 @@ import threading
 from db_engine import DatabaseEngine, TIME_FORMAT_DB
 from component_base import ComponentBase
 
+IPC_TIMEOUT = 60.0  # Seconds to wait for IPC response
+
 
 class DatabaseManager(ComponentBase):
+    """Async database manager with IPC queue.
+
+    Wraps DatabaseEngine in thread-bridged IPC for async-safe database
+    operations. Processes get_history, set_state, get_all_entities, and
+    get_state commands from the queue.
+    """
+
     def initialize(self, db_enable, db_days):
         self.db_days = db_days
         self.db_queue = []
@@ -27,6 +44,7 @@ class DatabaseManager(ComponentBase):
         self.return_event = threading.Event()
         self.api_started = False
         self.last_success_timestamp = None
+        self.last_commit_time = datetime.now(timezone.utc)
 
     def bridge_event(self, loop):
         """
@@ -41,7 +59,7 @@ class DatabaseManager(ComponentBase):
 
     async def start(self):
         """
-        Initialize the database and clean up old data
+        Initialise the database and clean up old data
         """
 
         self.db_engine = DatabaseEngine(self.base, self.db_days)
@@ -78,18 +96,24 @@ class DatabaseManager(ComponentBase):
                     state = self.db_engine._get_state_db(info["entity_id"])
                     self.queue_results[queue_id] = state
                     self.return_event.set()  # Notify that the result is ready
-                elif command == "stop":
-                    self.api_stop = True
-                    self.log("db_manager: stopping")
 
+                # Commit if the queue is empty and at least 5 seconds have passed since last commit
+                if not self.db_queue:
+                    now = datetime.now(timezone.utc)
+                    if self.last_commit_time is None or (now - self.last_commit_time).total_seconds() >= 5.0:
+                        if hasattr(self.db_engine, "_commit_db"):
+                            self.db_engine._commit_db()
+                            self.last_commit_time = now
                 self.last_success_timestamp = datetime.now(timezone.utc)
 
             except Exception as e:
                 self.log(f"Error in database thread: {e}")
                 self.log("Error: " + traceback.format_exc())
 
+        if hasattr(self.db_engine, "_commit_db"):
+            self.db_engine._commit_db()
         self.db_engine._close()
-        self.log("db_manager: Stopped")
+        self.log("db_manager: Stopped cleanly")
         self.api_started = False
 
     def send_via_ipc(self, command, info, expect_response=False):
@@ -104,7 +128,7 @@ class DatabaseManager(ComponentBase):
 
         if expect_response:
             count = 0.0
-            while (queue_id not in self.queue_results) and count < 15.0:
+            while (queue_id not in self.queue_results) and count < IPC_TIMEOUT:
                 self.return_event.wait(0.1)
                 if queue_id not in self.queue_results:
                     time.sleep(0.1)  # Wait a bit before checking again
@@ -122,9 +146,10 @@ class DatabaseManager(ComponentBase):
         """
         Close the database connection
         """
-        self.api_stop = True
-        self.send_via_ipc("stop", {}, expect_response=False)
         self.api_started = False
+        self.api_stop = True
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self.send_via_ipc, "stop", {}, False)
         self.log("db_manager: stop command sent")
 
     def get_state_db(self, entity_id):

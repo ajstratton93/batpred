@@ -6,7 +6,7 @@ Further details can be found in the [Predheat YouTube video](https://youtu.be/_-
 
 ## Operation
 
-The app runs every 5 minutes and it will automatically update its prediction for the heating system for the next period, up to a maximum of 48 hours.
+The app runs every 5 minutes (by default) and will automatically update its prediction for the heating system for the next period, up to a maximum of 48 hours.
 
 The inputs are as follows
 
@@ -29,6 +29,14 @@ Future versions will also offer Predbat to run in master mode, controlling your 
 
 Predheat is now part of Predbat, you will need to configure it using `apps.yaml` and then enable it by turning on **switch.predbat_predheat_enable**
 
+Configuring the `predheat` section of `apps.yaml` on its own only makes Predheat start up, it does not make it run.
+Until the switch is turned on you will see `Predheat: Startup` and `Predheat: Next run time will be ...` in the log
+followed by `Predheat: Disabled - turn on switch.predbat_predheat_enable to run it`, and no `predheat.*` entities
+will be created. Once the switch is on the log shows `Predheat: Enabled via switch.predbat_predheat_enable ...` and
+then a `Predheat: update at ...` line for each run. If you turn the switch on in Home Assistant but the log still
+says Predheat is disabled, then Predbat did not receive the switch change - toggle it from Predbat's own web
+interface instead and check the log for a `switch_event: switch.predbat_predheat_enable` line.
+
 ### Weather install
 
 You will need a weather forecast service available in Home Assistant for Predbat to be able to forecast heating demand based on the weather forecast.
@@ -42,9 +50,9 @@ Then add in the Home Assistant service and connect up your API key to obtain hou
 
 ### Apex Charts install
 
-Use HACS to install Apex Charts (Lovelace frontend add-on) - <https://github.com/RomRider/apexcharts-card>
+Use HACS to install Apex Charts: <https://github.com/RomRider/apexcharts-card>
 
-There is a template for the Predheat charts in: <https://raw.githubusercontent.com/springfall2008/batpred/refs/heads/main/templates/example_chart_predbat.yaml_template>
+There is a template of [example_Predheat charts](https://raw.githubusercontent.com/springfall2008/batpred/refs/heads/main/templates/example_chart_predheat.yaml_template) you can use.
 
 Create a new Apex chart for each chart in this template and copy the YAML code into the chart.
 
@@ -100,7 +108,7 @@ Set **heating_cop** to the nominal COP of your system. For a gas boiler use 1.0 
 Set **flow_temp** To the target flow temperature of your system, either via a sensor or as a fixed value. E.g. gas boilers are often set to say 60 or 70 degrees while heat pumps are much lower e.g. 30 or 40.
 
 Set **flow_difference_target** to be the difference in flow temperature (in vs out) where your heating system will run at full power if it is above. e.g.
-for gas boilers this maybe something around 40 while on a heat pump, it could be much lower e.g. 10.
+for gas boilers this may be something around 40 while on a heat pump, it could be much lower e.g. 10.
 
 Set **volume_temp** If you have a sensor on your radiators which can confirm the water temperature, this must not be near the heat pump/boiler but instead as close to the
 interior temperature sensor as possible. If you do not have a sensor then instead PredHeat will calculate the next temperature and store it in **next_volume_temp** for use
@@ -109,6 +117,8 @@ in the next calculation cycle.
 For energy rates, they will come from the Predbat configuration, ensure you have your electric or gas rates set correctly.
 
 Note you can also change the tables for **gas_efficiency**, **heat_pump_efficiency** and **delta_correction** in the Predheat configuration but the defaults should be fine to get going.
+
+Set **run_every** to how often you want Predheat to update its heat energy prediction. By default this is every 5 minutes.
 
 Now comes the tricky part, we need to calculate the heat loss for your house:
 
@@ -145,6 +155,8 @@ If your heat source makes use of weather compensation then add the following to 
 
 Predheat will fill in the gaps between the points provided.
 
+IMPORTANT: The weather compensation curve must have a low value of -20 degrees C and a high value of 20 degrees C. You can have whatever other points you want between the upper and lower bounds and Predheat will fill in the gaps, but if you don't have -20 and 20 Predheat will error when it tries to calculate the weather-adjusted flow temperature.
+
 ### Link Predheat to Predbat
 
 Add a **load_forecast** entry in `apps.yaml` to configure Predbat to use the [Predheat load forecast](apps-yaml.md#load-forecast):
@@ -158,7 +170,7 @@ Add a **load_forecast** entry in `apps.yaml` to configure Predbat to use the [Pr
 
 If your **load_today** sensor in `apps.yaml` already contains your heat pump load then when Predbat forecasts your house load, the heat pump load will be double counted - once from historical house load data, and once from the Predheat forecast.
 
-To resolve this you need to use **car_charging_energy** to [exclude heat pump load](apps-yaml.md#car-charging-filtering) from the historical house load energy. e.g.:
+To resolve this you need to use **car_charging_energy** to [exclude heat pump load](car-charging.md#filtering-car-charging-energy-from-house-load) from the historical house load energy. e.g.:
 
 ```yaml
   car_charging_energy:

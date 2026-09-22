@@ -2,13 +2,66 @@
 
 ## I've installed Predbat but I don't see the correct entities
 
-- First look at predbat.status in Home Assistant and the Predbat/AppDaemon add-on log (which can be found in the list of log files in the System/Log area of the GUI).
+- First look at **predbat.status** in Home Assistant and the Predbat App log (which can be found in the list of log files in the System/Log area of the GUI).
 See if any errors are warnings are found. If you see an error something is likely configured incorrectly,
 check your entity settings are correct.
-- Make sure Solcast is installed and it's auto-updated at least a couple of times a day (see the [Solcast instructions](install.md#solcast-install)).
-The default Solcast sensor names may be wrong, you might need to update the `apps.yaml` config to match your own names
-(some people don't have the solcast_ bit in their names)
-- Did you configure AppDaemon apps_dir correctly in `appdaemon.yaml`?
+- Make sure a Solar Forecast is installed and it's auto-updated at least a couple of times a day (see the [Solar Forecast instructions](install.md#solar-forecast-install)).
+If you are using the Solcast Integration then the default Solcast sensor names may be wrong, you might need to update the `apps.yaml` config to match your own names
+(some people don't have the solcast_ bit in their entity names).
+
+## Predbat is failing with Warn: Service call select/select_option data failed
+
+Here's an example error message:
+
+```text
+2026-01-14 15:10:43.706153: Warn: Service call select/select_option data
+{'option': '17:00:00', 'entity_id':
+'select.predbat_fox_603j303046yp036_battery_schedule_charge_end_time'}
+failed
+```
+
+This will happen if you have no actual selectors provided by integrations in Home Assistant before Predbat starts. You can workaround this by adding a
+dummy selector to `configuration.yaml` and restarting HA e.g:
+
+```yaml
+template:
+  - select:
+      - name: "simple_select"
+        state: "{{ states('input_select.my_input') }}"  # Current value
+        options: "{{ ['Option 1', 'Option 2', 'Option 3'] }}"  # Available options
+        select_option:
+          - service: input_select.select_option
+            target:
+              entity_id: input_select.my_input
+            data:
+              option: "{{ option }}"
+```
+
+## Predbat is running but not producing a plan
+
+There are a number of things to work through if Predbat isn't producing a plan:
+
+- Check the [Predbat web console Log view](web-interface.md#log-view) and see if there are any warnings or errors. If there are you need to investigate and resolve those
+- Check the [Web Console Apps view](web-interface.md#apps-view) to see if there are any errors with the `apps.yaml` configuration. Again these need to be resolved
+- Check **predbat.status** in the [Web Console Dash view](web-interface.md#dash-view) - does it indicate there is a problem. See [Predbat status](what-does-predbat-do.md#predbat-status)
+- Also in the Dash view, check what [Predbat mode](what-does-predbat-do.md#predbat-modes) is set. If you want Predbat to control your battery charging it must be set to 'Control charge', if you also want Predbat to be able to force export your battery, it must be set to 'Control charge & discharge'. In 'Monitor' mode Predbat monitors what the inverter is already planned to do, it does not produce a plan of its own
+- In the Dash view, check that **switch.predbat_set_read_only** is not turned on, putting Predbat in [Read-only mode](what-does-predbat-do.md#predbat-modes) where Predbat will plan but not control your inverter.
+
+## Why is my house load lower than expected, or zero?
+
+If your house load is unusually low in the Predbat plan, then its often due to Predbat excluding some of your house load.
+
+- Are your **load_today**, **import_today**, **export_today** and **pv_today** entries in `apps.yaml` correctly configured and pointing to the right inverter/Home Assistant entities?
+- Check the history of these entities, are there gaps in them or do the entities go down during the day rather than continually increment - these need to be resolved if they do not increment continually over the day and reset at midnight.
+- Have you accidentally used a power sensor (W or kW) rather than a daily energy sensor (Wh or kWh)?
+- In the logfile do you see car/iBoost energy being excluded, e.g. "Today's predicted so far 19.0kWh with 3.2kWh car/iBoost excluded"?
+- If energy is being excluded and you have an EV/iBoost, have you configured the correct **car_charging_energy** energy sensor(s) to [filter car charging energy](car-charging.md#filtering-car-charging-energy-from-house-load) in `apps.yaml`?
+- Do these sensors increment over the day or are there gaps or resets back to zero during the day?  Use a daily utility meter to wrap around your EV charger sensor to provide Predbat with a sensor that doesn't do this.
+- Depending on the wiring of your EV charger and inverter, the inverter may not 'see' the EV charging energy.
+If you configure car_charging_energy in `apps.yaml` then Predbat will be calculating an artificially low house load - turn **switch.car_charging_hold** off to stop this.
+- If you don't have a sensor that provides car charging energy then Predbat will use **input_number.predbat_car_charging_threshold** as the
+[threshold to detect car charging](car-charging.md/#filtering-car-charging-energy-from-house-load) - adjust as necessary for your EV charger.
+- If you don't have an EV charger then turn **switch.car_charging_hold** off as Predbat will still use **input_number.predbat_car_charging_threshold** and assume any house load above this is EV charging.
 
 ## Why is my predicted charge % higher or lower than I might expect?
 
@@ -21,7 +74,6 @@ If you do something like have export>import then Predbat will try to export as m
 - Have you tuned **predbat_best_soc_keep settings**?
 - Do you have predicted car charging during the time period?
 - You can also tune **predbat_load_scaling** and **predbat_pv_scaling** to adjust predictions up and down a bit
-- Maybe your historical data includes car charging, you might want to filter this out using [car_charging_hold in apps.yaml](apps-yaml.md#car-charging-filtering)
 
 ## Why didn't the slot get configured?
 
@@ -55,9 +107,39 @@ especially if you have a small battery. If you set it to zero then Predbat may n
 - Perhaps set up the calibration chart and let it run for 24 hours to see how things line up
 - If your export slots are too small compared to expected check your inverter_limit is set correctly (see below)
 
-## In my power flow diagram my grid power is the wrong way around
+## In the power flow diagram my grid power is flowing in the wrong direction
 
-You may need to set '**grid_power_invert** to True if your **grid_power** is positive when importing.
+To reverse the direction of your [grid power entity](apps-yaml.md#power-data) in the Predbat web console, you may need to set '**grid_power_invert** to true if your **grid_power** is positive when importing.
+
+## In the power flow diagram the grid always shows 0W even though I'm clearly exporting (or importing)
+
+**grid_power** must be a single signed sensor - negative while importing, positive while exporting (or the reverse, corrected with **grid_power_invert**). Some meter/CT-clamp integrations instead expose two separate sensors that are always zero or positive - one for import, one for export - rather than one signed sensor. If **grid_power** is pointed at one of these (e.g. the import-only sensor), it will correctly read 0 whenever you're exporting (and vice versa), because that sensor structurally cannot represent flow in the other direction - Predbat is displaying it faithfully, it just isn't the right sensor for this field.
+
+If this is your situation, create a template sensor in Home Assistant that combines the two into one signed value (e.g. `export - import`, or `-import` when only importing) and point **grid_power** at that combined template instead of either sensor directly.
+
+## I have a second solar array that Predbat doesn't manage as an inverter - how do I include its generation?
+
+The [Power Data](apps-yaml.md#power-data) **pv_power**/**pv_today** lists take one entry per inverter Predbat is actually configured to manage (`num_inverters`) - you can't just add an extra line for a second array that has no corresponding managed inverter (e.g. a separate FIT-metered string, or a second hybrid system Predbat isn't controlling), Predbat will still only look for as many sensors as it has inverters defined.
+
+Instead, create a template sensor in Home Assistant that adds the extra array's generation into the same total, and point your managed inverter's **pv_power**/**pv_today** entry at that combined sensor instead of the raw inverter sensor. For example, combining a managed inverter's PV power with a separate FIT array's:
+
+```yaml
+# Combined PV power sensor, updated every 5 minutes instead of the default of every sensor state change
+- trigger:
+    - platform: time_pattern
+      minutes: "/5"
+  sensor:
+    - name: "Combined PV Power"
+      unique_id: "combined_pv_power"
+      unit_of_measurement: W
+      device_class: power
+      state_class: measurement
+      state: >
+        {{ (states('sensor.givtcp_xxx_pv_power') | float(0)
+          + states('sensor.fit_array_pv_power') | float(0)) | round(0) }}
+```
+
+Use a `time_pattern` trigger template (rather than a plain templated sensor in the UI) so it updates on a fixed schedule instead of firing on every state change of either underlying sensor, which generates unnecessary extra state history. The same pattern works for **pv_today** (summing the two daily energy totals instead of instantaneous power).
 
 ## My plan is freeze charging or holding at 100% battery a lot
 
@@ -93,11 +175,11 @@ And this should prevent the issue
 
 ## The plan doesn't charge or discharge when I expect it to
 
-Predbat can only work on the information it's given, although it does run every 5 minutes when it re-evaluates the plan and adjusts if necessary.
+Predbat can only work on the information it's given, although it does run every 5 minutes to execute the plan, and updates and re-evaluates the plan every 10 minutes, adjusting if necessary.
 
 The plan Predbat produces assumes that your average load and PV forecasts are accurate and Predbat will aim to give you the maximum return.
 
-Make sure you have set up your [Solcast solar forecast correctly](install.md#solcast-install) with the number of panels, orientation, output, etc.
+Make sure you have set up your [Solar forecast correctly](install.md#solar-forecast-install) with the number of panels, orientation, output, etc.
 
 Projected daily load is determined from historical load information so make sure you have set [days_previous and days_previous_weight in apps.yaml](apps-yaml.md#basics)
 to give appropriately representative load history to Predbat, and read the [longer explanation of how days_previous works](apps-yaml.md#understanding-how-days_previous-works).
@@ -148,13 +230,74 @@ Finally, it could be worth considering adding [import or export rate increments]
 to avoid or encourage charging or discharging in certain time periods - e.g. avoiding exporting in the time period saving sessions normally fall in,
 or to encourage discharging just before import rates fall overnight.
 
-## Predbat is causing warning messages about 'exceed maximum size' in the Home Assistant Core log
+## Predbat is causing 'exceed maximum size' warning messages in the Home Assistant Core log
 
-If you have a large **input_number.predbat_forecast_plan_hours** then you may see warning messages in the Home Assistant Core log about the size of a number of Predbat entities,
-the message will be "State attributes for predbat.*XXXX* exceed maximum size of 16384 bytes".
+You may see warning messages in the Home Assistant Core log about the size of a number of Predbat entities, the message will be "State attributes for predbat.*XXXX* exceed maximum size of 16384 bytes".
 
-This is just a warning, the Predbat entity attributes aren't stored in the database anyway,
-but you can suppress these warnings by adding the following to your `configuration.yaml` file:
+This is just a warning from the Home Assistant recorder, but note that Predbat entity attributes are stored in the recorder database and can take up a significant amount of space.
+The history of most of Predbat's entities isn't needed so to limit the size of the recorder database the following filters can be added to `configuration.yaml`,
+but pay attention to the [order in which inclusion and exclusion rules are applied](https://www.home-assistant.io/integrations/recorder/#configure-filter) if you have existing filters:
+
+```yaml
+recorder:
+  exclude:
+    domains:
+      - predbat
+      - predheat
+    entities:
+      - sensor.predbat_load_ml_forecast
+      - sensor.predbat_pv_tomorrow
+      - sensor.predbat_pv_forecast_raw
+      - sensor.predbat_pv_d2
+      - sensor.predbat_pv_d3
+      - sensor.predbat_temperature
+  include:
+    entities: #The history of these entities is used by Predbat
+      - predbat.car_charging_power
+      - predbat.carbon_today
+      - predbat.cost_today
+      - predbat.cost_today_car
+      - predbat.cost_yesterday
+      - predbat.cost_yesterday_car
+      - predbat.load_ml_stats
+      - predbat.load_power
+      - predbat.load_energy_actual
+      - predbat.load_energy_predicted
+      - predbat.load_energy_adjusted
+      - predbat.load_inday_adjustment
+      - predbat.ppkwh_today
+      - predbat.ppkwh_hour
+      - predbat.pv_energy_h0
+      - predbat.pv_power
+      - predbat.rates
+      - predbat.rates_export
+      - predbat.soc_kw_best
+      - predbat.soc_kw_h0
+      - predbat.savings_yesterday_predbat
+      - predbat.savings_yesterday_pvbat
+      - predbat.status
+      - predbat.savings_total_predbat
+      - predbat.savings_total_pvbat
+      - predheat.external_temperature
+      - predheat.heating_energy
+      - predheat.internal_temperature
+      - predheat.target_temperature
+
+```
+
+Two things to be careful of if you adapt the example above:
+
+- Don't drop entries from the `include` list without checking what reads them. Predbat needs the recorded history of
+every entity listed there and quietly loses a feature for each one it can no longer read - `predbat.cost_today`, for
+instance, is what the Plan tab's *History* and *Yesterday Without Predbat* views are built from.
+- Don't add further Predbat sensors to the `exclude` list for the same reason. `sensor.predbat_pv_forecast_h0`,
+`sensor.predbat_pv_forecast_h0_uncalibrated` and `sensor.predbat_pv_today` are deliberately left out of it because PV
+calibration, the PV chart and the PV accuracy chart compare against their history. Adding a `sensor.*` entity to
+`exclude` and to `include` does not rescue it either - an entry under `include` only overrides the exclusion of its
+whole *domain*, which here is `predbat`, not `sensor`.
+
+When the serialized attributes payload for a Predbat entity state exceeds 16384 bytes, the recorder will not store any attributes for that state (only the state value itself is stored). States whose serialized attributes payload is below this limit are stored normally.
+You can suppress these warnings by adding the following to your `configuration.yaml` file:
 
 ```yaml
 # Filter out 'message too large' warnings from Predbat entities
@@ -162,51 +305,17 @@ logger:
   default: warning
   filters:
     homeassistant.components.recorder.db_schema:
-      - "State attributes for predbat.base10_export_energy exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.base10_import_energy exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.base10_metric exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.base10_pv_energy exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.battery_cycle exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.battery_cycle_best exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.battery_power exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.battery_power_best exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.best_charge_limit exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.best_export_energy exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.best_import_energy exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.best_load_energy exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.best_metric exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.best_pv_energy exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.best10_export_energy exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.best10_import_energy exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.best10_metric exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.best10_pv_energy exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.cost_today_export exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.cost_today_import exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.export_energy exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.grid_power exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.grid_power_best exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.import_energy exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.load_energy exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.load_energy_actual exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.load_energy_adjusted exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.load_energy_predicted exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.load_power exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.load_power_best exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.metric exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.plan_html exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.pv_energy exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.pv_power exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.pv_power_best exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.rates exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.soc_kw exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.soc_kw_base10 exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.soc_kw_best exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
-      - "State attributes for predbat.soc_kw_best10 exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
+      - "State attributes for predbat.cost_yesterday exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
+      - "State attributes for predbat.savings_yesterday_predbat exceed maximum size of 16384 bytes. This can cause database performance issues; Attributes will not be stored"
 ```
 
-## Error - metric_octopus_import not set correctly or no energy rates can be read
+## Error - metric_octopus_import not set correctly in apps.yaml, or no energy rates can be read
 
-If you get this error in the Predbat log file:
+If you get this error in the Predbat log file it is telling you that Predbat can't find your energy rates from your `apps.yaml` [Energy rate configuration](energy-rates.md).
+
+Check your `apps.yaml` configuration and that the entities you have specified as energy rates have got data in them ('Settings' / 'Developer Tools' / 'States', filtering on the entity name).
+
+If you are using the Octopus integration to provide your rates to Predbat then there are some specific requirements Predbat has:
 
 - Check that the Octopus integration is working and that **event.octopus_energy_electricity_METER_NUMBER_current_day_rates**
 and **sensor.octopus_electricity_energy_METER_NUMBER_current_rate** are both populated by the integration.
@@ -217,16 +326,16 @@ If the 'event' and 'sensor' entities are not consistently named then Predbat wil
 To fix this, uninstall the Octopus integration, reboot Home Assistant,
 delete all the old Octopus sensors, and [re-install the Octopus Integration](install.md#octopus-energy).
 
-## WARN: No solar data has been configured
+## Warn: No solar data has been configured
 
 If you get this warning message in the Predbat log file or you see that the 'PV kWh' column in the [Predbat plan card](predbat-plan-card.md) is completely blank:
 
-- Ensure that you have [installed and configured Solcast correctly](install.md#solcast-install)
-- Check the Solcast integration in Home Assistant is configured and enabled (go to Settings / Integrations / Solcast )
+- Ensure that you have [installed and configured a Solar Forecast correctly](install.md#solar-forecast-install)
+- Check the Solcast integration in Home Assistant is configured and enabled (go to Settings / Integrations / Solcast)
 - Check that there are no errors relating to Solcast in the Home Assistant log (go to Settings / System / Logs and view the 'Home Assistant Core' log).
 If you see an error 429 message in the log then this is as a result of  Solcast's rate limiting for Hobbyist accounts.
-The only fix is to re-run the 'Solcast update' automation and hope that Solcast isn't as busy when you re-run.
-- Verify the solar forecast has been populated in Home Assistant by going to Developer Tools / States, filtering on 'solcast',
+The only fix is to wait for the next scheduled Solcast update and hope Solcast isn't as busy then.
+- Verify the solar forecast has been populated in Home Assistant by going to 'Settings' / 'Developer Tools' / 'States', filtering on 'solcast',
 and check that you can see the half-hourly solar forecasts in the Solcast entities
 - If you can see the Solcast entities but there are no forecast PV figures, try running the 'Solcast update' automation you created, and check again the Solcast entities
 - If the Solcast entities are still not populated, try reloading the Solcast integration (go to System / Devices & Services / Integrations tab, click on 'Solcast PV Forecast',
@@ -239,14 +348,15 @@ If you've run out of API calls you will have to wait until midnight GMT for the 
 It's recommended that you don't include the Solcast forecast within your GivEnergy portal to avoid running out of API calls.
 - Check the [Solcast server API status](https://status.solcast.com/) is OK
 
-## Note: Can not find battery charge curve
+## Info: Cannot find battery charge curve
 
-If you get the message "Note: Can not find battery charge curve, one of the required settings for soc_kw, battery_power and charge_rate are missing from apps.yaml" in the logfile
-then Predbat tries to create a battery charge curve but does not have access to the required history information in Home Assistant.
+If you get the message "Info: Cannot find battery charge curve, one of the required settings for soc_kw, battery_power and charge_rate are missing from apps.yaml" in the logfile
+then Predbat is trying to create a battery charge curve but does not have access to the required history information in Home Assistant.
 
-[Creating the battery charge curve](apps-yaml.md#workarounds) is described in the apps.yaml document.
-The most likely cause of the above message appearing in the logfile is that you are controlling the inverter in REST mode
-but have not uncommented the following entities in apps.yaml that Predbat needs to obtain history from to create the battery charge curve:
+[Creating the battery charge curve](apps-yaml.md#battery-chargedischarge-curves) is described in the `apps.yaml` document.
+
+One cause of the above message appearing in the logfile is that you are controlling a GivEnergy inverter in REST mode
+but have not uncommented the following entities in `apps.yaml` that Predbat needs to obtain history from to create the battery charge curve:
 
 ```yaml
   charge_rate:
@@ -259,15 +369,19 @@ but have not uncommented the following entities in apps.yaml that Predbat needs 
     - sensor.givtcp_{geserial}_soc_kwh
 ```
 
+The other main cause of the above message appearing is that one or more of the entities that Predbat is trying to use to create the charge curve does not have suitable history.  You should check the history on the entities Predbat highlights that it is using, and that the charging/discharging goes to full/empty as described in the battery curve documentation.
+If the charging/discharging is not at near full rate, or doesn't go to near full/empty then Predbat will be unable to create the curves.
+
 ## WARN: Inverter is in calibration mode
 
 If you see the message "WARN: Inverter is in calibration mode, Predbat will not function correctly and will be disabled" in the logfile,
 then Predbat has identified that your inverter is currently calibrating your battery. Predbat's status will also be set to 'Calibration'.
 
-Predbat will set the inverter charge and discharge rates to maximum (if they are not already), SoC target to 100% and battery reserve to minimum (usually 4%),
-and will not execute the plan nor enable battery charge or discharge.
+Predbat will set the inverter charge and discharge rates to maximum (if they are not already), SoC target to 100% and battery reserve to minimum (usually 4%), and will not execute the plan, nor enable battery charge or discharge.
 
-Once the inverter finishes calibrating the battery, Predbat will resume normal operations.
+If you wish to take manual control of the inverter whilst the calibration is running, such as to vary battery charge or discharge rates to better fit the calibration into cheap energy rate periods, simply set Predbat to [read-only mode](customisation.md#predbat-mode) and you will be able to use the normal inverter controls without interference from Predbat.
+
+Once the inverter finishes calibrating the battery, Predbat will resume normal operations.<BR>Remember to turn read-only mode off if you had turned it on whilst the calibration was running.
 
 ## Inverter time is xxx, Predbat computer time is xxx, this is xxx minutes skewed, Predbat may not function correctly
 
@@ -287,7 +401,7 @@ In the GivEnergy portal, go to My Inverters / Remote Control (cog symbol) / clic
 - Finally, check how often your inverter integration is polling your inverter for new data. For [GivTCP the Self Run Loop Timer](apps-yaml.md#rest-interface-inverter-control)
 is recommended to be set to a value of between 20 and 60 seconds.
 
-If you have checked the above and keep getting “time is skewed” warnings then it means Home Assistant/predbat isn’t getting the same time from the inverter as it is expecting.
+If you have checked the above and keep getting “time is skewed” warnings then it means Home Assistant/Predbat isn’t getting the same time from the inverter as it is expecting.
 Either GivTCP has lost communications with the inverter or the inverter has stopped talking to the world.
 
 If you look at the Logbook in Home Assistant you should see a steady stream of entities changing in HA.
@@ -295,7 +409,7 @@ In particular, you will see the GivTCP inverter time entity changing every polli
 
 Possible fixes:
 
-- restart the GivTCP add-on
+- restart the GivTCP app
 - restart Home Assistant (although usually restarting GivTCP is enough)
 - power the inverter off, turn off the panels and battery first, then the inverter, then follow the reverse sequence to power the inverter back on again.
 This forces the inverter to reconnect to your wifi
@@ -308,4 +422,4 @@ There is a [Home Assistant automation that will alert you if GivTCP stops sendin
 
 ## I have another problem not listed above
 
-If you are still having trouble feel free to raise a [Github ticket](https://github.com/springfall2008/batpred/issues) for support
+If you are still having trouble feel free to raise a [GitHub ticket](https://github.com/springfall2008/batpred/issues) for support

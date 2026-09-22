@@ -1,6 +1,6 @@
 # -----------------------------------------------------------------------------
 # Predbat Home Battery System
-# Copyright Trefor Southwell 2024 - All Rights Reserved
+# Copyright Trefor Southwell 2026 - All Rights Reserved
 # This application maybe used for personal use only and not for commercial use
 # -----------------------------------------------------------------------------
 # fmt off
@@ -9,6 +9,67 @@
 # pylint: disable=attribute-defined-outside-init
 #
 # Helper functions for web pages
+
+
+"""Web UI component generators for CSS and JavaScript.
+
+Contains functions that generate CSS stylesheets and JavaScript code for
+all web dashboard UI components including charts (ApexCharts), entity
+selectors, form controls, code editors (CodeMirror), modals, and responsive
+navigation menus.
+"""
+
+
+def get_refresh_inverter_js():
+    """
+    Returns CSS and JavaScript code for refreshing inverter data.
+    """
+    return """
+        <style>
+        @keyframes inverterStatusFadeOut {
+            0%   { opacity: 1; }
+            60%  { opacity: 1; }
+            100% { opacity: 0; }
+        }
+        #inverterRefreshStatus {
+            display: inline-block;
+            font-size: 13px;
+            color: #666;
+        }
+        #inverterRefreshStatus.fade-out {
+            animation: inverterStatusFadeOut 4s forwards;
+        }
+        </style>
+        <script>
+        function refreshInverterData() {
+            var btn = document.getElementById('inverterRefreshBtn');
+            var status = document.getElementById('inverterRefreshStatus');
+            btn.disabled = true;
+            btn.style.backgroundColor = '#90CAF9';
+            btn.textContent = 'Refreshing\u2026';
+            status.className = '';
+            status.style.color = '#666';
+            status.textContent = '';
+            fetch('./inverter_refresh', {method: 'POST'})
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    status.style.color = '#4CAF50';
+                    status.textContent = 'Done \u2014 reloading in 20s\u2026';
+                    setTimeout(function() { status.classList.add('fade-out'); }, 100);
+                    setTimeout(function() { location.reload(); }, 20000);
+                })
+                .catch(function(e) {
+                    btn.disabled = false;
+                    btn.style.backgroundColor = '#2196F3';
+                    btn.textContent = 'Refresh';
+                    status.style.color = '#f44336';
+                    status.textContent = 'Refresh failed';
+                    setTimeout(function() { status.classList.add('fade-out'); }, 2000);
+                    console.error('Refresh failed:', e);
+                });
+        }
+        </script>
+    """
 
 
 def get_restart_button_js():
@@ -69,7 +130,37 @@ async function restartComponent(componentName) {
     return text
 
 
-def get_entity_js(entity):
+def get_entity_detailed_row_js():
+    text = """
+    <script>
+    function toggleDetailRow(rowIndex) {
+        var mainRow = document.getElementById('row_' + rowIndex);
+        var detailRows = document.querySelectorAll('#detail_' + rowIndex);
+        var timeCell = mainRow.cells[0];
+        var isExpanded = mainRow.classList.contains('expanded');
+
+        if (isExpanded) {
+            // Collapse
+            detailRows.forEach(function(row) {
+                row.style.display = 'none';
+            });
+            mainRow.classList.remove('expanded');
+            timeCell.innerHTML = timeCell.innerHTML.replace('\u25bc', '\u25b6');
+        } else {
+            // Expand
+            detailRows.forEach(function(row) {
+                row.style.display = 'table-row';
+            });
+            mainRow.classList.add('expanded');
+            timeCell.innerHTML = timeCell.innerHTML.replace('\u25b6', '\u25bc');
+        }
+    }
+    </script>
+    """
+    return text
+
+
+def get_entity_js(selected_entities_json, entity_attributes_json):
     text = (
         """
         <script>
@@ -78,36 +169,40 @@ def get_entity_js(entity):
         let filteredEntities = [];
         let selectedIndex = -1;
         let isDropdownVisible = false;
+        let selectedEntities = """
+        + selected_entities_json
+        + """;
+        let entityAttributes = """
+        + entity_attributes_json
+        + """;
 
-        // Initialize entity data
+        // Initialise entity data
 
         document.addEventListener('DOMContentLoaded', function() {
+            // Restore the "Show All" preference across page loads (e.g. after submitting the
+            // entity form to add another entity, which is a full page navigation, not an
+            // in-place update)
+            var showAll = localStorage.getItem('entityShowAllEntities') === 'true';
+            var showAllCheckbox = document.getElementById('showAllEntities');
+            if (showAllCheckbox) {
+                showAllCheckbox.checked = showAll;
+            }
             // Load entity data from API
-            loadEntityData();
+            loadEntityData(showAll);
         });
 
-        async function loadEntityData() {
+        async function loadEntityData(showAll) {
             try {
-                const response = await fetch('./api/entities');
+                const url = showAll ? './api/entities?all=1' : './api/entities';
+                const response = await fetch(url);
                 if (!response.ok) {
                     throw new Error('Failed to load entities');
                 }
                 allEntities = await response.json();
 
-                // Set initial value if entity is selected
-                const currentEntity = '"""
-        + (entity.replace("'", "\\'").replace('"', '\\"') if entity else "")
-        + """';
-                if (currentEntity) {
-                    const entityInput = document.getElementById('entitySearchInput');
-                    const selectedEntity = allEntities.find(e => e.id === currentEntity);
-                    if (selectedEntity) {
-                        entityInput.value = selectedEntity.id;
-                    }
-                }
-
                 // Set up event listeners after data is loaded
                 setupEventListeners();
+                updateSelectedEntitiesDisplay();
             } catch (error) {
                 console.error('Error loading entities:', error);
                 allEntities = [];
@@ -115,9 +210,19 @@ def get_entity_js(entity):
             }
         }
 
+        function toggleShowAll(checked) {
+            localStorage.setItem('entityShowAllEntities', checked ? 'true' : 'false');
+            loadEntityData(checked).then(function() {
+                if (isDropdownVisible) {
+                    filterEntityOptions();
+                }
+            });
+        }
+
         function setupEventListeners() {
             const entityInput = document.getElementById('entitySearchInput');
             const clearButton = document.getElementById('clearEntitySearch');
+            const entityForm = document.getElementById('entitySelectForm');
 
             if (entityInput) {
                 entityInput.addEventListener('input', filterEntityOptions);
@@ -129,9 +234,32 @@ def get_entity_js(entity):
             if (clearButton) {
                 clearButton.addEventListener('click', function() {
                     entityInput.value = '';
-                    document.getElementById('selectedEntityId').value = '';
                     hideEntityDropdown();
                     entityInput.focus();
+                });
+            }
+
+            // Intercept form submission to add selected entities and attributes as hidden inputs
+            if (entityForm) {
+                entityForm.addEventListener('submit', function(event) {
+                    // Remove any existing entity_id and entity_attribute inputs
+                    const existingInputs = entityForm.querySelectorAll('input[name=\"entity_id\"], input[name=\"entity_attribute\"]');
+                    existingInputs.forEach(input => input.remove());
+
+                    // Add hidden inputs for each selected entity and its attribute
+                    selectedEntities.forEach(selection => {
+                        const hiddenEntityInput = document.createElement('input');
+                        hiddenEntityInput.type = 'hidden';
+                        hiddenEntityInput.name = 'entity_id';
+                        hiddenEntityInput.value = selection.entity;
+                        entityForm.appendChild(hiddenEntityInput);
+
+                        const hiddenAttrInput = document.createElement('input');
+                        hiddenAttrInput.type = 'hidden';
+                        hiddenAttrInput.name = 'entity_attribute';
+                        hiddenAttrInput.value = selection.attributes.join(',');
+                        entityForm.appendChild(hiddenAttrInput);
+                    });
                 });
             }
 
@@ -142,6 +270,170 @@ def get_entity_js(entity):
                     hideEntityDropdown();
                 }
             });
+        }
+
+        function updateSelectedEntitiesDisplay() {
+            const display = document.getElementById('selectedEntitiesDisplay');
+            if (!display) return;
+
+            if (selectedEntities.length === 0) {
+                display.innerHTML = '<span style=\"color: #999;\">No entities selected</span>';
+                return;
+            }
+
+            // Create table for selected entities with attribute checkboxes
+            let html = '<table style=\"width: 100%; border-collapse: collapse;\">';
+            html += '<thead><tr>';
+            html += '<th style=\"text-align: left; padding: 8px; border-bottom: 2px solid #ddd;\">Entity</th>';
+            html += '<th style=\"text-align: left; padding: 8px; border-bottom: 2px solid #ddd;\">Attributes</th>';
+            html += '<th style=\"text-align: center; padding: 8px; border-bottom: 2px solid #ddd; width: 50px;\">Remove</th>';
+            html += '</tr></thead><tbody>';
+
+            selectedEntities.forEach((selection, idx) => {
+                const entity = allEntities.find(e => e.id === selection.entity);
+                const entityName = entity ? entity.name : selection.entity;
+                const availableAttrs = entityAttributes[selection.entity] || [];
+
+                html += '<tr style=\"border-bottom: 1px solid #eee;\">';
+                html += '<td style=\"padding: 8px;\">' + entityName + '</td>';
+                html += '<td style=\"padding: 8px; position: relative;\">';
+
+                // Multi-select dropdown with tag display
+                html += '<div class=\"attr-select-container\" id=\"attr-container-' + idx + '\">';
+
+                // Display selected attributes as tags
+                html += '<div class=\"attr-tags\" onclick=\"toggleAttrDropdown(' + idx + ')\" style=\"cursor: pointer; min-height: 30px; padding: 4px 8px; border: 1px solid #ddd; border-radius: 4px; background: var(--input-background, #fff);\">';
+                if (selection.attributes.length === 0 || (selection.attributes.length === 1 && selection.attributes[0] === '')) {
+                    html += '<span style=\"color: #999;\">state (default)</span>';
+                } else {
+                    selection.attributes.forEach(attr => {
+                        const displayName = attr === '' ? 'state' : attr;
+                        html += '<span class=\"attr-tag\">' + displayName + '</span>';
+                    });
+                }
+                html += '<span style=\"float: right; color: #999;\">\u25bc</span>';
+                html += '</div>';
+
+                // Dropdown menu (hidden by default)
+                html += '<div class=\"attr-dropdown\" id=\"attr-dropdown-' + idx + '\" style=\"display: none;\">';
+
+                // State option
+                const stateChecked = selection.attributes.includes('') ? ' checked' : '';
+                html += '<label class=\"attr-option\">';
+                html += '<input type=\"checkbox\" onchange=\"toggleEntityAttribute(' + idx + ', \\'\\')\"' + stateChecked + ' />';
+                html += '<span style=\"font-weight: bold;\">state (default)</span>';
+                html += '</label>';
+
+                // Other attributes
+                availableAttrs.forEach(attr => {
+                    const attrChecked = selection.attributes.includes(attr) ? ' checked' : '';
+                    html += '<label class=\"attr-option\">';
+                    html += '<input type=\"checkbox\" onchange=\"toggleEntityAttribute(' + idx + ', \\'' + attr + '\\')\"' + attrChecked + ' />';
+                    html += attr;
+                    html += '</label>';
+                });
+
+                html += '</div>';
+                html += '</div>';
+
+                html += '</td>';
+                html += '<td style=\"padding: 8px; text-align: center;\">';
+                html += '<button type=\"button\" onclick=\"removeEntity(' + idx + ')\" style=\"background: #ff4444; color: white; border: none; border-radius: 4px; cursor: pointer; padding: 4px 12px; font-weight: bold;\" title=\"Remove\">X</button>';
+                html += '</td>';
+                html += '</tr>';
+            });
+
+            html += '</tbody></table>';
+            display.innerHTML = html;
+        }
+
+        function toggleAttrDropdown(index) {
+            const dropdown = document.getElementById('attr-dropdown-' + index);
+            if (dropdown) {
+                const isVisible = dropdown.style.display !== 'none';
+                // Close all other dropdowns
+                document.querySelectorAll('.attr-dropdown').forEach(d => d.style.display = 'none');
+                // Toggle this dropdown
+                dropdown.style.display = isVisible ? 'none' : 'block';
+            }
+        }
+
+        function toggleEntityAttribute(index, attribute) {
+            if (index >= 0 && index < selectedEntities.length) {
+                const attrs = selectedEntities[index].attributes;
+                const attrIndex = attrs.indexOf(attribute);
+
+                if (attrIndex >= 0) {
+                    // Remove attribute
+                    attrs.splice(attrIndex, 1);
+                } else {
+                    // Add attribute
+                    attrs.push(attribute);
+                }
+
+                // Ensure at least one attribute is selected (default to state)
+                if (attrs.length === 0) {
+                    attrs.push('');
+                }
+
+                updateSelectedEntitiesDisplay();
+                autoSubmitForm(); // Automatically update chart
+            }
+        }
+
+        // Close dropdown when clicking outside
+        document.addEventListener('click', function(event) {
+            if (!event.target.closest('.attr-select-container')) {
+                document.querySelectorAll('.attr-dropdown').forEach(d => d.style.display = 'none');
+            }
+        });
+
+        function toggleEntitySelection(entityId) {
+            const index = selectedEntities.findIndex(s => s.entity === entityId);
+            if (index >= 0) {
+                selectedEntities.splice(index, 1);
+            } else {
+                selectedEntities.push({ entity: entityId, attributes: [''] });
+            }
+            updateSelectedEntitiesDisplay();
+            renderEntityDropdown(); // Re-render to update checkboxes
+            autoSubmitForm(); // Automatically update chart
+        }
+
+        function removeEntity(index) {
+            if (index >= 0 && index < selectedEntities.length) {
+                selectedEntities.splice(index, 1);
+                updateSelectedEntitiesDisplay();
+                if (isDropdownVisible) {
+                    renderEntityDropdown(); // Update checkboxes if dropdown is open
+                }
+                autoSubmitForm(); // Automatically update chart
+            }
+        }
+
+        function autoSubmitForm() {
+            const entityForm = document.getElementById('entitySelectForm');
+            if (entityForm) {
+                // Manually add hidden inputs before submitting
+                const existingInputs = entityForm.querySelectorAll('input[name=\"entity_id\"], input[name=\"entity_attribute\"]');
+                existingInputs.forEach(input => input.remove());
+
+                selectedEntities.forEach(selection => {
+                    const hiddenEntityInput = document.createElement('input');
+                    hiddenEntityInput.type = 'hidden';
+                    hiddenEntityInput.name = 'entity_id';
+                    hiddenEntityInput.value = selection.entity;
+                    entityForm.appendChild(hiddenEntityInput);
+
+                    const hiddenAttrInput = document.createElement('input');
+                    hiddenAttrInput.type = 'hidden';
+                    hiddenAttrInput.name = 'entity_attribute';
+                    hiddenAttrInput.value = selection.attributes.join(',');
+                    entityForm.appendChild(hiddenAttrInput);
+                });
+
+                entityForm.submit();
+            }
         }
 
         function filterEntityOptions() {
@@ -198,9 +490,14 @@ def get_entity_js(entity):
                     const globalIndex = filteredEntities.indexOf(entity);
                     const nameColor = isDarkMode ? '#ffffff' : '#333333';
                     const idColor = isDarkMode ? '#cccccc' : '#666666';
-                    html += '<div class="entity-option" data-index="' + globalIndex + '" onclick="selectEntity(\\'' + entity.id + '\\')">';
+                    const isChecked = selectedEntities.some(s => s.entity === entity.id);
+
+                    html += '<div class="entity-option" data-index="' + globalIndex + '" onclick="toggleEntitySelection(\\'' + entity.id + '\\')">';
+                    html += '<input type="checkbox" ' + (isChecked ? 'checked' : '') + ' onclick="event.stopPropagation(); toggleEntitySelection(\\'' + entity.id + '\\')" style="margin-right: 8px;" />';
+                    html += '<div style="flex: 1; display: flex; justify-content: space-between;">';
                     html += '<span class="entity-name" style="color: ' + nameColor + ' !important;">' + entity.name + '</span>';
                     html += '<span class="entity-id" style="color: ' + idColor + ' !important;">' + entity.id + '</span>';
+                    html += '</div>';
                     html += '</div>';
                 });
             });
@@ -214,22 +511,6 @@ def get_entity_js(entity):
             dropdown.style.display = 'block';
             isDropdownVisible = true;
             selectedIndex = -1;
-        }
-
-        function selectEntity(entityId) {
-            const entity = allEntities.find(e => e.id === entityId);
-            if (entity) {
-                const input = document.getElementById('entitySearchInput');
-                const hiddenInput = document.getElementById('selectedEntityId');
-
-                input.value = entity.id;
-                hiddenInput.value = entity.id;
-
-                hideEntityDropdown();
-
-                // Submit the form
-                document.getElementById('entitySelectForm').submit();
-            }
         }
 
         function hideEntityDropdown() {
@@ -258,7 +539,7 @@ def get_entity_js(entity):
                     const entityIndex = parseInt(options[selectedIndex].getAttribute('data-index'));
                     const entity = filteredEntities[entityIndex];
                     if (entity) {
-                        selectEntity(entity.id);
+                        toggleEntitySelection(entity.id);
                     }
                 }
             } else if (event.key === 'Escape') {
@@ -297,7 +578,7 @@ def get_entity_css():
             background: white;
             border: 1px solid #ddd;
             border-top: none;
-            max-height: 300px;
+            max-height: 400px;
             overflow-y: auto;
             z-index: 1000;
             display: none;
@@ -308,13 +589,18 @@ def get_entity_css():
             cursor: pointer;
             border-bottom: 1px solid #eee;
             display: flex;
-            justify-content: space-between;
             align-items: center;
             gap: 10px;
         }
         .entity-option:hover,
         .entity-option.selected {
             background-color: #f0f0f0;
+        }
+        .entity-option input[type="checkbox"] {
+            flex-shrink: 0;
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
         }
         .entity-option .entity-name {
             font-weight: bold;
@@ -385,6 +671,111 @@ def get_entity_css():
         }
         body.dark-mode #clearEntitySearch:hover {
             color: #fff !important;
+        }
+        body.dark-mode #selectedEntitiesDisplay {
+            background-color: #2d2d2d !important;
+            border: 1px solid #555 !important;
+        }
+        body.dark-mode #selectedEntitiesDisplay table {
+            border: none !important;
+        }
+        body.dark-mode #selectedEntitiesDisplay th {
+            background-color: #444 !important;
+            color: #e0e0e0 !important;
+            border-bottom: 2px solid #555 !important;
+        }
+        body.dark-mode #selectedEntitiesDisplay td {
+            color: #e0e0e0 !important;
+            border-bottom: 1px solid #444 !important;
+        }
+        body.dark-mode #selectedEntitiesDisplay tr {
+            border-bottom: 1px solid #444 !important;
+        }
+        body.dark-mode #selectedEntitiesDisplay select {
+            background-color: #333 !important;
+            color: #e0e0e0 !important;
+            border: 1px solid #666 !important;
+        }
+        body.dark-mode #selectedEntitiesDisplay select option {
+            background-color: #333 !important;
+            color: #e0e0e0 !important;
+        }
+        body.dark-mode #selectedEntitiesDisplay button {
+            background-color: #cc3333 !important;
+            color: #e0e0e0 !important;
+            border: none !important;
+        }
+        body.dark-mode #selectedEntitiesDisplay button:hover {
+            background-color: #dd4444 !important;
+        }
+
+        /* Attribute multi-select dropdown styles */
+        .attr-select-container {
+            position: relative;
+        }
+        .attr-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            align-items: center;
+        }
+        .attr-tag {
+            display: inline-block;
+            background: #4CAF50;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 0.9em;
+        }
+        .attr-dropdown {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            background: white;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+            z-index: 1000;
+            max-height: 300px;
+            overflow-y: auto;
+            margin-top: 2px;
+        }
+        .attr-option {
+            display: block;
+            padding: 8px 12px;
+            cursor: pointer;
+            border-bottom: 1px solid #f0f0f0;
+        }
+        .attr-option:hover {
+            background-color: #f5f5f5;
+        }
+        .attr-option input[type="checkbox"] {
+            margin-right: 8px;
+        }
+
+        /* Dark mode for attribute selector */
+        body.dark-mode .attr-tags {
+            background: #333 !important;
+            border-color: #666;
+            color: #e0e0e0;
+        }
+        body.dark-mode .attr-tag {
+            background: #2e7d32;
+        }
+        body.dark-mode .attr-dropdown {
+            background: #2a2a2a;
+            border-color: #555;
+        }
+        body.dark-mode .attr-option {
+            color: #e0e0e0;
+            border-bottom-color: #444;
+        }
+        body.dark-mode .attr-option:hover {
+            background-color: #333;
+        }
+        body.dark-mode .attr-option input[type="checkbox"] {
+            cursor: pointer;
         }
         </style>
 """
@@ -623,10 +1014,8 @@ function typeIsNumerical(value) {
     try {
         if (value.includes('.')) {
             value = parseFloat(value);
-            console.log("Parsed as float:", value);
         } else {
             value = parseInt(value);
-            console.log("Parsed as integer:", value);
         }
     } catch (e) {
         return false; // Not a numerical value
@@ -1337,6 +1726,186 @@ function saveNestedValue(rowId) {
     updateChangeCounter();
 }
 
+// Counter used to give each pending addition a unique key, as several can target the same list
+let addCounter = 0;
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+function deleteNestedValue(rowId) {
+    const row = document.getElementById('nested_row_' + rowId);
+    const nestedPath = row.dataset.nestedPath;
+
+    // Keyed separately from an edit of the same value, so that undoing the deletion does not
+    // also silently undo a pending edit - the server applies edits before any deletion
+    pendingChanges[nestedPath + '#delete'] = {
+        rowId: rowId,
+        originalValue: row.dataset.nestedOriginal,
+        newValue: '',
+        type: 'delete',
+        isNested: true,
+        path: nestedPath
+    };
+
+    row.classList.add('row-deleted');
+    setDeleteButtonState(rowId, true);
+    updateChangeCounter();
+}
+
+function undoDeleteNestedValue(rowId) {
+    const row = document.getElementById('nested_row_' + rowId);
+    const nestedPath = row.dataset.nestedPath;
+
+    delete pendingChanges[nestedPath + '#delete'];
+    row.classList.remove('row-deleted');
+    setDeleteButtonState(rowId, false);
+    updateChangeCounter();
+}
+
+function setDeleteButtonState(rowId, deleted) {
+    // The button is looked up by id rather than by class, as a row holding a nested table
+    // also contains the delete buttons of all of its children
+    const button = document.getElementById('delete_button_' + rowId);
+    if (!button) return;
+    if (deleted) {
+        button.textContent = 'Undo';
+        button.setAttribute('onclick', 'undoDeleteNestedValue(' + rowId + ')');
+    } else {
+        button.textContent = 'Delete';
+        button.setAttribute('onclick', 'deleteNestedValue(' + rowId + ')');
+    }
+}
+
+function hideAddDialog() {
+    const overlay = document.querySelector('.add-overlay');
+    if (overlay) {
+        overlay.remove();
+    }
+}
+
+// Show a dialog collecting one or more fields, calling onConfirm with an id -> value object
+function showAddDialog(title, help, fields, onConfirm) {
+    const overlay = document.createElement('div');
+    overlay.className = 'confirmation-overlay add-overlay';
+
+    let fieldsHtml = '';
+    fields.forEach(field => {
+        if (field.type === 'textarea') {
+            fieldsHtml += `<label class="add-dialog-label" for="add_field_${field.id}">${field.label}</label>
+                           <textarea class="add-dialog-input" id="add_field_${field.id}" rows="5"></textarea>`;
+        } else {
+            fieldsHtml += `<label class="add-dialog-label" for="add_field_${field.id}">${field.label}</label>
+                           <input type="text" class="add-dialog-input" id="add_field_${field.id}">`;
+        }
+    });
+
+    overlay.innerHTML = `
+        <div class="confirmation-dialog">
+            <h3>${title}</h3>
+            <p>${help}</p>
+            ${fieldsHtml}
+            <div class="confirmation-buttons">
+                <button class="cancel-button-dialog" onclick="hideAddDialog()">Cancel</button>
+                <button class="confirm-button" id="addDialogConfirm">Add</button>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(overlay);
+
+    // Pre-fill any defaults, which cannot go in the markup above as they may contain newlines
+    fields.forEach(field => {
+        document.getElementById('add_field_' + field.id).value = field.value || '';
+    });
+
+    document.getElementById('addDialogConfirm').onclick = () => {
+        const values = {};
+        for (const field of fields) {
+            values[field.id] = document.getElementById('add_field_' + field.id).value;
+        }
+        if (onConfirm(values)) {
+            hideAddDialog();
+        }
+    };
+
+    document.getElementById('add_field_' + fields[0].id).focus();
+}
+
+// Insert a pending row above the add button and register the change, returning the change key
+function registerPendingAdd(anchorId, path, valueText, nameHtml, valueHtml) {
+    addCounter += 1;
+    const changeKey = path + '#' + addCounter;
+
+    pendingChanges[changeKey] = {
+        rowId: null,
+        originalValue: '',
+        newValue: valueText,
+        type: 'add',
+        isNested: true,
+        path: path,
+        pendingRowId: addCounter
+    };
+
+    const anchor = document.getElementById('add_anchor_' + anchorId);
+    const row = document.createElement('tr');
+    row.id = 'pending_row_' + addCounter;
+    row.className = 'row-added';
+    row.dataset.changeKey = changeKey;
+    row.innerHTML = `<td>${nameHtml}</td><td>${valueHtml}</td>` +
+                    `<td><button class="cancel-button" onclick="cancelPendingAdd(${addCounter})">Remove</button></td>`;
+    anchor.parentNode.insertBefore(row, anchor);
+
+    updateChangeCounter();
+    return changeKey;
+}
+
+function cancelPendingAdd(pendingRowId) {
+    const row = document.getElementById('pending_row_' + pendingRowId);
+    if (!row) return;
+    delete pendingChanges[row.dataset.changeKey];
+    row.remove();
+    updateChangeCounter();
+}
+
+function addListItem(listPath, argName, anchorId) {
+    // compare_list entries need at least a name and an id, so offer them as a starting point
+    const template = (argName === 'compare_list') ? 'name: My Tariff\\nid: my_tariff' : '';
+    const help = (argName === 'compare_list')
+        ? 'Enter the new tariff to compare, one <b>setting: value</b> per line. A <b>name</b> and a unique <b>id</b> are required.'
+        : 'Enter the new entry in YAML format - a single value, or one <b>setting: value</b> per line.';
+
+    showAddDialog('Add entry to ' + listPath, help, [{id: 'value', label: 'New entry', type: 'textarea', value: template}], (values) => {
+        const valueText = values.value;
+        if (!valueText.trim()) {
+            showMessage('Value cannot be empty', 'error');
+            return false;
+        }
+        registerPendingAdd(anchorId, listPath + '[]', valueText, '+ ', '<pre>' + escapeHtml(valueText) + '</pre>');
+        return true;
+    });
+}
+
+function addDictKey(dictPath, anchorId) {
+    showAddDialog('Add setting to ' + dictPath, 'Enter the name of the new setting and its value.',
+                  [{id: 'key', label: 'Setting name', type: 'text'}, {id: 'value', label: 'Value', type: 'text'}], (values) => {
+        const key = values.key.trim();
+        const valueText = values.value;
+        if (!key.match(/^[A-Za-z0-9_-]+$/)) {
+            showMessage('Setting name must contain only letters, numbers, dashes or underscores', 'error');
+            return false;
+        }
+        if (!valueText.trim()) {
+            showMessage('Value cannot be empty', 'error');
+            return false;
+        }
+        registerPendingAdd(anchorId, dictPath + '.' + key, valueText, '<b>' + escapeHtml(key) + ': </b>', escapeHtml(valueText));
+        return true;
+    });
+}
+
 function markNestedRowAsChanged(rowId) {
     const row = document.getElementById('nested_row_' + rowId);
     row.classList.add('row-changed');
@@ -1353,7 +1922,20 @@ function discardAllChanges() {
     for (const pathOrArgName in pendingChanges) {
         const change = pendingChanges[pathOrArgName];
 
-        if (change.isNested) {
+        if (change.type === 'delete') {
+            // Restore a row marked for deletion
+            const row = document.getElementById('nested_row_' + change.rowId);
+            if (row) {
+                row.classList.remove('row-deleted');
+            }
+            setDeleteButtonState(change.rowId, false);
+        } else if (change.type === 'add') {
+            // Drop the preview row of a pending addition
+            const row = document.getElementById('pending_row_' + change.pendingRowId);
+            if (row) {
+                row.remove();
+            }
+        } else if (change.isNested) {
             // Handle nested values
             const row = document.getElementById('nested_row_' + change.rowId);
             const valueCell = document.getElementById('nested_value_' + change.rowId);
@@ -1499,6 +2081,57 @@ def get_apps_css():
 
 .edit-button:hover {
     background-color: #45a049;
+}
+
+.delete-button, .add-button {
+    color: white;
+    border: none;
+    padding: 4px 8px;
+    text-align: center;
+    text-decoration: none;
+    display: inline-block;
+    font-size: 12px;
+    margin: 2px 2px;
+    cursor: pointer;
+    border-radius: 3px;
+}
+
+.delete-button {
+    background-color: #dc3545;
+}
+
+.delete-button:hover {
+    background-color: #c82333;
+}
+
+.add-button {
+    background-color: #17a2b8;
+}
+
+.add-button:hover {
+    background-color: #138496;
+}
+
+.add-dialog-label {
+    display: block;
+    font-weight: bold;
+    margin-top: 10px;
+}
+
+.add-dialog-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 6px;
+    border: 1px solid #ddd;
+    border-radius: 3px;
+    font-family: monospace;
+    font-size: 13px;
+}
+
+body.dark-mode .add-dialog-input {
+    background-color: #2d2d2d;
+    color: #e0e0e0;
+    border: 1px solid #555;
 }
 
 .edit-input {
@@ -1713,6 +2346,29 @@ body.dark-mode .toggle-button::before {
     border-left: 4px solid #ffc107 !important;
 }
 
+/* Rows pending deletion or addition */
+.row-deleted {
+    background-color: #f8d7da !important;
+    border-left: 4px solid #dc3545 !important;
+    text-decoration: line-through;
+    opacity: 0.7;
+}
+
+.row-added {
+    background-color: #d4edda !important;
+    border-left: 4px solid #28a745 !important;
+}
+
+body.dark-mode .row-deleted {
+    background-color: #3f1e1e !important;
+    border-left: 4px solid #dc3545 !important;
+}
+
+body.dark-mode .row-added {
+    background-color: #1e3f20 !important;
+    border-left: 4px solid #28a745 !important;
+}
+
 /* Dark mode save controls styles */
 body.dark-mode .save-controls {
     background-color: #2d2d2d;
@@ -1905,6 +2561,200 @@ body.dark-mode .entity-value {
     return text
 
 
+def get_dashboard_collapsible_js():
+    """
+    Return JavaScript for dashboard collapsible sections
+    """
+    text = """
+<script>
+function saveSectionState() {
+    const allSections = document.querySelectorAll('.dashboard-section-content');
+    const state = {};
+    allSections.forEach(section => {
+        state[section.id] = section.classList.contains('collapsed');
+    });
+    sessionStorage.setItem('dashboardSectionState', JSON.stringify(state));
+}
+
+function restoreSectionState() {
+    const stateStr = sessionStorage.getItem('dashboardSectionState');
+    if (!stateStr) return;
+
+    try {
+        const state = JSON.parse(stateStr);
+        Object.keys(state).forEach(sectionId => {
+            const section = document.getElementById(sectionId);
+            const icon = document.getElementById('icon-' + sectionId);
+            if (section && icon) {
+                if (state[sectionId]) {
+                    section.classList.add('collapsed');
+                    icon.textContent = '+';
+                } else {
+                    section.classList.remove('collapsed');
+                    icon.textContent = '−';
+                }
+            }
+        });
+        updateExpandAllButton();
+    } catch (e) {
+        console.error('Error restoring section state:', e);
+    }
+}
+
+function updateExpandAllButton() {
+    const allSections = document.querySelectorAll('.dashboard-section-content');
+    const btn = document.getElementById('expandAllBtn');
+    if (!btn) return;
+
+    const allExpanded = Array.from(allSections).every(s => !s.classList.contains('collapsed'));
+    btn.textContent = allExpanded ? 'Collapse All' : 'Expand All';
+}
+
+function toggleDashboardSection(sectionId) {
+    const section = document.getElementById(sectionId);
+    const icon = document.getElementById('icon-' + sectionId);
+
+    if (section.classList.contains('collapsed')) {
+        section.classList.remove('collapsed');
+        icon.textContent = '−';
+    } else {
+        section.classList.add('collapsed');
+        icon.textContent = '+';
+    }
+
+    // Save state and update the expand all button text
+    saveSectionState();
+    updateExpandAllButton();
+}
+
+function toggleAllSections() {
+    const allSections = document.querySelectorAll('.dashboard-section-content');
+    const allIcons = document.querySelectorAll('.expand-icon');
+    const btn = document.getElementById('expandAllBtn');
+
+    // Check if all are expanded or not
+    const allExpanded = Array.from(allSections).every(s => !s.classList.contains('collapsed'));
+
+    allSections.forEach((section, index) => {
+        if (allExpanded) {
+            section.classList.add('collapsed');
+            if (allIcons[index]) allIcons[index].textContent = '+';
+        } else {
+            section.classList.remove('collapsed');
+            if (allIcons[index]) allIcons[index].textContent = '−';
+        }
+    });
+
+    btn.textContent = allExpanded ? 'Expand All' : 'Collapse All';
+    saveSectionState();
+}
+
+// Restore state when page loads
+document.addEventListener('DOMContentLoaded', restoreSectionState);
+</script>
+"""
+    return text
+
+
+def get_dashboard_css():
+    """
+    Return CSS for dashboard collapsible sections
+    """
+    text = """
+<style>
+.expand-all-button {
+    background-color: #4CAF50;
+    color: white;
+    border: none;
+    padding: 10px 20px;
+    text-align: center;
+    text-decoration: none;
+    display: inline-block;
+    font-size: 14px;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: background-color 0.3s ease;
+}
+
+.expand-all-button:hover {
+    background-color: #45a049;
+}
+
+.dashboard-section {
+    margin: 0;
+    margin-bottom: 2px;
+}
+
+.dashboard-section-header {
+    cursor: pointer;
+    user-select: none;
+    padding: 6px 10px;
+    background-color: #f5f5f5;
+    border-radius: 4px;
+    transition: background-color 0.3s ease;
+    display: flex;
+    align-items: center;
+    margin: 0;
+}
+
+.dashboard-section-header:hover {
+    background-color: #e8e8e8;
+}
+
+.expand-icon {
+    display: inline-block;
+    width: 24px;
+    height: 24px;
+    line-height: 24px;
+    text-align: center;
+    margin-right: 8px;
+    font-weight: bold;
+    font-size: 20px;
+    color: #4CAF50;
+}
+
+.dashboard-section-content {
+    transition: max-height 0.3s ease, opacity 0.3s ease;
+    overflow-y: auto;
+    padding-bottom: 20px;
+}
+
+.dashboard-section-content.collapsed {
+    max-height: 0;
+    opacity: 0;
+}
+
+.dashboard-section-content:not(.collapsed) {
+    max-height: 50000px;
+    opacity: 1;
+}
+
+/* Dark mode for dashboard sections */
+body.dark-mode .expand-all-button {
+    background-color: #4CAF50;
+}
+
+body.dark-mode .expand-all-button:hover {
+    background-color: #45a049;
+}
+
+body.dark-mode .dashboard-section-header {
+    background-color: #333;
+    color: #e0e0e0;
+}
+
+body.dark-mode .dashboard-section-header:hover {
+    background-color: #3a3a3a;
+}
+
+body.dark-mode .expand-icon {
+    color: #4CAF50;
+}
+</style>
+"""
+    return text
+
+
 def get_components_css():
     """
     Return CSS for components page
@@ -1932,6 +2782,10 @@ def get_components_css():
 
 .component-card.active {
     border-color: #4CAF50;
+}
+
+.component-card.error {
+    border-color: #dc3545;
 }
 
 .component-card.inactive {
@@ -1979,8 +2833,7 @@ def get_components_css():
     color: #333;
 }
 
-.restart-button {
-    background-color: #2196F3;
+.restart-button, .edit-button {
     color: white;
     border: none;
     padding: 6px 12px;
@@ -1992,6 +2845,10 @@ def get_components_css():
     margin-left: 10px;
 }
 
+.restart-button {
+    background-color: #2196F3;
+}
+
 .restart-button:hover {
     background-color: #1976D2;
 }
@@ -1999,6 +2856,14 @@ def get_components_css():
 .restart-button:disabled {
     background-color: #ccc;
     cursor: not-allowed;
+}
+
+.edit-button {
+    background-color: #FF9800;
+}
+
+.edit-button:hover {
+    background-color: #F57C00;
 }
 
 .component-details {
@@ -2096,6 +2961,16 @@ def get_components_css():
     font-style: italic;
 }
 
+.error-count-none {
+    color: #4CAF50;
+    font-weight: bold;
+}
+
+.error-count-high {
+    color: #f44336;
+    font-weight: bold;
+}
+
 /* Dark mode styles */
 body.dark-mode .component-card {
     background: #2d2d2d;
@@ -2105,6 +2980,10 @@ body.dark-mode .component-card {
 
 body.dark-mode .component-card.active {
     border-color: #4CAF50;
+}
+
+body.dark-mode .component-card.error {
+    border-color: #dc3545;
 }
 
 body.dark-mode .component-card.inactive {
@@ -2183,9 +3062,22 @@ body.dark-mode .last-updated-time {
     font-style: italic;
 }
 
+body.dark-mode .error-count-none {
+    color: #4CAF50;
+    font-weight: bold;
+}
+
+body.dark-mode .error-count-high {
+    color: #f44336;
+    font-weight: bold;
+}
+
+body.dark-mode .restart-button, body.dark-mode .edit-button {
+    color: white;
+}
+
 body.dark-mode .restart-button {
     background-color: #2196F3;
-    color: white;
 }
 
 body.dark-mode .restart-button:hover {
@@ -2195,6 +3087,14 @@ body.dark-mode .restart-button:hover {
 body.dark-mode .restart-button:disabled {
     background-color: #555;
     color: #999;
+}
+
+body.dark-mode .edit-button {
+    background-color: #FF9800;
+}
+
+body.dark-mode .edit-button:hover {
+    background-color: #F57C00;
 }
 
 /* Responsive design */
@@ -2219,6 +3119,1499 @@ body.dark-mode .restart-button:disabled {
     }
 }
 </style>
+"""
+    return text
+
+
+def get_discovery_css():
+    """
+    Return CSS for the discovery catalogue page
+    """
+    text = """
+<style>
+.discovery-bar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin: 12px 0 20px 0;
+}
+
+.discovery-counts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.discovery-count {
+    background: #eceff1;
+    border-radius: 12px;
+    padding: 3px 10px;
+    font-size: 0.85em;
+    white-space: nowrap;
+}
+
+body.dark-mode .discovery-count {
+    background: #37474f;
+    color: #eee;
+}
+
+.discovery-toggle {
+    margin-left: auto;
+    padding: 6px 14px;
+    border-radius: 4px;
+    text-decoration: none;
+    background: #1976D2;
+    color: #fff;
+    white-space: nowrap;
+}
+
+.discovery-toggle:hover {
+    background: #1565C0;
+}
+
+.discovery-warning {
+    border-left: 5px solid #d32f2f;
+    background: #ffebee;
+    color: #b71c1c;
+    padding: 10px 14px;
+    border-radius: 4px;
+    margin-bottom: 18px;
+}
+
+body.dark-mode .discovery-warning {
+    background: #4a1c1c;
+    color: #ffcdd2;
+}
+
+.discovery-conflicts {
+    border-left: 5px solid #f57c00;
+    background: #fff8e1;
+    color: #6d4c00;
+    padding: 10px 14px;
+    border-radius: 4px;
+    margin-bottom: 18px;
+}
+
+body.dark-mode .discovery-conflicts {
+    background: #4a3c1c;
+    color: #ffe082;
+}
+
+.discovery-clear {
+    border-left: 5px solid #4CAF50;
+    background: #e8f5e9;
+    color: #1b5e20;
+    padding: 10px 14px;
+    border-radius: 4px;
+    margin-bottom: 18px;
+}
+
+body.dark-mode .discovery-clear {
+    background: #1b3a1e;
+    color: #c8e6c9;
+}
+
+.discovery-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+    gap: 18px;
+    margin-bottom: 26px;
+}
+
+.discovery-card {
+    border: 2px solid #ddd;
+    border-radius: 8px;
+    padding: 16px;
+    background: #fff;
+    color: #333;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    overflow-wrap: break-word;
+    word-wrap: break-word;
+}
+
+body.dark-mode .discovery-card {
+    background: #2c2c2c;
+    color: #eee;
+    border-color: #555;
+}
+
+.discovery-card-title {
+    font-weight: bold;
+    font-size: 1.05em;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.discovery-source {
+    background: #1976D2;
+    color: #fff;
+    border-radius: 10px;
+    padding: 2px 9px;
+    font-size: 0.75em;
+    font-weight: normal;
+}
+
+.discovery-field {
+    margin: 3px 0;
+    line-height: 1.45;
+}
+
+.discovery-key {
+    color: #555;
+    font-weight: 600;
+}
+
+body.dark-mode .discovery-key {
+    color: #bbb;
+}
+
+.discovery-nested {
+    margin-left: 16px;
+    border-left: 2px solid #e0e0e0;
+    padding-left: 10px;
+}
+
+body.dark-mode .discovery-nested {
+    border-left-color: #555;
+}
+
+.discovery-token {
+    font-family: monospace;
+    background: #f1f1f1;
+    border-radius: 3px;
+    padding: 0 4px;
+}
+
+body.dark-mode .discovery-token {
+    background: #3a3a3a;
+}
+
+.discovery-raw {
+    background: #f6f6f6;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    padding: 12px;
+    overflow-x: auto;
+    font-size: 0.85em;
+    white-space: pre;
+}
+
+body.dark-mode .discovery-raw {
+    background: #1e1e1e;
+    color: #ddd;
+    border-color: #555;
+}
+
+.discovery-empty {
+    padding: 20px;
+    background: #f5f5f5;
+    border-radius: 6px;
+    color: #555;
+}
+
+body.dark-mode .discovery-empty {
+    background: #333;
+    color: #ccc;
+}
+
+@media (max-width: 768px) {
+    .discovery-grid {
+        grid-template-columns: 1fr;
+    }
+}
+</style>
+"""
+    return text
+
+
+def get_entity_modal_css():
+    """
+    Return CSS for entity modal popup
+    """
+    text = """
+<style>
+/* Entity Modal Styles */
+.entity-modal {
+    display: none;
+    position: fixed;
+    z-index: 1000;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    overflow: auto;
+    background-color: rgba(0, 0, 0, 0.5);
+}
+
+.entity-modal-content {
+    background-color: #fff;
+    margin: 5% auto;
+    padding: 20px;
+    border-radius: 8px;
+    width: 90%;
+    max-width: 1200px;
+    max-height: 80vh;
+    overflow-y: auto;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+    color: #333;
+}
+
+.entity-modal-close {
+    color: #aaa;
+    float: right;
+    font-size: 28px;
+    font-weight: bold;
+    cursor: pointer;
+}
+
+.entity-modal-close:hover,
+.entity-modal-close:focus {
+    color: #000;
+}
+
+.entity-search-input {
+    width: 100%;
+    padding: 10px;
+    margin: 10px 0;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    font-size: 14px;
+    box-sizing: border-box;
+}
+
+.entity-list-table-container {
+    overflow-x: auto;
+    margin-top: 10px;
+}
+
+.entity-list-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 10px;
+}
+
+.entity-list-table th {
+    background-color: #4CAF50;
+    color: white;
+    padding: 12px;
+    text-align: left;
+    border: 1px solid #ddd;
+    font-weight: bold;
+}
+
+.entity-list-table td {
+    padding: 10px;
+    border: 1px solid #ddd;
+    color: #333;
+}
+
+.entity-list-table tbody tr:hover {
+    background-color: #f1f1f1;
+}
+
+.entity-list-table a {
+    color: #2196F3;
+    text-decoration: none;
+}
+
+.entity-list-table a:hover {
+    text-decoration: underline;
+}
+
+.entity-empty-state {
+    text-align: center;
+    padding: 20px;
+    color: #999;
+    font-size: 16px;
+}
+
+/* Dark mode support */
+body.dark-mode .entity-modal-content {
+    background-color: #2c2c2c;
+    color: #e0e0e0;
+}
+
+body.dark-mode .entity-modal-close {
+    color: #aaa;
+}
+
+body.dark-mode .entity-modal-close:hover,
+body.dark-mode .entity-modal-close:focus {
+    color: #fff;
+}
+
+body.dark-mode .entity-search-input {
+    background-color: #333;
+    color: #e0e0e0;
+    border-color: #555;
+}
+
+body.dark-mode .entity-list-table th {
+    background-color: #333;
+    color: #e0e0e0;
+    border-color: #555;
+}
+
+body.dark-mode .entity-list-table td {
+    color: #e0e0e0;
+    border-color: #555;
+}
+
+body.dark-mode .entity-list-table tbody tr:hover {
+    background-color: #3c3c3c;
+}
+
+body.dark-mode .entity-list-table a {
+    color: #64B5F6;
+}
+
+body.dark-mode .entity-empty-state {
+    color: #999;
+}
+
+/* Responsive design */
+@media (max-width: 768px) {
+    .entity-modal-content {
+        width: 90%;
+        margin: 10% auto;
+        padding: 15px;
+    }
+
+    .entity-list-table th,
+    .entity-list-table td {
+        padding: 8px;
+        font-size: 0.9em;
+    }
+}
+</style>
+"""
+    return text
+
+
+def get_component_edit_modal_css():
+    """
+    Return CSS for component edit modal
+    """
+    text = """
+<style>
+/* Component Edit Modal Styles */
+.component-edit-modal-content {
+    max-width: 800px;
+    max-height: 90vh;
+}
+
+.component-edit-form {
+    margin: 20px 0;
+}
+
+.config-field {
+    margin-bottom: 20px;
+    padding: 15px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    background: #f9f9f9;
+}
+
+.config-field-label {
+    display: block;
+    margin-bottom: 8px;
+    font-weight: bold;
+    color: #333;
+}
+
+.config-field-label .required-star {
+    color: #f44336;
+    margin-left: 4px;
+}
+
+.config-field-label .required-or-star {
+    color: #FF9800;
+    margin-left: 4px;
+}
+
+.config-field-default {
+    color: #666;
+    font-size: 0.9em;
+    margin-left: 10px;
+    font-weight: normal;
+}
+
+.config-field-input-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.config-field-input {
+    flex: 1;
+    padding: 8px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 14px;
+}
+
+.config-field-textarea {
+    width: 100%;
+    padding: 8px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 14px;
+    box-sizing: border-box;
+}
+
+.config-field-input:focus,
+.config-field-textarea:focus {
+    outline: none;
+    border-color: #2196F3;
+}
+
+.config-field-input.error,
+.config-field-textarea.error {
+    border-color: #f44336;
+}
+
+.config-field-error {
+    color: #f44336;
+    font-size: 0.85em;
+    margin-top: 4px;
+    display: none;
+}
+
+.config-field-error.visible {
+    display: block;
+}
+
+.delete-button {
+    background-color: #f44336;
+    color: white;
+    border: none;
+    padding: 6px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 16px;
+    font-weight: bold;
+    transition: background-color 0.3s ease;
+}
+
+.delete-button:hover {
+    background-color: #d32f2f;
+}
+
+.add-button {
+    background-color: #4CAF50;
+    color: white;
+    border: none;
+    padding: 6px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: bold;
+    transition: background-color 0.3s ease;
+    margin-top: 8px;
+}
+
+.add-button:hover {
+    background-color: #45a049;
+}
+
+/* Toggle switch for boolean fields */
+.toggle-switch {
+    position: relative;
+    display: inline-block;
+    width: 50px;
+    height: 24px;
+}
+
+.toggle-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.toggle-slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: #ccc;
+    transition: 0.4s;
+    border-radius: 24px;
+}
+
+.toggle-slider:before {
+    position: absolute;
+    content: "";
+    height: 18px;
+    width: 18px;
+    left: 3px;
+    bottom: 3px;
+    background-color: white;
+    transition: 0.4s;
+    border-radius: 50%;
+}
+
+input:checked + .toggle-slider {
+    background-color: #dc3545;
+}
+
+input:checked + .toggle-slider:before {
+    transform: translateX(26px);
+}
+
+.toggle-switch.deleted {
+    opacity: 0.4;
+}
+
+.toggle-switch.deleted .toggle-slider {
+    background-color: #999;
+}
+
+.deleted-indicator {
+    color: #ff4444;
+    font-size: 0.9em;
+    margin-left: 10px;
+    font-style: italic;
+}
+
+.component-edit-buttons {
+    display: flex;
+    gap: 10px;
+    justify-content: flex-end;
+    margin-top: 20px;
+    padding-top: 15px;
+    border-top: 1px solid #ddd;
+}
+
+.save-button {
+    background-color: #4CAF50;
+    color: white;
+    border: none;
+    padding: 10px 20px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: bold;
+    transition: background-color 0.3s ease;
+}
+
+.save-button:hover {
+    background-color: #45a049;
+}
+
+.save-button:disabled {
+    background-color: #ccc;
+    cursor: not-allowed;
+}
+
+.cancel-button {
+    background-color: #999;
+    color: white;
+    border: none;
+    padding: 10px 20px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: bold;
+    transition: background-color 0.3s ease;
+}
+
+.cancel-button:hover {
+    background-color: #777;
+}
+
+.component-edit-error {
+    color: #f44336;
+    padding: 10px;
+    margin: 10px 0;
+    border-radius: 4px;
+    display: none;
+}
+
+.component-edit-error.visible {
+    display: block;
+    background-color: #ffebee;
+}
+
+/* Dark mode support */
+body.dark-mode .config-field {
+    background: #2a2a2a;
+    border-color: #555;
+}
+
+body.dark-mode .config-field-label {
+    color: #e0e0e0;
+}
+
+body.dark-mode .config-field-default {
+    color: #aaa;
+}
+
+body.dark-mode .config-field-input {
+    background-color: #333;
+    color: #e0e0e0;
+    border-color: #555;
+}
+
+body.dark-mode .config-field-textarea {
+    background-color: #333;
+    color: #e0e0e0;
+    border-color: #555;
+}
+
+body.dark-mode .toggle-slider {
+    background-color: #555;
+}
+
+body.dark-mode input:checked + .toggle-slider {
+    background-color: #dc3545;
+}
+
+body.dark-mode .deleted-indicator {
+    color: #ff6666;
+}
+
+body.dark-mode .component-edit-buttons {
+    border-top-color: #555;
+}
+
+body.dark-mode .component-edit-error.visible {
+    background-color: #3a1a1a;
+}
+
+/* Responsive design */
+@media (max-width: 768px) {
+    .component-edit-modal-content {
+        width: 95%;
+        max-height: 95vh;
+    }
+
+    .config-field {
+        padding: 10px;
+    }
+
+    .config-field-input-row {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .delete-button {
+        width: 100%;
+        margin-top: 8px;
+    }
+}
+</style>
+"""
+    return text
+
+
+def get_entity_modal_js():
+    """
+    Return JavaScript for entity modal popup
+    """
+    text = """
+<script>
+let currentEntityData = [];
+
+async function showEntityModal(filter) {
+    const modal = document.getElementById('entityModal');
+    const modalTitle = document.getElementById('entityModalTitle');
+    const tableBody = document.getElementById('entityTableBody');
+    const emptyState = document.getElementById('entityEmptyState');
+    const searchInput = document.getElementById('entitySearchInput');
+
+    // Clear search input
+    searchInput.value = '';
+
+    // Show modal
+    modal.style.display = 'block';
+    modalTitle.textContent = 'Entities matching: ' + filter;
+
+    // Clear table
+    tableBody.innerHTML = '<tr><td colspan="3" style="text-align: center;">Loading...</td></tr>';
+    emptyState.style.display = 'none';
+
+    try {
+        // Fetch entities
+        const response = await fetch('./component_entities?filter=' + encodeURIComponent(filter));
+        const data = await response.json();
+
+        currentEntityData = data.entities || [];
+
+        // Populate table
+        if (currentEntityData.length === 0) {
+            tableBody.innerHTML = '';
+            emptyState.style.display = 'block';
+        } else {
+            renderEntityTable(currentEntityData);
+        }
+    } catch (error) {
+        console.error('Error fetching entities:', error);
+        tableBody.innerHTML = '<tr><td colspan="3" style="text-align: center; color: red;">Error loading entities</td></tr>';
+    }
+}
+
+function renderEntityTable(entities) {
+    const tableBody = document.getElementById('entityTableBody');
+    const emptyState = document.getElementById('entityEmptyState');
+
+    if (entities.length === 0) {
+        tableBody.innerHTML = '';
+        emptyState.style.display = 'block';
+        return;
+    }
+
+    emptyState.style.display = 'none';
+
+    let html = '';
+    for (const entity of entities) {
+        const entityUrl = './entity?entity_id=' + encodeURIComponent(entity.entity_id);
+        // Combine state and unit in one column
+        let stateWithUnit = escapeHtml(entity.state);
+        if (entity.unit_of_measurement && entity.unit_of_measurement !== '?' && entity.unit_of_measurement !== 'None') {
+            stateWithUnit += ' ' + escapeHtml(entity.unit_of_measurement);
+        }
+        html += '<tr>';
+        html += '<td><a href="' + entityUrl + '">' + escapeHtml(entity.entity_id) + '</a></td>';
+        html += '<td>' + escapeHtml(entity.friendly_name) + '</td>';
+        html += '<td>' + stateWithUnit + '</td>';
+        html += '</tr>';
+    }
+    tableBody.innerHTML = html;
+}
+
+function filterEntityTable() {
+    const searchInput = document.getElementById('entitySearchInput');
+    const searchTerm = searchInput.value.toLowerCase();
+
+    if (!searchTerm) {
+        renderEntityTable(currentEntityData);
+        return;
+    }
+
+    const filtered = currentEntityData.filter(entity =>
+        entity.entity_id.toLowerCase().includes(searchTerm) ||
+        entity.friendly_name.toLowerCase().includes(searchTerm)
+    );
+
+    renderEntityTable(filtered);
+}
+
+function closeEntityModal() {
+    const modal = document.getElementById('entityModal');
+    modal.style.display = 'none';
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// Close modal when clicking outside of it
+window.onclick = function(event) {
+    const modal = document.getElementById('entityModal');
+    if (event.target === modal) {
+        closeEntityModal();
+    }
+}
+</script>
+"""
+    return text
+
+
+def get_component_edit_modal_js():
+    """
+    Return JavaScript for component edit modal
+    """
+    text = """
+<script>
+let componentConfigData = {};
+let componentFormDirty = false;
+let componentFormValid = true;
+
+async function showComponentEditModal(componentName) {
+    const modal = document.getElementById('componentEditModal');
+    const title = document.getElementById('componentEditModalTitle');
+    const form = document.getElementById('componentEditForm');
+    const errorDiv = document.getElementById('componentEditError');
+
+    // Reset state
+    componentFormDirty = false;
+    componentFormValid = true;
+    form.innerHTML = '<p>Loading...</p>';
+    errorDiv.textContent = '';
+    errorDiv.classList.remove('visible');
+
+    modal.style.display = 'block';
+    title.textContent = 'Edit Component Configuration: ' + componentName;
+
+    try {
+        const response = await fetch('./component_config?component_name=' + encodeURIComponent(componentName));
+        const data = await response.json();
+
+        if (!data.success) {
+            throw new Error(data.message || 'Failed to load configuration');
+        }
+
+        componentConfigData = data;
+        renderComponentConfigForm(data);
+    } catch (error) {
+        console.error('Error loading component config:', error);
+        form.innerHTML = '<p style="color: #f44336;">Error loading configuration: ' + error.message + '</p>';
+    }
+}
+
+function renderComponentConfigForm(data) {
+    const form = document.getElementById('componentEditForm');
+    form.innerHTML = '';
+
+    if (!data.args || data.args.length === 0) {
+        form.innerHTML = '<p>No configurable settings for this component.</p>';
+        return;
+    }
+
+    data.args.forEach(arg => {
+        const fieldDiv = document.createElement('div');
+        fieldDiv.className = 'config-field';
+        fieldDiv.dataset.configKey = arg.config_key;
+
+        // Label with required indicators
+        const label = document.createElement('label');
+        label.className = 'config-field-label';
+        label.textContent = arg.config_key;
+
+        if (arg.required) {
+            const star = document.createElement('span');
+            star.className = 'required-star';
+            star.innerHTML = '&#9733;';
+            star.title = 'Required';
+            label.appendChild(star);
+        } else if (arg.required_or) {
+            const star = document.createElement('span');
+            star.className = 'required-or-star';
+            star.innerHTML = '&#9733;';
+            star.title = 'At least one required';
+            label.appendChild(star);
+        }
+
+        if (arg.default !== null && arg.default !== undefined && arg.default !== '') {
+            const defaultSpan = document.createElement('span');
+            defaultSpan.className = 'config-field-default';
+            defaultSpan.textContent = '(default: ' + arg.default + ')';
+            label.appendChild(defaultSpan);
+        }
+
+        fieldDiv.appendChild(label);
+
+        // Input based on type
+        if (arg.type === 'boolean') {
+            renderBooleanField(fieldDiv, arg);
+        } else if (arg.type === 'string_list') {
+            renderListField(fieldDiv, arg);
+        } else if (arg.type === 'dict') {
+            renderDictField(fieldDiv, arg);
+        } else {
+            renderTextField(fieldDiv, arg);
+        }
+
+        form.appendChild(fieldDiv);
+    });
+}
+
+function renderBooleanField(container, arg) {
+    // Check current state from DOM
+    const existingCheckbox = container.querySelector('input[type="checkbox"]');
+    const existingAddBtn = container.querySelector('.add-button');
+
+    // Determine if we should show the field based on arg or current state
+    let shouldShowField;
+    if (existingCheckbox || existingAddBtn) {
+        // Already rendered, check if we have a checkbox
+        shouldShowField = !!existingCheckbox;
+    } else {
+        // First render, check arg
+        shouldShowField = arg.current_value !== null && arg.current_value !== undefined;
+    }
+
+    // Remove existing input row
+    const existingRow = container.querySelector('.config-field-input-row');
+    if (existingRow) {
+        existingRow.remove();
+    }
+
+    const inputRow = document.createElement('div');
+    inputRow.className = 'config-field-input-row';
+
+    // Define reusable handlers
+    function createAddButton() {
+        const addRow = document.createElement('div');
+        addRow.className = 'config-field-input-row';
+        const addBtn = document.createElement('button');
+        addBtn.className = 'add-button';
+        addBtn.innerHTML = '+ Add';
+        addBtn.type = 'button';
+        addBtn.onclick = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            componentFormDirty = true;
+
+            // Remove the add button row
+            addRow.remove();
+
+            // Create the toggle row
+            createToggleWithDelete();
+        };
+        addRow.appendChild(addBtn);
+        container.appendChild(addRow);
+    }
+
+    function createToggleWithDelete() {
+        const newRow = document.createElement('div');
+        newRow.className = 'config-field-input-row';
+
+        const toggleLabel = document.createElement('label');
+        toggleLabel.className = 'toggle-switch';
+
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = arg.current_value === true || arg.current_value === 'true';
+        checkbox.onchange = function() {
+            componentFormDirty = true;
+        };
+
+        const slider = document.createElement('span');
+        slider.className = 'toggle-slider';
+
+        toggleLabel.appendChild(checkbox);
+        toggleLabel.appendChild(slider);
+        newRow.appendChild(toggleLabel);
+
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'delete-button';
+        deleteBtn.innerHTML = '×';
+        deleteBtn.type = 'button';
+        deleteBtn.onclick = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            componentFormDirty = true;
+
+            // Remove toggle row
+            newRow.remove();
+
+            // Add back the + Add button
+            createAddButton();
+        };
+        newRow.appendChild(deleteBtn);
+
+        container.appendChild(newRow);
+    }
+
+    if (!shouldShowField) {
+        // Show + Add button
+        createAddButton();
+    } else {
+        // Show toggle with delete button
+        createToggleWithDelete();
+    }
+}
+
+function renderTextField(container, arg) {
+    // Check current state from DOM
+    const existingInput = container.querySelector('.config-field-input');
+    const existingAddBtn = container.querySelector('.add-button');
+
+    // Determine if we should show the field
+    let shouldShowField;
+    if (existingInput || existingAddBtn) {
+        // Already rendered, check if we have an input
+        shouldShowField = !!existingInput;
+    } else {
+        // First render, check arg
+        shouldShowField = arg.current_value !== null && arg.current_value !== undefined && arg.current_value !== '';
+    }
+
+    // Remove existing elements
+    const existingRow = container.querySelector('.config-field-input-row');
+    if (existingRow) {
+        existingRow.remove();
+    }
+    const existingError = container.querySelector('.config-field-error');
+    if (existingError) {
+        existingError.remove();
+    }
+
+    // Define reusable handlers
+    function createAddButton() {
+        const addRow = document.createElement('div');
+        addRow.className = 'config-field-input-row';
+        const addBtn = document.createElement('button');
+        addBtn.className = 'add-button';
+        addBtn.innerHTML = '+ Add';
+        addBtn.type = 'button';
+        addBtn.onclick = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            componentFormDirty = true;
+
+            // Remove the add button row
+            addRow.remove();
+
+            // Create the input row
+            createInputWithDelete();
+        };
+        addRow.appendChild(addBtn);
+        container.appendChild(addRow);
+    }
+
+    function createInputWithDelete() {
+        const newRow = document.createElement('div');
+        newRow.className = 'config-field-input-row';
+
+        const input = document.createElement('input');
+        input.type = arg.config_key.includes('password') || arg.config_key.includes('key') || arg.config_key.includes('secret') ? 'password' : 'text';
+        input.className = 'config-field-input';
+        input.placeholder = 'Enter value...';
+        input.value = arg.current_value || '';
+        input.onblur = function() { validateField(input, arg.type); };
+        input.oninput = function() { componentFormDirty = true; };
+
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'delete-button';
+        deleteBtn.innerHTML = '×';
+        deleteBtn.type = 'button';
+        deleteBtn.onclick = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            componentFormDirty = true;
+
+            // Remove input row and error
+            newRow.remove();
+            const err = container.querySelector('.config-field-error');
+            if (err) err.remove();
+
+            // Add back the + Add button
+            createAddButton();
+        };
+
+        newRow.appendChild(input);
+        newRow.appendChild(deleteBtn);
+        container.appendChild(newRow);
+
+        // Error message
+        const errorSpan = document.createElement('span');
+        errorSpan.className = 'config-field-error';
+        container.appendChild(errorSpan);
+    }
+
+    if (!shouldShowField) {
+        // Show + Add button
+        createAddButton();
+    } else {
+        // Show input with delete button
+        createInputWithDelete();
+    }
+}
+
+function renderDictField(container, arg) {
+    // Check current state from DOM
+    const existingTextarea = container.querySelector('.config-field-textarea');
+    const existingAddBtn = container.querySelector('.add-button');
+
+    // Determine if we should show the field
+    let shouldShowField;
+    if (existingTextarea || existingAddBtn) {
+        shouldShowField = !!existingTextarea;
+    } else {
+        shouldShowField = arg.current_value !== null && arg.current_value !== undefined;
+    }
+
+    // Remove existing elements
+    const existingRow = container.querySelector('.config-field-input-row');
+    if (existingRow) {
+        existingRow.remove();
+    }
+    const existingError = container.querySelector('.config-field-error');
+    if (existingError) {
+        existingError.remove();
+    }
+
+    // Define reusable handlers
+    function createAddButton() {
+        const addRow = document.createElement('div');
+        addRow.className = 'config-field-input-row';
+        const addBtn = document.createElement('button');
+        addBtn.className = 'add-button';
+        addBtn.innerHTML = '+ Add';
+        addBtn.type = 'button';
+        addBtn.onclick = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            componentFormDirty = true;
+            addRow.remove();
+            createTextareaWithDelete();
+        };
+        addRow.appendChild(addBtn);
+        container.appendChild(addRow);
+    }
+
+    function createTextareaWithDelete() {
+        const newRow = document.createElement('div');
+        newRow.className = 'config-field-input-row';
+        newRow.style.flexDirection = 'column';
+        newRow.style.alignItems = 'stretch';
+
+        const textarea = document.createElement('textarea');
+        textarea.className = 'config-field-textarea';
+        textarea.placeholder = 'Enter YAML dictionary...';
+        textarea.rows = 6;
+        textarea.style.fontFamily = 'monospace';
+        textarea.style.fontSize = '0.9em';
+        textarea.style.resize = 'vertical';
+
+        // Convert dict to YAML string
+        if (arg.current_value && typeof arg.current_value === 'object') {
+            try {
+                // Simple YAML formatting - just use JSON with better formatting
+                textarea.value = JSON.stringify(arg.current_value, null, 2);
+            } catch (e) {
+                textarea.value = String(arg.current_value);
+            }
+        } else {
+            textarea.value = arg.current_value || '';
+        }
+
+        textarea.oninput = function() { componentFormDirty = true; };
+
+        const btnRow = document.createElement('div');
+        btnRow.style.display = 'flex';
+        btnRow.style.justifyContent = 'flex-end';
+        btnRow.style.marginTop = '5px';
+
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'delete-button';
+        deleteBtn.innerHTML = '×';
+        deleteBtn.type = 'button';
+        deleteBtn.onclick = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            componentFormDirty = true;
+            newRow.remove();
+            const err = container.querySelector('.config-field-error');
+            if (err) err.remove();
+            createAddButton();
+        };
+
+        btnRow.appendChild(deleteBtn);
+        newRow.appendChild(textarea);
+        newRow.appendChild(btnRow);
+        container.appendChild(newRow);
+
+        // Error message
+        const errorSpan = document.createElement('span');
+        errorSpan.className = 'config-field-error';
+        container.appendChild(errorSpan);
+    }
+
+    if (!shouldShowField) {
+        createAddButton();
+    } else {
+        createTextareaWithDelete();
+    }
+}
+
+function renderListField(container, arg) {
+    const listContainer = document.createElement('div');
+
+    let values = arg.current_value;
+    if (!Array.isArray(values)) {
+        values = values ? [values] : [''];
+    }
+
+    values.forEach((value, index) => {
+        addListEntry(listContainer, value, arg.type);
+    });
+
+    const addBtn = document.createElement('button');
+    addBtn.className = 'add-button';
+    addBtn.textContent = '+ Add Entry';
+    addBtn.type = 'button';
+    addBtn.onclick = () => {
+        addListEntry(listContainer, '', arg.type);
+        componentFormDirty = true;
+    };
+
+    container.appendChild(listContainer);
+    container.appendChild(addBtn);
+}
+
+function addListEntry(listContainer, value, type) {
+    const inputRow = document.createElement('div');
+    inputRow.className = 'config-field-input-row';
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'config-field-input';
+    input.placeholder = 'Enter value...';
+    input.value = value || '';
+    input.onblur = () => validateField(input, type);
+    input.oninput = () => componentFormDirty = true;
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.className = 'delete-button';
+    deleteBtn.innerHTML = '×';
+    deleteBtn.type = 'button';
+    deleteBtn.onclick = () => {
+        inputRow.remove();
+        componentFormDirty = true;
+    };
+
+    inputRow.appendChild(input);
+    inputRow.appendChild(deleteBtn);
+    listContainer.appendChild(inputRow);
+
+    // Error message
+    const errorSpan = document.createElement('span');
+    errorSpan.className = 'config-field-error';
+    listContainer.appendChild(errorSpan);
+}
+
+function validateField(input, type) {
+    const value = input.value.trim();
+    const errorSpan = input.parentElement.nextElementSibling || input.parentElement.parentElement.querySelector('.config-field-error');
+
+    if (!errorSpan) return true;
+
+    // Skip validation for empty fields
+    if (value === '') {
+        input.classList.remove('error');
+        errorSpan.textContent = '';
+        errorSpan.classList.remove('visible');
+        return true;
+    }
+
+    let isValid = true;
+    let errorMsg = '';
+
+    try {
+        if (type === 'integer' || type === 'int') {
+            if (!/^-?\\d+$/.test(value)) {
+                isValid = false;
+                errorMsg = 'Must be a valid integer';
+            }
+        } else if (type === 'float' || type === 'number') {
+            if (isNaN(parseFloat(value)) || !isFinite(value)) {
+                isValid = false;
+                errorMsg = 'Must be a valid number';
+            }
+        }
+    } catch (e) {
+        isValid = false;
+        errorMsg = 'Invalid value';
+    }
+
+    if (isValid) {
+        input.classList.remove('error');
+        errorSpan.textContent = '';
+        errorSpan.classList.remove('visible');
+    } else {
+        input.classList.add('error');
+        errorSpan.textContent = errorMsg;
+        errorSpan.classList.add('visible');
+    }
+
+    // Update global valid state
+    componentFormValid = document.querySelectorAll('.config-field-input.error').length === 0;
+    document.getElementById('componentEditSaveBtn').disabled = !componentFormValid;
+
+    return isValid;
+}
+
+async function saveComponentConfig() {
+    if (!componentFormValid) {
+        alert('Please fix validation errors before saving.');
+        return;
+    }
+
+    const form = document.getElementById('componentEditForm');
+    const fields = form.querySelectorAll('.config-field');
+    const changes = {};
+    const deletions = [];
+    const missingRequired = [];
+
+    // First pass: collect changes and deletions
+    fields.forEach(field => {
+        const configKey = field.dataset.configKey;
+        const argData = componentConfigData.args.find(a => a.config_key === configKey);
+        if (!argData) return;
+
+        if (argData.type === 'boolean') {
+            const checkbox = field.querySelector('input[type="checkbox"]');
+
+            // Check if field is missing (showing + Add button)
+            if (!checkbox) {
+                if (argData.current_value !== null && argData.current_value !== undefined && argData.current_value !== '') {
+                    deletions.push(configKey);
+                    if (argData.required) {
+                        missingRequired.push(configKey);
+                    }
+                }
+            } else {
+                const newValue = checkbox.checked;
+                const oldValue = argData.current_value === true || argData.current_value === 'true';
+                if (newValue !== oldValue) {
+                    changes[configKey] = newValue;
+                }
+            }
+        } else if (argData.type === 'string_list') {
+            const inputs = field.querySelectorAll('.config-field-input');
+            const values = [];
+            inputs.forEach(input => {
+                const val = input.value.trim();
+                if (val !== '') {
+                    values.push(val);
+                }
+            });
+
+            if (values.length === 0) {
+                deletions.push(configKey);
+            } else {
+                const oldValues = Array.isArray(argData.current_value) ? argData.current_value : (argData.current_value ? [argData.current_value] : []);
+                if (JSON.stringify(values) !== JSON.stringify(oldValues)) {
+                    changes[configKey] = values;
+                }
+            }
+        } else if (argData.type === 'dict') {
+            const textarea = field.querySelector('.config-field-textarea');
+
+            // Check if field is missing (showing + Add button)
+            if (!textarea) {
+                if (argData.current_value !== null && argData.current_value !== undefined) {
+                    deletions.push(configKey);
+                    if (argData.required) {
+                        missingRequired.push(configKey);
+                    }
+                }
+            } else {
+                const yamlValue = textarea.value.trim();
+
+                if (yamlValue === '') {
+                    if (argData.current_value !== null && argData.current_value !== undefined) {
+                        deletions.push(configKey);
+                        if (argData.required) {
+                            missingRequired.push(configKey);
+                        }
+                    }
+                } else {
+                    // Store as raw YAML string - backend will parse it
+                    const oldYaml = argData.current_value ? JSON.stringify(argData.current_value) : '';
+                    if (yamlValue !== oldYaml) {
+                        changes[configKey] = yamlValue;
+                    }
+                }
+            }
+        } else {
+            const input = field.querySelector('.config-field-input');
+
+            // Check if field is missing (showing + Add button)
+            if (!input) {
+                if (argData.current_value !== null && argData.current_value !== undefined && argData.current_value !== '') {
+                    deletions.push(configKey);
+                    if (argData.required) {
+                        missingRequired.push(configKey);
+                    }
+                }
+            } else {
+                const newValue = input.value.trim();
+
+                if (newValue === '') {
+                    if (argData.current_value !== null && argData.current_value !== undefined && argData.current_value !== '') {
+                        deletions.push(configKey);
+                        if (argData.required) {
+                            missingRequired.push(configKey);
+                        }
+                    }
+                } else if (newValue !== argData.current_value) {
+                    changes[configKey] = newValue;
+                }
+            }
+        }
+    });
+
+    // Check if any required fields will be missing after save
+    if (missingRequired.length > 0) {
+        const fieldList = missingRequired.join(', ');
+        if (!confirm(`Warning: Deleting required field(s) (${fieldList}) will disable this component.\\n\\nPredbat will restart automatically to apply changes. Continue?`)) {
+            return;
+        }
+    } else {
+        if (!confirm('Predbat will restart automatically to apply changes. Continue?')) {
+            return;
+        }
+    }
+
+    if (Object.keys(changes).length === 0 && deletions.length === 0) {
+        alert('No changes to save.');
+        return;
+    }
+
+    const saveBtn = document.getElementById('componentEditSaveBtn');
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Saving...';
+
+    try {
+        const response = await fetch('./component_config_save', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                component_name: componentConfigData.component_name,
+                changes: changes,
+                deletions: deletions
+            })
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            // Reset dirty flag before closing to avoid warning
+            componentFormDirty = false;
+            alert(result.message);
+            closeComponentEditModal();
+            // Reload page to show updated configuration
+            setTimeout(() => location.reload(), 1000);
+        } else {
+            throw new Error(result.message || 'Failed to save configuration');
+        }
+    } catch (error) {
+        console.error('Error saving component config:', error);
+        const errorDiv = document.getElementById('componentEditError');
+        errorDiv.textContent = 'Error: ' + error.message;
+        errorDiv.classList.add('visible');
+        saveBtn.disabled = false;
+        saveBtn.textContent = 'Save';
+    }
+}
+
+function closeComponentEditModal() {
+    if (componentFormDirty) {
+        if (!confirm('You have unsaved changes. Are you sure you want to close?')) {
+            return;
+        }
+    }
+
+    const modal = document.getElementById('componentEditModal');
+    modal.style.display = 'none';
+    componentFormDirty = false;
+}
+</script>
 """
     return text
 
@@ -2296,7 +4689,7 @@ body.dark-mode .charts-menu a.active {
 }
 </style>
 <script>
-// Initialize the charts menu scrolling functionality
+// Initialise the charts menu scrolling functionality
 document.addEventListener("DOMContentLoaded", function() {
     // Scroll active item into view
     setTimeout(function() {
@@ -3108,7 +5501,7 @@ def get_logfile_js(filter_type):
             }}
         }}
 
-        // Initialize
+        // Initialise
         document.addEventListener('DOMContentLoaded', function() {{
             lastLineNumber = 0; // Start from 0 since we're loading all initial data
             updateStatus('Log viewer loaded - fetching initial data...');
@@ -3169,7 +5562,7 @@ document.getElementById('editorForm').addEventListener('submit', function(e) {
     try {
         // Only validate if content exists and isn't empty
         if (content && content.trim()) {
-            jsyaml.load(content);
+            jsyaml.load(content, { schema: CUSTOM_SCHEMA });
         }
     } catch (e) {
         console.log('YAML validation error during form submit:', e.message);
@@ -3284,7 +5677,18 @@ function updateButtonStates(saveButton, revertButton, content, hasError = false)
     }
 }
 
-// Custom YAML linter using js-yaml
+// Define custom YAML types for Home Assistant/Predbat tags
+const SECRET_TYPE = new jsyaml.Type('!secret', {
+    kind: 'scalar',
+    construct: function(data) {
+        return '***SECRET***'; // Placeholder value for secrets
+    }
+});
+
+// Create a custom schema that includes the !secret tag
+const CUSTOM_SCHEMA = jsyaml.DEFAULT_SCHEMA.extend([SECRET_TYPE]);
+
+// Custom YAML linter using js-yaml with custom schema
 CodeMirror.registerHelper("lint", "yaml", function(text) {
     const found = [];
     if (!text.trim()) {
@@ -3292,7 +5696,7 @@ CodeMirror.registerHelper("lint", "yaml", function(text) {
     }
 
     try {
-        jsyaml.load(text);
+        jsyaml.load(text, { schema: CUSTOM_SCHEMA });
     } catch (e) {
         // Convert js-yaml error to CodeMirror lint format
         const line = e.mark && e.mark.line ? e.mark.line : 0;
@@ -3309,7 +5713,7 @@ CodeMirror.registerHelper("lint", "yaml", function(text) {
     return found;
 });
 
-// Initialize CodeMirror and handle dark mode
+// Initialise CodeMirror and handle dark mode
 function initializeCodeMirror() {
     const textarea = document.getElementById('appsContent');
 
@@ -3370,7 +5774,7 @@ function initializeCodeMirror() {
         try {
             // Parse YAML to check for errors
             if (content.trim()) {
-                jsyaml.load(content);
+                jsyaml.load(content, { schema: CUSTOM_SCHEMA });
             }
         } catch (e) {
             isValid = false;
@@ -3379,11 +5783,9 @@ function initializeCodeMirror() {
 
         // Update button states based on YAML validation result
         updateButtonStates(saveButton, revertButton, content, !isValid);
-        console.log('Button states updated by change handler, YAML valid:', isValid);
 
         // Save content to localStorage whenever it changes
         localStorage.setItem('appsYamlContent', content);
-        console.log('Content saved to localStorage');
     });
 
     // Make CodeMirror fill the available space
@@ -3408,7 +5810,7 @@ function initializeCodeMirror() {
             try {
                 const content = editor.getValue();
                 if (content && content.trim()) {
-                    jsyaml.load(content);
+                    jsyaml.load(content, { schema: CUSTOM_SCHEMA });
                 }
             } catch (e) {
                 console.log('Manual YAML validation error during lint event:', e.message);
@@ -3427,16 +5829,60 @@ function initializeCodeMirror() {
 
                 // Update button states with error flag
                 updateButtonStates(saveButton, revertButton, content, true);
-                console.log('Button states updated by lint event (with errors)');
             } else {
                 // Clear the lint status when syntax is valid
                 lintStatusEl.innerHTML = '';
 
                 // Update button states with no error flag
                 updateButtonStates(saveButton, revertButton, content, false);
-                console.log('Button states updated by lint event (no errors)');
             }
         });
+
+        // Set up external change detection
+        const form = document.getElementById('editorForm');
+        let originalChecksum = form.getAttribute('data-file-checksum');
+        let externalChangeWarningShown = false;
+
+        function checkForExternalChanges() {
+            fetch('./apps_editor_checksum')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.checksum && data.checksum !== originalChecksum && !externalChangeWarningShown) {
+                        const currentContent = editor.getValue();
+                        const hasLocalChanges = currentContent !== window.originalContent;
+
+                        if (!hasLocalChanges) {
+                            // No local edits - auto-reload
+                            editor.setValue(data.content);
+                            window.originalContent = data.content;
+                            originalChecksum = data.checksum;  // Update the variable
+                            form.setAttribute('data-file-checksum', data.checksum);
+                            showMessage('File was changed externally and has been reloaded.', 'success');
+                            externalChangeWarningShown = false;  // Reset so we can detect future changes
+                        } else {
+                            // Has local edits - show warning
+                            externalChangeWarningShown = true;
+                            const warningDiv = document.createElement('div');
+                            warningDiv.className = 'message warning';
+                            warningDiv.style.display = 'block';
+                            warningDiv.style.backgroundColor = '#fff3cd';
+                            warningDiv.style.color = '#856404';
+                            warningDiv.style.border = '1px solid #ffeeba';
+                            warningDiv.innerHTML = `
+                                <strong>⚠️ Warning:</strong> The apps.yaml file has been changed externally. You have unsaved local changes.<br>
+                                <button onclick="location.reload()" style="margin-top: 10px; padding: 5px 10px; background: #856404; color: white; border: none; border-radius: 4px; cursor: pointer;">Reload and discard local changes</button>
+                            `;
+                            const messageContainer = document.getElementById('messageContainer');
+                            messageContainer.innerHTML = '';
+                            messageContainer.appendChild(warningDiv);
+                        }
+                    }
+                })
+                .catch(err => console.error('Error checking for external changes:', err));
+        }
+
+        // Check every 5 seconds for external changes
+        setInterval(checkForExternalChanges, 5000);
 
         // Initial lint after a short delay to ensure editor is fully loaded
         setTimeout(() => {
@@ -3455,15 +5901,14 @@ function initializeCodeMirror() {
                     // Only validate if we have content
                     if (content && content.trim()) {
                         try {
-                            jsyaml.load(content);
+                            jsyaml.load(content, { schema: CUSTOM_SCHEMA });
                         } catch (e) {
                             isValidYaml = false;
-                            console.log('YAML validation error in initialization:', e.message);
+                            console.log('YAML validation error in initialisation:', e.message);
                         }
 
                         // Update button states based on content validity
                         updateButtonStates(saveButton, revertButton, content, !isValidYaml);
-                        console.log('Button states updated by initial validation');
 
                         // Also clear the lint status if it exists and YAML is valid
                         if (lintStatusEl && isValidYaml) {
@@ -3472,12 +5917,9 @@ function initializeCodeMirror() {
                     } else {
                         // Empty content is considered valid
                         updateButtonStates(saveButton, revertButton, content, false);
-                        console.log('Button states updated for empty content');
                     }
                 } catch (e) {
                     // Something went wrong, keep the save button disabled but enable revert if changed
-                    console.log('Error during initialization button state update:', e.message);
-
                     const content = editor.getValue();
                     updateButtonStates(saveButton, revertButton, content, true);
                 }
@@ -3510,7 +5952,7 @@ document.addEventListener('DOMContentLoaded', function() {
         textarea.placeholder = 'apps.yaml content could not be loaded';
     }
 
-    // Initialize CodeMirror
+    // Initialise CodeMirror
     initializeCodeMirror();
 
     // Handle Revert button click
@@ -3540,7 +5982,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 let isValid = true;
                 if (content && content.trim()) {
                     try {
-                        jsyaml.load(content);
+                        jsyaml.load(content, { schema: CUSTOM_SCHEMA });
                     } catch (e) {
                         isValid = false;
                         console.log('YAML validation error in DOMContentLoaded final check:', e.message);
@@ -3549,10 +5991,8 @@ document.addEventListener('DOMContentLoaded', function() {
 
                 // Update buttons states consistently
                 updateButtonStates(saveButton, revertButton, content, !isValid);
-                console.log('Button states updated by DOMContentLoaded final check, YAML valid:', isValid);
 
             } catch (e) {
-                console.log('YAML validation error in DOMContentLoaded:', e.message);
                 // We already know there's an error, but we won't disable the button here
                 // as that should be handled by the lint event
             }
@@ -3568,7 +6008,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 }
             };
         }
-    }, 2000); // Wait longer for everything to initialize
+    }, 2000); // Wait longer for everything to initialise
 
     // Add a listener for dark mode toggle
     window.addEventListener('storage', function(e) {
@@ -3633,6 +6073,51 @@ document.addEventListener('DOMContentLoaded', function() {
 def get_plan_css():
     text = """<body>
     <style>
+    /* CSS Variables for colors */
+    :root {
+        --bg-default: #FFFFFF;
+        --bg-table: #FFFFFF;
+        --text-default: #000000;
+        --text-muted: #666666;
+        --border-color: #ddd;
+    }
+
+    body.dark-mode {
+        --bg-default: #1e1e1e;
+        --bg-table: #2d2d2d;
+        --text-default: #FFFFFF;
+        --text-muted: #cccccc;
+        --border-color: #444;
+    }
+
+    /* Table styling for dark mode */
+    body {
+        background-color: var(--bg-default);
+        color: var(--text-default);
+    }
+
+    table {
+        background-color: var(--bg-table);
+        color: var(--text-default);
+        border-collapse: collapse;
+    }
+
+    table td, table th {
+        border: 1px solid var(--border-color);
+        color: var(--text-default);
+    }
+
+    /* Ensure text is pure white in dark mode */
+    body.dark-mode table td,
+    body.dark-mode table th {
+        color: #FFFFFF !important;
+    }
+
+    /* Timestamp styling for dark mode */
+    body.dark-mode #planTimestamp {
+        color: #aaaaaa;
+    }
+
     .dropdown {
         position: relative;
         display: inline-block;
@@ -3642,32 +6127,89 @@ def get_plan_css():
         display: none;
         position: absolute;
         background-color: #f9f9f9;
-        min-width: 160px;
+        min-width: 220px;
         box-shadow: 0px 8px 16px 0px rgba(0,0,0,0.2);
-        z-index: 1;
+        z-index: 2001;
         border-radius: 4px;
+        padding: 12px;
+        box-sizing: border-box;
     }
 
     .dropdown-content a {
         color: black;
-        padding: 12px 16px;
+        padding: 10px 12px;
         text-decoration: none;
         display: block;
         cursor: pointer;
+        border-radius: 3px;
+        margin: 4px 0;
     }
 
     .dropdown-content a:hover {
         background-color: #f1f1f1;
     }
 
+    .dropdown-content label {
+        display: block;
+        margin-bottom: 6px;
+        font-weight: 500;
+        color: #333;
+        font-size: 13px;
+    }
+
     .clickable-time-cell {
         cursor: pointer;
         position: relative;
         transition: background-color 0.2s;
+        z-index: 1;
+    }
+
+    /* Boost z-index for cell with open dropdown */
+    .clickable-time-cell:has(.dropdown-content[style*="display: block"]) {
+        z-index: 2000;
+    }
+
+    .clickable-state-cell {
+        cursor: pointer;
+        position: relative;
+        transition: background-color 0.2s;
+        z-index: 1;
+    }
+
+    .clickable-state-cell:has(.dropdown-content[style*="display: block"]) {
+        z-index: 2000;
+    }
+
+    .clickable-state-cell:hover {
+        filter: brightness(0.9);
+    }
+
+    .clickable-state-cell:focus-visible {
+        outline: 2px solid #2196F3;
+        outline-offset: -2px;
+    }
+
+    body.dark-mode .clickable-state-cell:hover {
+        filter: brightness(1.2);
+    }
+
+    .reason-text {
+        font-size: 13px;
+        line-height: 1.4;
+        color: #333;
+        max-width: 260px;
+    }
+
+    body.dark-mode .reason-text {
+        color: #eee;
     }
 
     .clickable-time-cell:hover {
-        background-color: #f5f5f5 !important;
+        filter: brightness(0.9);
+    }
+
+    body.dark-mode .clickable-time-cell:hover {
+        filter: brightness(1.2);
     }
 
     /* Dark mode styles */
@@ -3684,8 +6226,8 @@ def get_plan_css():
         background-color: #444;
     }
 
-    body.dark-mode .clickable-time-cell:hover {
-        background-color: #444 !important;
+    body.dark-mode .dropdown-content label {
+        color: #e0e0e0;
     }
 
     /* ============================
@@ -3751,11 +6293,18 @@ def get_plan_css():
         background-color: #fff;
         color: #333;
         border: 1px solid #ccc;
+        width: 100%;
+        padding: 8px 10px;
+        border-radius: 4px;
+        box-sizing: border-box;
+        font-size: 14px;
+        margin-bottom: 8px;
     }
 
     .dropdown-content input[type="number"]:focus {
         outline: none;
         border-color: #4CAF50;
+        box-shadow: 0 0 0 2px rgba(76, 175, 80, 0.2);
     }
 
     .dropdown-content button {
@@ -3763,13 +6312,33 @@ def get_plan_css():
         color: white;
         border: none;
         cursor: pointer;
+        width: 100%;{
+        padding: 12px;
     }
 
-    .dropdown-content button:hover {
+    body.dark-mode .dropdown-content input[type="number"] {
+        background-color: #444;
+        color: #e0e0e0;
+        border-color: #666;
+    }
+
+    body.dark-mode .dropdown-content input[type="number"]:focus {
+        border-color: #4CAF50;
+        box-shadow: 0 0 0 2px rgba(76, 175, 80, 0.3);
+    }
+
+    body.dark-mode .dropdown-content button {
+        background-color: #4CAF50;
+        color: white !important;
+    }
+
+    body.dark-mode .dropdown-content button:hover {
         background-color: #45a049;
+        color: white !important;
     }
 
-    /* Dark mode styles for input and button */
+    body.dark-mode .dropdown-content button:active {
+        background-color: #3d8b40 and button */
     body.dark-mode .dropdown-content input[type="number"] {
         background-color: #444;
         color: #e0e0e0;
@@ -3801,6 +6370,91 @@ def get_plan_css():
     </style>
 
     <script>
+    // Function to darken a hex color for dark mode
+    function darkenColor(hex, factor = 0.4) {
+        // Remove # if present
+        hex = hex.replace('#', '');
+
+        // Parse RGB
+        const r = parseInt(hex.substring(0, 2), 16);
+        const g = parseInt(hex.substring(2, 4), 16);
+        const b = parseInt(hex.substring(4, 6), 16);
+
+        // Darken by reducing brightness
+        const newR = Math.round(r * factor);
+        const newG = Math.round(g * factor);
+        const newB = Math.round(b * factor);
+
+        // Convert back to hex
+        return '#' + [newR, newG, newB].map(x => {
+            const hex = x.toString(16);
+            return hex.length === 1 ? '0' + hex : hex;
+        }).join('');
+    }
+
+    // Check if a color is white or very light (close to white)
+    function isWhiteColor(hex) {
+        // Remove # if present
+        hex = hex.replace('#', '').toUpperCase();
+
+        // Check if it's white or very close to white
+        return hex === 'FFFFFF' || hex === 'FFF';
+    }
+
+    // Check if dark mode is active
+    function isDarkMode() {
+        return document.body.classList.contains('dark-mode');
+    }
+
+    // Apply colors to table cells based on mode
+    function updateTableColors() {
+        const cells = document.querySelectorAll('td[bgcolor]');
+        const darkMode = isDarkMode();
+
+        cells.forEach(cell => {
+            // Skip cells with override classes - they have their own dark mode CSS
+            if (cell.classList.contains('override-charge') ||
+                cell.classList.contains('override-export') ||
+                cell.classList.contains('override-freeze-charge') ||
+                cell.classList.contains('override-freeze-export') ||
+                cell.classList.contains('override-demand') ||
+                cell.classList.contains('override-active')) {
+                return;
+            }
+
+            const bgColor = cell.getAttribute('bgcolor');
+            if (bgColor) {
+                if (darkMode) {
+                    // Convert white to black, darken other colors
+                    if (isWhiteColor(bgColor)) {
+                        cell.style.backgroundColor = '#1e1e1e';
+                    } else {
+                        cell.style.backgroundColor = darkenColor(bgColor);
+                    }
+                } else {
+                    // Keep original color in light mode
+                    cell.style.backgroundColor = bgColor;
+                }
+            }
+        });
+    }
+
+    // Watch for dark mode changes on body element
+    const bodyObserver = new MutationObserver((mutations) => {
+        mutations.forEach((mutation) => {
+            if (mutation.type === 'attributes' && mutation.attributeName === 'class') {
+                updateTableColors();
+            }
+        });
+    });
+    bodyObserver.observe(document.body, { attributes: true });
+
+    // Apply colors on initial load
+    document.addEventListener('DOMContentLoaded', updateTableColors);
+    if (document.readyState !== 'loading') {
+        updateTableColors();
+    }
+
     // Close all dropdown menus
     function closeDropdowns() {
         var dropdowns = document.getElementsByClassName("dropdown-content");
@@ -3815,6 +6469,16 @@ def get_plan_css():
     function toggleForceDropdown(id) {
         closeDropdowns();
         var dropdown = document.getElementById(id);
+        if (!dropdown) {
+            // dropdownId is assigned by a counter that increments across the whole table render
+            // and gets baked into the cell's onclick string; if that string is now stale relative
+            // to the current DOM (e.g. after a plan refresh reassigned different ids), this would
+            // otherwise throw here and silently abort the click with no visible effect at all -
+            // indistinguishable from the cell just not responding (batpred#4474 follow-up). Log
+            // instead of throwing so a real cause leaves a trace even without DevTools handy.
+            console.warn("toggleForceDropdown: no element found for id", id);
+            return;
+        }
         if (dropdown.style.display === "block") {
             dropdown.style.display = "none";
         } else {
@@ -3880,13 +6544,40 @@ def get_plan_css():
     }
 
     // Handle rate override option function
-    function handleRateOverride(time, rate, action, clear) {
-        console.log("Rate override:", time, "Rate:", rate, "Action:", action);
+    function handleRateOverride(time, type, dropdownId, clear) {
+        // Get the rate value from the input field (unless clearing)
+        let rate = null;
+        if (!clear && dropdownId) {
+            const inputElement = document.getElementById('rate_' + dropdownId);
+            if (inputElement) {
+                rate = inputElement.value;
+            }
+        } else if (clear) {
+            // When clearing, we need to find the actual stored rate for this time
+            const minutesFromMidnight = getMinutesFromTimeString(time);
+            const overrideList = type === 'import' ? window.overridesData.manual_import_rates : window.overridesData.manual_export_rates;
+            const override = overrideList.find(r => r.minutes === minutesFromMidnight);
+            if (override) {
+                rate = override.rate;
+            } else {
+                rate = 0; // Fallback if not found
+            }
+        }
+
+        // Construct the action string the server expects
+        let action;
+        if (clear) {
+            action = type === 'import' ? 'Clear Import' : 'Clear Export';
+        } else {
+            action = type === 'import' ? 'Set Import' : 'Set Export';
+        }
+
         // Create a form data object to send the override parameters
         const formData = new FormData();
         formData.append('time', time);
-        formData.append('rate', rate);
+        formData.append('rate', rate || '0');
         formData.append('action', action);
+
         // Send the override request to the server
         fetch('./rate_override', {
             method: 'POST',
@@ -3934,13 +6625,33 @@ def get_plan_css():
 
     }
 
-    // Handle rate override option function
-    function handleLoadOverride(time, adjustment, action, clear) {
-        console.log("Load override:", time, "Adjustment:", adjustment, "Action:", action);
+    // Handle load override option function
+    function handleLoadOverride(time, dropdownId, clear) {
+        // Get the adjustment value from the input field (unless clearing)
+        let adjustment = null;
+        if (!clear && dropdownId) {
+            const inputElement = document.getElementById('load_' + dropdownId);
+            if (inputElement) {
+                adjustment = inputElement.value;
+            }
+        } else if (clear) {
+            // When clearing, we need to find the actual stored adjustment for this time
+            const minutesFromMidnight = getMinutesFromTimeString(time);
+            const override = window.overridesData.manual_load_adjust.find(r => r.minutes === minutesFromMidnight);
+            if (override) {
+                adjustment = override.adjustment;
+            } else {
+                adjustment = 0; // Fallback if not found
+            }
+        }
+
+        // Construct the action string the server expects
+        const action = clear ? 'Clear Load' : 'Set Load';
+
         // Create a form data object to send the override parameters
         const formData = new FormData();
         formData.append('time', time);
-        formData.append('rate', adjustment);
+        formData.append('rate', adjustment || '0');
         formData.append('action', action);
         // Send the override request to the server
         fetch('./rate_override', {
@@ -3992,7 +6703,6 @@ def get_plan_css():
 
     // Handle option selection
     function handleTimeOverride(time, action) {
-        console.log("Time override:", time, "Action:", action);
 
         // Create a form data object to send the override parameters
         const formData = new FormData();
@@ -4042,15 +6752,37 @@ def get_plan_css():
         closeDropdowns();
     }
 
-    // Handle SOC override
-    function handleSocOverride(time, value, action, isClear) {
-        console.log("SOC override:", time, "Value:", value, "Action:", action, "Clear:", isClear);
+    // Handle SOC override (isMax selects the manual_soc_max ceiling instead of the manual_soc floor)
+    function handleSocOverride(time, dropdownId, isClear, isMax) {
+        const inputPrefix = isMax ? 'socmax_' : 'soc_';
+        const overrideKey = isMax ? 'manual_soc_max' : 'manual_soc';
+
+        // Get the SOC value from the input field (unless clearing)
+        let value = null;
+        if (!isClear && dropdownId) {
+            const inputElement = document.getElementById(inputPrefix + dropdownId);
+            if (inputElement) {
+                value = inputElement.value;
+            }
+        } else if (isClear) {
+            // When clearing, we need to find the actual stored SOC for this time
+            const minutesFromMidnight = getMinutesFromTimeString(time);
+            const override = window.overridesData[overrideKey].find(r => r.minutes === minutesFromMidnight);
+            if (override) {
+                value = override.target;
+            } else {
+                value = 0; // Fallback if not found
+            }
+        }
+
+        // Construct the action string the server expects
+        const action = isMax ? (isClear ? 'Clear SOC Max' : 'Set SOC Max') : (isClear ? 'Clear SOC' : 'Set SOC');
 
         // Create a form data object to send the override parameters
         const formData = new FormData();
         formData.append('time', time);
         formData.append('action', action);
-        formData.append('rate', value);
+        formData.append('rate', value || '0');
 
         // Send the override request to the server
         fetch('./rate_override', {
@@ -4062,10 +6794,11 @@ def get_plan_css():
             if (data.success) {
                 // Show success message
                 const messageElement = document.createElement('div');
+                const label = isMax ? 'SOC max' : 'SOC';
                 if (isClear) {
-                    messageElement.textContent = `SOC override cleared for ${time}`;
+                    messageElement.textContent = `${label} override cleared for ${time}`;
                 } else {
-                    messageElement.textContent = `SOC target set to ${value}% for ${time}`;
+                    messageElement.textContent = `${label} target set to ${value}% for ${time}`;
                 }
                 messageElement.style.position = 'fixed';
                 messageElement.style.top = '65px';
@@ -4101,7 +6834,7 @@ def get_plan_css():
 
     // Close dropdowns when clicking outside
     document.addEventListener("click", function(event) {
-        if (!event.target.matches('.clickable-time-cell') && !event.target.closest('.dropdown-content')) {
+        if (!event.target.matches('.clickable-time-cell') && !event.target.matches('.clickable-state-cell') && !event.target.closest('.dropdown-content')) {
             closeDropdowns();
         }
     });
@@ -4110,14 +6843,1125 @@ def get_plan_css():
     return text
 
 
-def get_header_html(title, calculating, default_page, arg_errors, THIS_VERSION, battery_status_icon, refresh=0, codemirror=False):
+def get_plan_renderer_js():
+    """
+    JavaScript renderer for client-side plan table generation from JSON data
+    Includes timestamp-based change detection, 5-second polling, error handling, and stale data warnings
+    """
+    text = """
+    <script>
+    // State variables
+    let currentView = 'plan';
+    let newestDataTimestamp = null;  // Track the newest data timestamp we've seen
+    let updateIntervalId = null;
+    let dropdownCounter = 0;
+
+    // Load debug toggle state from sessionStorage
+    function loadDebugState() {
+        const debugToggle = document.getElementById('debugToggle');
+        if (debugToggle) {
+            const savedState = sessionStorage.getItem('planDebugToggle');
+            debugToggle.checked = savedState === 'true';
+        }
+    }
+
+    // Save debug toggle state to sessionStorage
+    function saveDebugState() {
+        const debugToggle = document.getElementById('debugToggle');
+        if (debugToggle) {
+            sessionStorage.setItem('planDebugToggle', debugToggle.checked);
+        }
+    }
+
+    // Map rate adjust type to HTML symbol (matches output.py adjust_symbol)
+    function getAdjustSymbol(adjustType) {
+        if (!adjustType) return '';
+        switch (adjustType) {
+            case 'offset': return '? &#8518;';
+            case 'future': return '? &#x2696;';
+            case 'user': return '&#61;';
+            case 'manual': return '&#8526;';
+            case 'increment': return '&#177;';
+            case 'saving': return '&dollar;';
+            default: return '?';
+        }
+    }
+
+    // Render plan table from JSON data
+    // Find the retained debug-history snapshot for a plan row's timestamp, or null if none
+    // qualifies. window.debugHistoryData is a small array ({id, timestamp, steps_back}) fetched
+    // separately (see fetchAndRenderPlan) - matched here by wall-clock time rather than threaded
+    // through the plan JSON itself, since the History/Yesterday plan is a reconstruction (fed
+    // yesterday's real PV/load through the same renderer as the live plan) and has no inherent
+    // relationship to when a snapshot happened to be captured; only the row's own real timestamp
+    // does.
+    //
+    // Snapshots are captured server-side with their timestamp floored to the plan's own slot grid
+    // (self.midnight_utc + N * plan_interval_minutes, see predbat.py's _capture_debug_history) -
+    // the same anchor and step output.py uses to build each row's own row.time - so a snapshot's
+    // timestamp is either an exact match for one row or it isn't a match at all. That also gives
+    // each snapshot at most one owning row for free: two rows can never both claim the same
+    // snapshot, since row times a plan_interval_minutes apart can never both equal the same
+    // floored capture instant.
+    const DEBUG_SNAPSHOT_MATCH_TOLERANCE_MS = 1000; // guards only against sub-second formatting noise
+    function findNearestDebugSnapshot(rowTimeStr) {
+        if (!rowTimeStr || !window.debugHistoryData || !window.debugHistoryData.length) {
+            return null;
+        }
+        const rowTime = new Date(rowTimeStr).getTime();
+        if (isNaN(rowTime)) {
+            return null;
+        }
+        for (const snap of window.debugHistoryData) {
+            const snapTime = new Date(snap.timestamp).getTime();
+            if (isNaN(snapTime)) { continue; }
+            if (Math.abs(rowTime - snapTime) <= DEBUG_SNAPSHOT_MATCH_TOLERANCE_MS) {
+                return snap;
+            }
+        }
+        return null;
+    }
+
+    function renderPlanTable(jsonData, overrides, showDebug, editable, showHistoryLinks) {
+        try {
+            if (!jsonData || !jsonData.rows) {
+                return '<p style="color:red;">No plan data available</p>';
+            }
+
+            // Store plan midnight reference so getMinutesFromTimeString can compute
+            // absolute minutes for next-day slots (e.g., tomorrow 00:00 = 1440 min,
+            // not 0 which is what a plain hours*60+minutes calculation would return).
+            window.planMidnightRef = jsonData.time || null;
+
+            // Reason templates come from the dataset being rendered, not from window.planData -
+            // the History/Yesterday views publish their own copy alongside their own rows.
+            const reasonTemplates = jsonData.reason_templates;
+
+            let html = '<table>';
+            const cellStyle = 'style="padding: 4px;"';
+
+            // Short explanations for each plan-table column header, condensed from the full
+            // descriptions in predbat-plan-card.md - keep these brief, a hover tooltip is not
+            // the place for the doc page's colour-coding detail.
+            const currencyMinor = jsonData.currency_symbols?.[1] ?? 'p';
+            const COLUMN_HEADER_HELP = {
+                time: 'Predbat plans in slots (30 minutes by default) aligned to rate change times.',
+                import: `The import rate for this slot, in ${currencyMinor} per kWh. Bold if a charge is planned this slot.`,
+                export: `The export rate for this slot, in ${currencyMinor} per kWh. Bold if a discharge/export is planned this slot.`,
+                state: "What the battery is doing this slot - hover a state cell for the specific reason.",
+                limit: 'The battery SoC Predbat is planning to reach by the end of this slot.',
+                pv: 'Predicted solar generation for this slot, from the Solcast forecast.',
+                load: 'Predicted house electricity consumption for this slot, from historical data.',
+                clip: "Solar energy predicted to be lost - the inverter can't handle all the PV generated, or an export limit is set.",
+                xload: 'Extra load added externally via load_forecast settings (e.g. PredAI, PredHeat).',
+                car: 'Predicted car charging energy for this slot.',
+                iboost: 'Energy planned for the solar diverter (iBoost, MyEnergi Eddi, etc) this slot.',
+                soc: 'Estimated battery state of charge at the start of this slot.',
+                cost: 'Estimated cost (or saving) for this slot.',
+                total: 'Running total cost for today so far, at the start of this slot.',
+                co2_rate: 'Estimated carbon intensity of the grid at the start of this slot.',
+                co2_total: 'Estimated cumulative carbon footprint at the start of this slot.',
+            };
+
+            function th(key, innerHtml, extraAttrs) {
+                const helpText = COLUMN_HEADER_HELP[key];
+                const titleAttr = helpText ? ` title="${escapeAttr(helpText)}"` : '';
+                const attrs = extraAttrs ? ` ${extraAttrs.trim()}` : '';
+                return `<th${attrs}${titleAttr}><b>${innerHtml}</b></th>`;
+            }
+
+            // Render header
+            html += '<tr>';
+            html += th('time', 'Time');
+            html += showDebug ? th('import', `Import ${currencyMinor} (w/loss)`) : th('import', `Import ${currencyMinor}`);
+            html += showDebug ? th('export', `Export ${currencyMinor} (w/loss)`) : th('export', `Export ${currencyMinor}`);
+            html += th('state', 'State', ' colspan="2"');
+            html += th('limit', 'Limit %');
+            html += showDebug ? th('pv', 'PV kWh (10%)') : th('pv', 'PV kWh');
+            html += showDebug ? th('load', 'Load kWh (10%)') : th('load', 'Load kWh');
+            if (showDebug) {
+                html += th('clip', 'Clip kWh');
+            }
+            if (showDebug && jsonData.rows.some(r => r.extra_load !== undefined)) {
+                html += th('xload', 'XLoad kWh');
+            }
+            if (jsonData.num_cars > 0) {
+                html += th('car', 'Car kWh');
+            }
+            if (jsonData.iboost_enable) {
+                html += th('iboost', 'iBoost kWh');
+            }
+            html += th('soc', 'SoC %');
+            html += th('cost', 'Cost');
+            html += th('total', 'Total');
+            if (jsonData.carbon_enable) {
+                html += th('co2_rate', 'CO2 g/kWh');
+                html += th('co2_total', 'CO2 kg');
+            }
+            if (showHistoryLinks) {
+                html += '<th><b>Debug</b></th>';
+            }
+            html += '</tr>';
+
+            // Render rows
+            for (let i = 0; i < jsonData.rows.length; i++) {
+                const row = jsonData.rows[i];
+                html += '<tr style="color:black">';
+
+                // Time cell with dropdown (if editable)
+                const timeDisplay = formatTimeDisplay(row.time);
+                if (editable) {
+                    html += renderTimeCell(row.time, timeDisplay, overrides, row.slot_minute);
+                } else {
+                    html += `<td id=time bgcolor=#FFFFFF>${timeDisplay}</td>`;
+                }
+
+                // Import rate - formatted bold if in charge window, italic with symbol if estimated.
+                // 'manual' is excluded here when editable: renderRateCell() below already shows its
+                // own override marker (and the only functioning Clear control) for that case, driven
+                // by a separately-computed isOverride check. Baking this marker in too stacks a
+                // second, visually identical glyph from a source the Clear button doesn't know about
+                // - if the two ever disagree, you get a marker with no working Clear behind it
+                // (batpred#4474). Non-'manual' adjust types (offset/future/user/increment/saving)
+                // aren't part of that clickable-override mechanism, so they keep their marker as-is.
+                const importBold = row.state && (row.state === 'Chrg' || row.state === 'HoldChrg' || row.state === 'FrzChrg');
+                let importText = row.import_rate.toFixed(2);
+                if (showDebug && row.import_rate_adjusted !== undefined) {
+                    importText += ` (${row.import_rate_adjusted.toFixed(2)})`;
+                }
+                const importAdjustType = (editable && row.import_rate_adjust_type === 'manual') ? null : row.import_rate_adjust_type;
+                const importAdjust = importAdjustType ? ` ${getAdjustSymbol(importAdjustType)}` : '';
+                if (importAdjustType) {
+                    importText = `<i>${importText}${importAdjust}</i>`;
+                }
+                if (importBold) {
+                    importText = `<b>${importText}</b>`;
+                }
+                if (editable) {
+                    html += renderRateCell(row.import_rate, row.rate_color_import, 'import', row.time, timeDisplay, overrides, importText, row.slot_minute);
+                } else if (row.rate_split) {
+                    // Car's own rate has diverged from the house rate - not necessarily an IOG cap
+                    // (any car window with its own average can diverge, e.g. combined dynamic-rate
+                    // windows) - split the cell, house on the left, car on the right, own tooltip each.
+                    const houseTitle = escapeAttr(`House rate: ${row.import_rate.toFixed(2)}${currencyMinor}/kWh`);
+                    const carTitle = escapeAttr(`Car rate: ${row.car_rate.toFixed(2)}${currencyMinor}/kWh (differs from house rate)`);
+                    html += `<td id=import data-minute="${row.slot_minute}" data-rate="${row.import_rate}" style="padding:0;">`;
+                    html += `<div style="display:flex;">`;
+                    html += `<div style="flex:1;padding:4px;background-color:${row.rate_color_import || '#FFFFFF'};" title="${houseTitle}">${importText}</div>`;
+                    html += `<div style="flex:1;padding:4px;background-color:${row.car_rate_color || '#FFFFFF'};" title="${carTitle}">${row.car_rate.toFixed(2)}</div>`;
+                    html += `</div></td>`;
+                } else {
+                    html += `<td id=import ${cellStyle} bgcolor=${row.rate_color_import || '#FFFFFF'}>${importText}</td>`;
+                }
+
+                // Export rate - italic with symbol if estimated (see import rate comment above for
+                // why 'manual' is excluded in editable mode)
+                let exportText = row.export_rate.toFixed(2);
+                if (showDebug && row.export_rate_adjusted !== undefined) {
+                    exportText += ` (${row.export_rate_adjusted.toFixed(2)})`;
+                }
+                const exportAdjustType = (editable && row.export_rate_adjust_type === 'manual') ? null : row.export_rate_adjust_type;
+                const exportAdjust = exportAdjustType ? ` ${getAdjustSymbol(exportAdjustType)}` : '';
+                if (exportAdjustType) {
+                    exportText = `<i>${exportText}${exportAdjust}</i>`;
+                }
+                if (editable) {
+                    html += renderRateCell(row.export_rate, row.rate_color_export, 'export', row.time, timeDisplay, overrides, exportText, row.slot_minute);
+                } else {
+                    html += `<td id=export ${cellStyle} bgcolor=${row.rate_color_export || '#FFFFFF'}>${exportText}</td>`;
+                }
+
+                // State cells (with rowspan and split handling)
+                if (!row.skip_state_cell) {
+                    if (editable) {
+                        html += renderStateCell(row, timeDisplay, overrides, reasonTemplates);
+                    } else {
+                        const rowspanAttr = row.rowspan_state > 0 ? ` rowspan="${row.rowspan_state}"` : '';
+                        const colspanAttr = row.split ? '' : ' colspan=2';
+                        const titleAttr = reasonTitleAttr(row, reasonTemplates);
+                        html += `<td${colspanAttr}${rowspanAttr} ${cellStyle} bgcolor=${row.state_color || '#FFFFFF'}${titleAttr}>${row.state_text || ''}</td>`;
+
+                        // Second state cell if split - same combined reason text as the first half
+                        if (row.split && row.state2_text) {
+                            html += `<td${rowspanAttr} ${cellStyle} bgcolor=${row.state2_color || '#FFFFFF'}${titleAttr}>${row.state2_text}</td>`;
+                        }
+                    }
+                }
+
+                // Limit cell (with rowspan handling)
+                if (!row.skip_limit_cell) {
+                    const rowspanAttr = row.rowspan_limit > 0 ? ` rowspan="${row.rowspan_limit}"` : '';
+                    html += `<td${rowspanAttr} bgcolor=#FFFFFF> ${row.show_limit || ''}</td>`;
+                }
+
+                // PV forecast (with 10% value in brackets if debug mode)
+                let pvText = row.pv_forecast == 0 ? '&#9866;' : row.pv_forecast;
+                if (showDebug && row.pv_forecast10 > 0) {
+                    pvText += ` (${row.pv_forecast10})`;
+                }
+                if (row.pv_forecast >= 0.1) {
+                    pvText += '&#9728;';
+                }
+                html += `<td id=pv bgcolor=${row.pv_color || '#FFFFFF'}>${pvText}</td>`;
+
+                // Load forecast (with 10% value in brackets if debug mode)
+                if (editable) {
+                    html += renderLoadCell(row.time, timeDisplay, row.load_forecast, row.load_forecast10, row.load_color, showDebug, overrides, jsonData.manual_load_value !== undefined ? jsonData.manual_load_value : 0.5, row.slot_minute);
+                } else {
+                    let loadText = row.load_forecast !== undefined ? row.load_forecast : '';
+                    if (showDebug && row.load_forecast10 > 0) {
+                        loadText += ` (${row.load_forecast10})`;
+                    }
+                    html += `<td id=load bgcolor=${row.load_color || '#FFFFFF'}>${loadText}</td>`;
+                }
+
+                // Clipped (only if debug)
+                if (showDebug) {
+                    const clippedVal = row.clipped == 0 ? '&#9866;' : row.clipped;
+                    html += `<td id=clip bgcolor=${row.clipped_color || '#FFFFFF'}>${clippedVal}</td>`;
+                }
+
+                // XLoad (extra load) - only if debug and extra_load exists
+                if (showDebug && row.extra_load !== undefined) {
+                    const xloadVal = row.extra_load || '&#9866;';
+                    html += `<td id=extra bgcolor=${row.extra_color || '#FFFFFF'}>${xloadVal}</td>`;
+                }
+
+                // Car charging (conditional)
+                if (jsonData.num_cars > 0) {
+                    const carVal = row.car_charging > 0 ? row.car_charging : '&#9866;';
+                    html += `<td id=car bgcolor=${row.car_color || '#FFFFFF'}>${carVal}</td>`;
+                }
+
+                // iBoost (conditional)
+                if (jsonData.iboost_enable) {
+                    const iboostVal = row.iboost || '&#9866;';
+                    html += `<td bgcolor=${row.iboost_color || '#FFFFFF'}>${iboostVal}</td>`;
+                }
+
+                // SOC
+                const socSym = row.soc_sym || (row.soc_change > 0 ? '&nearr;' : (row.soc_change < 0 ? '&searr;' : '&rarr;'));
+                if (editable) {
+                    html += renderSocCell(row.time, timeDisplay, row.soc_percent, row.soc_color, socSym, overrides, row.slot_minute);
+                } else {
+                    html += `<td id=soc bgcolor=${row.soc_color || '#FFFFFF'}>${row.soc_percent}${socSym}</td>`;
+                }
+
+                // Cost change
+                const costChange = row.cost_change || 0;
+                let costStr = '';
+                if (costChange >= 0.005) {
+                    costStr = `+${Math.round(costChange * 100)} ${jsonData.currency_symbols[1]} &nearr;`;
+                } else if (costChange <= -0.005) {
+                    costStr = `-${Math.round(Math.abs(costChange) * 100)} ${jsonData.currency_symbols[1]} &searr;`;
+                } else {
+                    costStr = '&rarr;';
+                }
+                html += `<td id=cost bgcolor=${row.cost_color || '#FFFFFF'}>${costStr}</td>`;
+
+                // Total cost
+                const totalCost = row.total_cost ? `${jsonData.currency_symbols[0]}${row.total_cost.toFixed(2)}` : '';
+                html += `<td id=total_cost bgcolor=#FFFFFF>${totalCost}</td>`;
+
+                // Carbon (conditional)
+                if (jsonData.carbon_enable) {
+                    html += `<td id=carbon bgcolor=${row.carbon_intensity_color || '#FFFFFF'}>${row.carbon_intensity || ''}</td>`;
+                    html += `<td id=total_carbon bgcolor=${row.carbon_color || '#FFFFFF'}>${row.total_carbon || ''}</td>`;
+                }
+
+                // Debug history snapshot link (History/Yesterday view only)
+                if (showHistoryLinks) {
+                    const snap = findNearestDebugSnapshot(row.time);
+                    if (snap) {
+                        const snapWhen = new Date(snap.timestamp);
+                        const snapLabel = isNaN(snapWhen.getTime()) ? snap.id : snapWhen.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+                        html += `<td bgcolor=#FFFFFF><a href="./debug_history_download?id=${encodeURIComponent(snap.id)}">&#8681; ${snapLabel}</a></td>`;
+                    } else {
+                        html += '<td bgcolor=#FFFFFF></td>';
+                    }
+                }
+
+                html += '</tr>';
+            }
+
+            // Render totals row if available
+            if (jsonData.totals) {
+                const totals = jsonData.totals;
+                html += '<tr style="color:black">';
+
+                // Empty cells for Time, Import, Export, State (colspan 2), Limit %
+                html += '<td></td><td></td><td></td><td></td><td></td><td></td>';
+
+                // PV forecast total
+                html += `<td bgcolor=#FFFFFF><b>${totals.pv_forecast || ''}</b></td>`;
+
+                // Load forecast total
+                html += `<td bgcolor=#FFFFFF><b>${totals.load_forecast || ''}</b></td>`;
+
+                // Clipped (if debug)
+                if (showDebug && totals.clipped !== undefined) {
+                    html += `<td bgcolor=#FFFFFF><b>${totals.clipped}</b></td>`;
+                }
+
+                // XLoad (if debug and exists)
+                if (showDebug && totals.extra_load !== undefined) {
+                    html += `<td bgcolor=#FFFFFF><b>${totals.extra_load}</b></td>`;
+                }
+
+                // Car charging (if enabled)
+                if (jsonData.num_cars > 0 && totals.car_charging !== undefined) {
+                    html += `<td bgcolor=#FFFFFF><b>${totals.car_charging}</b></td>`;
+                }
+
+                // iBoost (if enabled)
+                if (jsonData.iboost_enable && totals.iboost !== undefined) {
+                    const iboostVal = totals.iboost == 0 ? '&#9866;' : totals.iboost;
+                    html += `<td bgcolor=#FFFFFF><b>${iboostVal}</b></td>`;
+                }
+
+                // SOC percent
+                html += `<td bgcolor=#FFFFFF><b>${totals.soc_percent || ''}</b></td>`;
+
+                // Empty cell for SOC change
+                html += '<td></td>';
+
+                // Total cost
+                const totalCostStr = totals.total_cost >= 0 ?
+                    `${jsonData.currency_symbols[0]}${totals.total_cost}` :
+                    `-${jsonData.currency_symbols[0]}${Math.abs(totals.total_cost).toFixed(2)}`;
+                html += `<td bgcolor=#FFFFFF><b>${totalCostStr}</b></td>`;
+
+                // Carbon (if enabled)
+                if (jsonData.carbon_enable) {
+                    html += '<td></td>'; // Empty cell for carbon intensity
+                    html += `<td bgcolor=#FFFFFF><b>${totals.total_carbon || ''}</b></td>`;
+                }
+
+                // Empty cell for the Debug history column
+                if (showHistoryLinks) {
+                    html += '<td></td>';
+                }
+
+                html += '</tr>';
+            }
+
+            html += '</table>';
+            return html;
+        } catch (error) {
+            console.error('Error rendering plan:', error);
+            return `<p style="color:red;">Error rendering plan: ${error.message}</p>`;
+        }
+    }
+
+    // Render time cell (simple, with subtle override-based highlighting; main state highlighting is in the state column)
+    function renderTimeCell(timeStr, timeDisplay, overrides, slotMinute) {
+        const dropdownId = `dropdown_${dropdownCounter++}`;
+        const minutesFromMidnight = slotMinute !== undefined ? slotMinute : getMinutesFromTimeString(timeStr);
+
+        const manualTimes = overrides.manual_charge_times.concat(
+            overrides.manual_export_times,
+            overrides.manual_freeze_charge_times,
+            overrides.manual_freeze_export_times,
+            overrides.manual_demand_times
+        );
+
+        // Determine highlight color based on override type
+        let bgColor = '#FFFFFF';
+        let overrideClass = '';
+
+        if (overrides.manual_charge_times.includes(minutesFromMidnight)) {
+            bgColor = '#D0F0D0';  // Light green hint
+            overrideClass = 'override-charge';
+        } else if (overrides.manual_export_times.includes(minutesFromMidnight)) {
+            bgColor = '#FFFFE0';  // Light yellow hint
+            overrideClass = 'override-export';
+        } else if (overrides.manual_demand_times.includes(minutesFromMidnight)) {
+            bgColor = '#FFE0E0';  // Light red hint
+            overrideClass = 'override-demand';
+        } else if (overrides.manual_freeze_charge_times.includes(minutesFromMidnight)) {
+            bgColor = '#E8E8E8';  // Light gray hint
+            overrideClass = 'override-freeze-charge';
+        } else if (overrides.manual_freeze_export_times.includes(minutesFromMidnight)) {
+            bgColor = '#D8D8D8';  // Darker gray hint
+            overrideClass = 'override-freeze-export';
+        }
+
+        let html = `<td bgcolor=${bgColor} onclick="toggleForceDropdown('${dropdownId}')" class="clickable-time-cell ${overrideClass}">`;
+        html += timeDisplay;
+        html += '<div class="dropdown">';
+        html += `<div id="${dropdownId}" class="dropdown-content">`;
+
+        // Add dropdown options
+        if (manualTimes.includes(minutesFromMidnight)) {
+            html += `<a onclick="handleTimeOverride('${timeDisplay}', 'Clear')">Clear</a>`;
+        }
+        if (!overrides.manual_demand_times.includes(minutesFromMidnight)) {
+            html += `<a onclick="handleTimeOverride('${timeDisplay}', 'Manual Demand')">Manual Demand</a>`;
+        }
+        if (!overrides.manual_charge_times.includes(minutesFromMidnight)) {
+            html += `<a onclick="handleTimeOverride('${timeDisplay}', 'Manual Charge')">Manual Charge</a>`;
+        }
+        if (!overrides.manual_export_times.includes(minutesFromMidnight)) {
+            html += `<a onclick="handleTimeOverride('${timeDisplay}', 'Manual Export')">Manual Export</a>`;
+        }
+        if (!overrides.manual_freeze_charge_times.includes(minutesFromMidnight)) {
+            html += `<a onclick="handleTimeOverride('${timeDisplay}', 'Manual Freeze Charge')">Manual Freeze Charge</a>`;
+        }
+        if (!overrides.manual_freeze_export_times.includes(minutesFromMidnight)) {
+            html += `<a onclick="handleTimeOverride('${timeDisplay}', 'Manual Freeze Export')">Manual Freeze Export</a>`;
+        }
+
+        html += '</div></div></td>';
+        return html;
+    }
+
+    // Escape text for safe use inside an HTML attribute (e.g. title="...")
+    function escapeAttr(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML.replace(/"/g, '&quot;');
+    }
+
+    // Render a row's "reasons" (list of {code, params}) into a single sentence, filling in
+    // each entry's template (looked up from the shared reason_templates table, published once
+    // per response rather than duplicating the rendered sentence on every row) with its params.
+    function renderReasonText(reasons, templates) {
+        if (!reasons || !templates) {
+            return '';
+        }
+        const rendered = reasons.map(function (entry) {
+            const template = templates[entry.code];
+            if (!template) {
+                return '';
+            }
+            return template.replace(/\\{(\\w+)\\}/g, function (match, key) {
+                return entry.params && entry.params[key] !== undefined ? entry.params[key] : match;
+            });
+        });
+        // A split cell's first half is always a demand_before_export_* code paired with the export
+        // reason as its second half - prefix "Then" (no comma) so the two read as one narrative
+        // instead of two disconnected sentences. Length is >= 2 rather than == 2 because a history
+        // slot that held more than one state appends a mixed_slot_states note after the pair, and
+        // that must not cost the narrative its "Then".
+        if (reasons.length >= 2 && rendered[0] && rendered[1] && typeof reasons[0].code === 'string' && reasons[0].code.indexOf('demand_before_export_') === 0) {
+            rendered[1] = 'Then ' + rendered[1].charAt(0).toLowerCase() + rendered[1].slice(1);
+        }
+        return rendered.filter(Boolean).join(' ');
+    }
+
+    // Build the ` title="..."` tooltip attribute for a row's state cell, or '' when the row
+    // has no reasons. Shared by both the editable (renderStateCell) and read-only state-cell
+    // paths so the History/Yesterday views get the same tooltips as the plan view.
+    function reasonTitleAttr(row, templates) {
+        const reasonText = renderReasonText(row.reasons, templates);
+        return reasonText ? ` title="${escapeAttr(reasonText)}"` : '';
+    }
+
+    // Render state cell without dropdown (dropdown moved to time column)
+    function renderStateCell(row, timeDisplay, overrides, templates) {
+        const cellStyle = 'style="padding: 4px;"';
+        const timeStr = row.time;
+        const minutesFromMidnight = row.slot_minute !== undefined ? row.slot_minute : getMinutesFromTimeString(timeStr);
+
+        // Determine background color based on override type (prioritize manual overrides over default state color)
+        let bgColor = row.state_color || '#FFFFFF';
+        let overrideClass = '';
+
+        if (overrides.manual_charge_times.includes(minutesFromMidnight)) {
+            bgColor = '#3AEE85';
+            overrideClass = 'override-charge';
+        } else if (overrides.manual_export_times.includes(minutesFromMidnight)) {
+            bgColor = '#FFFF00';
+            overrideClass = 'override-export';
+        } else if (overrides.manual_demand_times.includes(minutesFromMidnight)) {
+            bgColor = '#F18261';
+            overrideClass = 'override-demand';
+        } else if (overrides.manual_freeze_charge_times.includes(minutesFromMidnight)) {
+            bgColor = '#C0C0C0';
+            overrideClass = 'override-freeze-charge';
+        } else if (overrides.manual_freeze_export_times.includes(minutesFromMidnight)) {
+            bgColor = '#AAAAAA';
+            overrideClass = 'override-freeze-export';
+        }
+
+        const rowspanAttr = row.rowspan_state > 0 ? ` rowspan="${row.rowspan_state}"` : '';
+        const colspanAttr = row.split ? '' : ' colspan=2';
+        // reasonText is needed raw (not just as a title= attribute) for reasonCellAttrs() below,
+        // which also uses it for the tap/focus panel content - templates comes from the dataset
+        // being rendered (jsonData.reason_templates), not window.planData, so History/Yesterday
+        // views look up against their own template table rather than the plan view's.
+        const reasonText = renderReasonText(row.reasons, templates);
+        // Keep both title= (free instant hover for desktop/mouse) and the tap/focus panel below
+        // (for touch and keyboard, neither of which can trigger a hover state at all) - the two
+        // never fire together in practice, since a touch interaction can't trigger :hover/title
+        // in the first place, so there's nothing to reconcile between them.
+        const titleAttr = reasonText ? ` title="${escapeAttr(reasonText)}"` : '';
+
+        function reasonCellAttrs(extraClass) {
+            if (!reasonText) {
+                return { clickAttrs: extraClass ? ` class="${extraClass}"` : '', panel: '' };
+            }
+            const dropdownId = `reasonDropdown_${dropdownCounter++}`;
+            const classAttr = `clickable-state-cell${extraClass ? ' ' + extraClass : ''}`;
+            // tabindex + onkeydown make this reachable and operable by keyboard, not just tap -
+            // a bare onclick on a <td> (the existing pattern used for time/rate cell dropdowns)
+            // is mouse/touch-only, since <td> isn't focusable by default.
+            const keydown = `if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleForceDropdown('${dropdownId}')}`;
+            return {
+                clickAttrs: ` onclick="toggleForceDropdown('${dropdownId}')" onkeydown="${keydown}" tabindex="0" role="button" aria-label="Why this slot" class="${classAttr}"`,
+                panel: `<div class="dropdown"><div id="${dropdownId}" class="dropdown-content"><div class="reason-text">${escapeAttr(reasonText)}</div></div></div>`,
+            };
+        }
+
+        const first = reasonCellAttrs(overrideClass);
+        let html = `<td${colspanAttr}${rowspanAttr} ${cellStyle} bgcolor=${bgColor}${first.clickAttrs}${titleAttr}>`;
+        html += row.state_text || '';
+        html += first.panel;
+        html += '</td>';
+
+        // Second state cell if split - same combined reason text as the first half, since
+        // row.reasons is a single list covering both halves of a split (e.g. charging and
+        // freeze-exporting in the same slot), not two separately-attributed sentences.
+        if (row.split && row.state2_text) {
+            const second = reasonCellAttrs('');
+            html += `<td${rowspanAttr} ${cellStyle} bgcolor=${row.state2_color || '#FFFFFF'}${second.clickAttrs}${titleAttr}>${row.state2_text}${second.panel}</td>`;
+        }
+
+        return html;
+    }
+
+    // Render rate cell with dropdown for manual rate overrides
+    function renderRateCell(rate, bgColor, type, timeStr, timeDisplay, overrides, displayText, slotMinute) {
+        const cellStyle = 'style="padding: 4px;"';
+        const dropdownId = `dropdown_${dropdownCounter++}`;
+        const minutesFromMidnight = slotMinute !== undefined ? slotMinute : getMinutesFromTimeString(timeStr);
+        const overrideList = type === 'import' ? overrides.manual_import_rates : overrides.manual_export_rates;
+        const override = overrideList.find(r => r.minutes === minutesFromMidnight);
+        const isOverride = override !== undefined;
+
+        // Use provided displayText if available, otherwise format rate
+        const rateDisplay = displayText !== undefined ? displayText : rate.toFixed(2);
+
+        // Use the actual stored override rate for the input field if one exists
+        const inputValue = parseFloat((isOverride ? override.rate : rate).toFixed(1));
+
+        let html = `<td id=${type} data-minute="${minutesFromMidnight}" data-rate="${rate}" ${cellStyle} bgcolor=${bgColor} onclick="toggleForceDropdown('${dropdownId}')" class="clickable-time-cell">`;
+        html += `${rateDisplay}${isOverride ? ' &#8526;' : ''}`;
+        html += '<div class="dropdown">';
+        html += `<div id="${dropdownId}" class="dropdown-content">`;
+        html += `<label>Override ${type} rate:</label>`;
+        html += `<input type="number" id="rate_${dropdownId}" value="${inputValue}" step="0.1">`;
+        html += `<button onclick="handleRateOverride('${timeDisplay}', '${type}', '${dropdownId}')">Set Override</button>`;
+        if (isOverride) {
+            html += `<a onclick="handleRateOverride('${timeDisplay}', '${type}', null, true)">Clear</a>`;
+        }
+        html += '</div></div></td>';
+        return html;
+    }
+
+    // Render load cell with dropdown for load adjustments
+    function renderLoadCell(timeStr, timeDisplay, loadValue, loadValue10, bgColor, showDebug, overrides, manualLoadValue, slotMinute) {
+        const dropdownId = `dropdown_${dropdownCounter++}`;
+        const minutesFromMidnight = slotMinute !== undefined ? slotMinute : getMinutesFromTimeString(timeStr);
+        const isOverride = overrides.manual_load_adjust.some(r => r.minutes === minutesFromMidnight);
+
+        // Add 10% value in brackets if debug mode
+        let displayValue = loadValue;
+        if (showDebug && loadValue10 > 0) {
+            displayValue += ` (${loadValue10})`;
+        }
+
+        const defaultLoadValue = manualLoadValue !== undefined ? manualLoadValue : 0.5;
+        let html = `<td id=load data-minute="${minutesFromMidnight}" bgcolor=${bgColor} onclick="toggleForceDropdown('${dropdownId}')" class="clickable-time-cell">`;
+        html += `${displayValue}${isOverride ? ' &#8526;' : ''}`;
+        html += '<div class="dropdown">';
+        html += `<div id="${dropdownId}" class="dropdown-content">`;
+        html += '<label>Adjust load (kWh):</label>';
+        html += `<input type="number" id="load_${dropdownId}" value="${defaultLoadValue}" step="0.1">`;
+        html += `<button onclick="handleLoadOverride('${timeDisplay}', '${dropdownId}')">Set Adjustment</button>`;
+        if (isOverride) {
+            html += `<a onclick="handleLoadOverride('${timeDisplay}', null, true)">Clear</a>`;
+        }
+        html += '</div></div></td>';
+        return html;
+    }
+
+    // Render SOC cell with dropdown for manual SOC targets (minimum floor and maximum ceiling)
+    function renderSocCell(timeStr, timeDisplay, socValue, bgColor, socSym, overrides, slotMinute) {
+        const dropdownId = `dropdown_${dropdownCounter++}`;
+        const minutesFromMidnight = slotMinute !== undefined ? slotMinute : getMinutesFromTimeString(timeStr);
+        const isOverride = overrides.manual_soc.some(r => r.minutes === minutesFromMidnight);
+        const isOverrideMax = overrides.manual_soc_max.some(r => r.minutes === minutesFromMidnight);
+
+        let html = `<td id=soc data-minute="${minutesFromMidnight}" bgcolor=${bgColor} onclick="toggleForceDropdown('${dropdownId}')" class="clickable-time-cell">`;
+        html += `${socValue}${socSym}${isOverride ? ' &#8526;' : ''}${isOverrideMax ? ' &#11015;' : ''}`;
+        html += '<div class="dropdown">';
+        html += `<div id="${dropdownId}" class="dropdown-content">`;
+        html += '<label>Minimum SOC (%):</label>';
+        html += `<input type="number" id="soc_${dropdownId}" value="${socValue}" step="1" min="0" max="100">`;
+        html += `<button onclick="handleSocOverride('${timeDisplay}', '${dropdownId}')">Set Target</button>`;
+        if (isOverride) {
+            html += `<a onclick="handleSocOverride('${timeDisplay}', null, true)">Clear</a>`;
+        }
+        html += '<label>Maximum SOC (%):</label>';
+        html += `<input type="number" id="socmax_${dropdownId}" value="${socValue}" step="1" min="0" max="100">`;
+        html += `<button onclick="handleSocOverride('${timeDisplay}', '${dropdownId}', false, true)">Set Max</button>`;
+        if (isOverrideMax) {
+            html += `<a onclick="handleSocOverride('${timeDisplay}', null, true, true)">Clear</a>`;
+        }
+        html += '</div></div></td>';
+        return html;
+    }
+
+    // Utility: Extract the timezone offset in minutes from an ISO timestamp string.
+    // Handles both +HHMM and +HH:MM formats produced by Python strftime and isoformat().
+    function getTimezoneOffsetMinutes(isoTimestamp) {
+        const match = isoTimestamp.match(/([+-])(\\d{2}):?(\\d{2})$/);
+        if (!match) return 0;
+        const sign = match[1] === '+' ? 1 : -1;
+        return sign * (parseInt(match[2]) * 60 + parseInt(match[3]));
+    }
+
+    // Utility: Format ISO timestamp to short display format (e.g., "Fri 15:45")
+    // Uses the timezone offset embedded in the ISO string so the displayed time
+    // matches Predbat's configured timezone regardless of the browser's local timezone.
+    function formatTimeDisplay(isoTimestamp) {
+        try {
+            const date = new Date(isoTimestamp);
+            const offsetMinutes = getTimezoneOffsetMinutes(isoTimestamp);
+            // Shift UTC time by the Predbat timezone offset, then read as UTC
+            const adjDate = new Date(date.getTime() + offsetMinutes * 60000);
+            const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+            const dayName = days[adjDate.getUTCDay()];
+            const hours = adjDate.getUTCHours().toString().padStart(2, '0');
+            const minutes = adjDate.getUTCMinutes().toString().padStart(2, '0');
+            return `${dayName} ${hours}:${minutes}`;
+        } catch (e) {
+            return isoTimestamp; // Fallback to original if parsing fails
+        }
+    }
+
+    // Utility: Convert time string to minutes from midnight
+    function getMinutesFromTimeString(timeStr) {
+        try {
+            // Try to parse as ISO timestamp first
+            const date = new Date(timeStr);
+            if (!isNaN(date.getTime())) {
+                // Use the plan midnight reference to compute absolute minutes so that
+                // next-day slots (e.g., tomorrow 00:00) return 1440 not 0.
+                // This makes the value comparable to the override times lists which
+                // are stored as minutes-from-today's-midnight (can exceed 1439).
+                if (window.planMidnightRef) {
+                    const midnight = new Date(window.planMidnightRef);
+                    return Math.round((date - midnight) / 60000);
+                }
+                // Fallback: use timezone offset from the ISO string itself
+                const offsetMinutes = getTimezoneOffsetMinutes(timeStr);
+                const adjDate = new Date(date.getTime() + offsetMinutes * 60000);
+                return adjDate.getUTCHours() * 60 + adjDate.getUTCMinutes();
+            }
+            // Fallback to "Day HH:MM" format parsing
+            const parts = timeStr.split(' ');
+            if (parts.length < 2) return 0;
+            const timeParts = parts[1].split(':');
+            if (timeParts.length < 2) return 0;
+            return parseInt(timeParts[0]) * 60 + parseInt(timeParts[1]);
+        } catch (e) {
+            return 0;
+        }
+    }
+
+    // Format timestamp to readable format
+    // Uses the timezone offset embedded in the ISO string so the displayed time
+    // matches Predbat's configured timezone regardless of the browser's local timezone.
+    function formatTimestamp(isoTimestamp) {
+        if (!isoTimestamp) return '';
+        try {
+            const date = new Date(isoTimestamp);
+            const offsetMinutes = getTimezoneOffsetMinutes(isoTimestamp);
+            // Shift UTC time by the Predbat timezone offset, then read as UTC
+            const adjDate = new Date(date.getTime() + offsetMinutes * 60000);
+            const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+            const day = adjDate.getUTCDate();
+            const month = months[adjDate.getUTCMonth()];
+            const year = adjDate.getUTCFullYear();
+            const hours = String(adjDate.getUTCHours()).padStart(2, '0');
+            const minutes = String(adjDate.getUTCMinutes()).padStart(2, '0');
+            const seconds = String(adjDate.getUTCSeconds()).padStart(2, '0');
+            return `Updated: ${day} ${month} ${year} ${hours}:${minutes}:${seconds}`;
+        } catch (e) {
+            return '';
+        }
+    }
+
+    // Adjust timestamp size based on window width
+    function adjustTimestampSize() {
+        const timestampElement = document.getElementById('planTimestamp');
+        if (!timestampElement) return;
+
+        const width = window.innerWidth;
+
+        if (width <= 600) {
+            timestampElement.style.fontSize = '10px';
+            timestampElement.style.marginLeft = '6px';
+        } else if (width <= 900) {
+            timestampElement.style.fontSize = '11px';
+            timestampElement.style.marginLeft = '10px';
+        } else if (width <= 1200) {
+            timestampElement.style.fontSize = '12px';
+            timestampElement.style.marginLeft = '12px';
+        } else {
+            timestampElement.style.fontSize = '13px';
+            timestampElement.style.marginLeft = '16px';
+        }
+    }
+
+    // Adjust all font sizes based on window width for responsive layout
+    function adjustResponsiveSizes() {
+        const width = window.innerWidth;
+
+        // Adjust timestamp
+        adjustTimestampSize();
+
+        // Adjust table fonts
+        const tables = document.querySelectorAll('table');
+        const buttons = document.querySelectorAll('.view-button');
+        const debugLabel = document.getElementById('debugToggleLabel');
+
+        if (width <= 600) {
+            // Very small screens
+            tables.forEach(table => {
+                table.style.fontSize = '10px';
+                const cells = table.querySelectorAll('td, th');
+                cells.forEach(cell => cell.style.padding = '2px');
+            });
+            buttons.forEach(btn => btn.style.fontSize = '11px');
+            if (debugLabel) debugLabel.style.fontSize = '11px';
+        } else if (width <= 900) {
+            // Small screens
+            tables.forEach(table => {
+                table.style.fontSize = '11px';
+                const cells = table.querySelectorAll('td, th');
+                cells.forEach(cell => cell.style.padding = '3px');
+            });
+            buttons.forEach(btn => btn.style.fontSize = '12px');
+            if (debugLabel) debugLabel.style.fontSize = '12px';
+        } else if (width <= 1200) {
+            // Medium screens
+            tables.forEach(table => {
+                table.style.fontSize = '13px';
+                const cells = table.querySelectorAll('td, th');
+                cells.forEach(cell => cell.style.padding = '4px');
+            });
+            buttons.forEach(btn => btn.style.fontSize = '13px');
+            if (debugLabel) debugLabel.style.fontSize = '13px';
+        } else {
+            // Large screens - reset to default
+            tables.forEach(table => {
+                table.style.fontSize = '';
+                const cells = table.querySelectorAll('td, th');
+                cells.forEach(cell => cell.style.padding = '');
+            });
+            buttons.forEach(btn => btn.style.fontSize = '14px');
+            if (debugLabel) debugLabel.style.fontSize = '';
+        }
+    }
+
+    // Update timestamp display
+    function updateTimestampDisplay() {
+        let timestamp = null;
+        if (currentView === 'plan' && window.planData) {
+            timestamp = window.planData.timestamp;
+        } else if (currentView === 'yesterday' && window.yesterdayData) {
+            timestamp = window.yesterdayData.timestamp;
+        } else if (currentView === 'baseline' && window.baselineData) {
+            timestamp = window.baselineData.timestamp;
+        }
+
+        const timestampElement = document.getElementById('planTimestamp');
+        if (timestampElement) {
+            timestampElement.textContent = formatTimestamp(timestamp);
+            adjustResponsiveSizes();
+        }
+    }
+
+    // Fetch the rolling debug-history snapshot index (small: at most a few dozen tiny
+    // entries) into window.debugHistoryData for the History/Yesterday view's Debug
+    // column. Called on initial load and whenever the user switches to that view,
+    // rather than on every 5s plan poll (fetchAndRenderPlan) - the underlying data only
+    // changes on an hours-long capture interval, so polling it that often would just be
+    // wasted requests for something that only matters while the Yesterday view is open.
+    async function loadDebugHistoryData() {
+        try {
+            const response = await fetch('./debug_history_list');
+            if (response.ok) {
+                window.debugHistoryData = await response.json();
+            }
+        } catch (error) {
+            console.error('Error fetching debug history list:', error);
+        }
+    }
+
+    // Switch between plan views
+    function switchView(view) {
+        currentView = view;
+        if (view === 'yesterday') {
+            loadDebugHistoryData().then(refreshPlan);
+        }
+
+        // Update button styling
+        document.querySelectorAll('.view-button').forEach(btn => {
+            if (btn.dataset.view === view) {
+                btn.style.backgroundColor = '#4CAF50';
+                btn.style.color = 'white';
+            } else {
+                btn.style.backgroundColor = '#f0f0f0';
+                btn.style.color = 'black';
+            }
+        });
+
+        // Show/hide debug toggle based on view
+        const debugToggleLabel = document.getElementById('debugToggleLabel');
+        if (debugToggleLabel) {
+            if (view === 'plan') {
+                debugToggleLabel.style.display = 'block';
+            } else {
+                debugToggleLabel.style.display = 'none';
+            }
+        }
+
+        // Update timestamp display
+        updateTimestampDisplay();
+
+        // Render the selected view
+        refreshPlan();
+    }
+
+    // Refresh plan display
+    function refreshPlan() {
+        const container = document.getElementById('planContainer');
+        const debugToggle = document.getElementById('debugToggle');
+        // Only allow debug mode for the plan view
+        const showDebug = (currentView === 'plan' && debugToggle) ? debugToggle.checked : false;
+
+        let data, timestamp, overrides;
+        if (currentView === 'plan') {
+            data = window.planData;
+            timestamp = data ? data.timestamp : null;
+            overrides = window.overridesData || {};
+        } else if (currentView === 'yesterday') {
+            data = window.yesterdayData;
+            timestamp = data ? data.timestamp : null;
+            overrides = {};
+        } else {
+            data = window.baselineData;
+            timestamp = data ? data.timestamp : null;
+            overrides = {};
+        }
+
+        if (!data) {
+            if (currentView === 'plan') {
+                container.innerHTML = '<h2>Plan data is loading, please wait...</h2>';
+            } else {
+                // The yesterday/baseline views are only produced once calculate_yesterday() has run,
+                // which it can't do without the recorded history of predbat.cost_today - say so rather
+                // than sitting on a loading message that will never go away
+                container.innerHTML = '<h2>No data for this view yet</h2>' +
+                    '<p>This view is computed about once an hour from what actually happened yesterday, ' +
+                    'so it stays empty for the first hour after Predbat starts.</p>' +
+                    '<p>If it never fills in, Predbat could not read the history of <b>predbat.cost_today</b> ' +
+                    'from Home Assistant. Check that the Home Assistant recorder is storing the Predbat entities ' +
+                    '(see the recorder notes in the FAQ) and look for <i>Calculate yesterday</i> warnings in the Predbat log.</p>';
+            }
+            return;
+        }
+
+        // Check for stale data
+        checkStaleness(timestamp);
+
+        // Render table
+        const editable = (currentView === 'plan');
+        // Debug-history download links only make sense on the History/Yesterday view -
+        // its rows are entirely in the past, unlike the live Plan view which is mostly
+        // future predictions with no corresponding capture.
+        const showHistoryLinks = (currentView === 'yesterday');
+        container.innerHTML = renderPlanTable(data, overrides, showDebug, editable, showHistoryLinks);
+
+        // Apply dark mode colors if needed
+        updateTableColors();
+
+        // Apply responsive sizing
+        adjustResponsiveSizes();
+    }
+
+    // Check if data is stale (>15 minutes old)
+    function checkStaleness(timestamp) {
+        const staleWarning = document.getElementById('staleWarning');
+        if (!timestamp || !staleWarning) return;
+
+        const dataTime = new Date(timestamp);
+        const now = new Date();
+        const ageMs = now - dataTime;
+        const isStale = ageMs > 900000; // 15 minutes in milliseconds
+
+        if (isStale) {
+            staleWarning.style.display = 'block';
+        } else {
+            staleWarning.style.display = 'none';
+        }
+    }
+
+    // Fetch and render plan data
+    async function fetchAndRenderPlan() {
+        try {
+            // Build query string with newest data timestamp for conditional fetch
+            const params = new URLSearchParams();
+            if (newestDataTimestamp) {
+                params.append('newest_timestamp', newestDataTimestamp);
+            }
+            if (window.overridesHash) {
+                params.append('overrides_hash', window.overridesHash);
+            }
+
+            const url = './api/plan_data' + (params.toString() ? '?' + params.toString() : '');
+            const response = await fetch(url);
+            if (!response.ok) {
+                throw new Error(`HTTP error ${response.status}`);
+            }
+
+            const data = await response.json();
+
+            // Check if server says data is unchanged
+            if (data.unchanged === true) {
+                // Data hasn't changed, no need to update
+                // Still check staleness based on plan data timestamp
+                if (window.planData && window.planData.timestamp) {
+                    checkStaleness(window.planData.timestamp);
+                }
+
+                // Hide error message
+                const errorDiv = document.getElementById('planError');
+                if (errorDiv) {
+                    errorDiv.style.display = 'none';
+                }
+                return; // Exit early, no updates needed
+            }
+
+            // We received new data - update everything and re-render
+            window.planData = data.plan;
+            window.yesterdayData = data.yesterday;
+            window.baselineData = data.baseline;
+            window.overridesData = data.overrides;
+            window.overridesHash = data.overrides_hash;
+
+            // Update newestDataTimestamp to the newest timestamp from the data we just received
+            const timestamps = [];
+            if (data.plan && data.plan.timestamp) timestamps.push(data.plan.timestamp);
+            if (data.yesterday && data.yesterday.timestamp) timestamps.push(data.yesterday.timestamp);
+            if (data.baseline && data.baseline.timestamp) timestamps.push(data.baseline.timestamp);
+            if (timestamps.length > 0) {
+                newestDataTimestamp = timestamps.reduce((a, b) => a > b ? a : b);
+            }
+
+            // Hide error message on successful fetch
+            const errorDiv = document.getElementById('planError');
+            if (errorDiv) {
+                errorDiv.style.display = 'none';
+            }
+
+            // Update timestamp display with new data
+            updateTimestampDisplay();
+
+            // Always re-render when we receive new data
+            refreshPlan();
+        } catch (error) {
+            console.error('Error fetching plan data:', error);
+            const errorDiv = document.getElementById('planError');
+            if (errorDiv) {
+                errorDiv.textContent = `Error fetching plan data: ${error.message}`;
+                errorDiv.style.display = 'block';
+            }
+        }
+    }
+
+    // Start automatic updates
+    function startPlanUpdates() {
+        // Load debug state
+        loadDebugState();
+
+        // Initial render
+        refreshPlan();
+
+        // Fetch the debug-history snapshot index once up front too, in case the page
+        // loads with currentView already set to 'yesterday' (e.g. restored state).
+        if (currentView === 'yesterday') {
+            loadDebugHistoryData().then(refreshPlan);
+        }
+
+        // Set up polling every 5 seconds
+        if (updateIntervalId) {
+            clearInterval(updateIntervalId);
+        }
+        updateIntervalId = setInterval(fetchAndRenderPlan, 5000);
+    }
+
+    // Stop automatic updates
+    function stopPlanUpdates() {
+        if (updateIntervalId) {
+            clearInterval(updateIntervalId);
+            updateIntervalId = null;
+        }
+    }
+
+    // Handle debug toggle change
+    function onDebugToggleChange() {
+        saveDebugState();
+        refreshPlan();
+    }
+    </script>
+    """
+    return text
+
+
+def get_header_html(title, calculating, default_page, arg_errors, THIS_VERSION, battery_status_icon, refresh=0, codemirror=False, chat_enabled=False):
     """
     Return the HTML header for a page
     """
 
     text = '<!doctype html><html><head><meta charset="utf-8"><title>{}</title>'.format(title)
+    text += '<link rel="icon" type="image/svg+xml" href="./images/bat_logo.svg">'
+    text += '<link rel="icon" type="image/png" href="./images/bat_logo_light.png">'
 
     text += """
+<script>
+// Apply dark mode immediately before CSS is parsed to prevent flash of white
+// Falls back to the OS/browser prefers-color-scheme setting when the user hasn't made an explicit choice (batpred#4800)
+function getDarkModePreference() {
+    const storedDarkMode = localStorage.getItem('darkMode');
+    if (storedDarkMode !== null) {
+        return storedDarkMode === 'true';
+    }
+    return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+}
+if (getDarkModePreference()) {
+    document.documentElement.classList.add('dark-mode');
+    document.addEventListener('DOMContentLoaded', function() {
+        if (document.body) {
+            document.body.classList.add('dark-mode');
+        }
+    });
+}
+</script>
+<style>
+    /* Paint the correct background before the external font/chart resources below (which block
+       rendering while they load) have a chance to delay the full stylesheet - otherwise a slow or
+       uncached CDN fetch leaves the page showing its default white background until they resolve,
+       flashing bright white on every page load/refresh even with dark mode enabled (batpred#2256). */
+    html { background-color: #ffffff; }
+    html.dark-mode { background-color: #121212; }
+    body { background-color: #ffffff; color: #333; }
+    html.dark-mode body { background-color: #121212; color: #e0e0e0; }
+</style>
 <link href="https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/css/materialdesignicons.min.css" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
 <style>
@@ -4127,12 +7971,19 @@ def get_header_html(title, calculating, default_page, arg_errors, THIS_VERSION, 
         height: 100%;
         border: 2px solid #ffffff;
     }
+    html.dark-mode, html.dark-mode body {
+        border-color: #121212;
+    }
     body {
         font-family: Arial, sans-serif;
         text-align: left;
         margin: 5px;
         background-color: #ffffff;
         color: #333;
+    }
+    html.dark-mode body {
+        background-color: #121212;
+        color: #e0e0e0;
     }
     h1 {
         color: #4CAF50;
@@ -4412,7 +8263,7 @@ window.onload = function() {
     applyDarkMode();
 };
 function applyDarkMode() {
-    const darkModeEnabled = localStorage.getItem('darkMode') === 'true';
+    const darkModeEnabled = getDarkModePreference();
     if (darkModeEnabled) {
         document.body.classList.add('dark-mode');
         document.documentElement.classList.add('dark-mode');
@@ -4433,6 +8284,22 @@ function applyDarkMode() {
     }
 };
 
+// Re-apply if the OS/browser theme changes while no explicit preference is stored (batpred#4800)
+if (window.matchMedia) {
+    const darkModeMediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+    const handleDarkModePreferenceChange = function() {
+        if (localStorage.getItem('darkMode') === null) {
+            applyDarkMode();
+        }
+    };
+    // Safari < 14 and Chrome < 39 only implement the older, deprecated addListener() method
+    if (darkModeMediaQuery.addEventListener) {
+        darkModeMediaQuery.addEventListener('change', handleDarkModePreferenceChange);
+    } else if (darkModeMediaQuery.addListener) {
+        darkModeMediaQuery.addListener(handleDarkModePreferenceChange);
+    }
+}
+
 function toggleDarkMode() {
     const isDarkMode = document.body.classList.toggle('dark-mode');
     localStorage.setItem('darkMode', isDarkMode);
@@ -4451,8 +8318,8 @@ function flyBat() {
     // Get the appropriate bat image based on dark/light mode
     const isDarkMode = document.body.classList.contains('dark-mode');
     const batImage = isDarkMode
-        ? 'https://raw.githubusercontent.com/springfall2008/batpred/refs/heads/main/docs/images/bat_logo_dark.png'
-        : 'https://raw.githubusercontent.com/springfall2008/batpred/refs/heads/main/docs/images/bat_logo_light.png';
+        ? './images/bat_logo_dark.png'
+        : './images/bat_logo_light.png';
 
     bat.style.backgroundImage = `url('${batImage}')`;
 
@@ -4489,6 +8356,22 @@ function restartPredbat() {
             console.error('Error:', error);
             alert('Error initiating restart: ' + error.message);
         });
+    }
+}
+
+function downloadLiveApps() {
+    if (confirm(`Download apps.yaml with real credentials?\\n\\nOK = full unmasked file\\nCancel = masked file (credentials redacted)`)) {
+        window.location.href = './debug_apps_live?masked=0';
+    } else {
+        window.location.href = './debug_apps_live?masked=1';
+    }
+}
+
+function downloadFileApps() {
+    if (confirm(`Download apps.yaml with real credentials?\\n\\nOK = full unmasked file\\nCancel = masked file (credentials redacted)`)) {
+        window.location.href = './debug_apps?masked=0';
+    } else {
+        window.location.href = './debug_apps?masked=1';
     }
 }
 
@@ -4544,11 +8427,11 @@ function toggleSwitch(element, fieldName) {
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.9/addon/lint/lint.min.css">
     </head>"""
     text += "</head><body>"
-    text += get_menu_html(calculating, default_page, arg_errors, THIS_VERSION, battery_status_icon)
+    text += get_menu_html(calculating, default_page, arg_errors, THIS_VERSION, battery_status_icon, chat_enabled)
     return text
 
 
-def get_menu_html(calculating, default_page, arg_errors, THIS_VERSION, battery_status_icon):
+def get_menu_html(calculating, default_page, arg_errors, THIS_VERSION, battery_status_icon, chat_enabled=False):
     """
     Return the Predbat Menu page as HTML
     """
@@ -4561,7 +8444,7 @@ def get_menu_html(calculating, default_page, arg_errors, THIS_VERSION, battery_s
     # Define status icon based on calculating state
     status_icon = ""
     if calculating:
-        status_icon = '<span class="mdi mdi-sync mdi-spin calculating-icon" style="color: #4CAF50; font-size: 24px; margin-left: 10px; margin-right: 10px;" title="Calculation in progress..."></span>'
+        status_icon = '<span class="mdi mdi-autorenew mdi-spin calculating-icon" style="color: #4CAF50; font-size: 24px; margin-left: 10px; margin-right: 10px;" title="Calculation in progress..."></span>'
     else:
         status_icon = '<span class="mdi mdi-check-circle idle-icon" style="color: #4CAF50; font-size: 24px; margin-left: 10px; margin-right: 10px;" title="System idle"></span>'
 
@@ -4775,6 +8658,36 @@ menuLinks.forEach(link => {
     }
 });
 
+// Second pass: a sub-page belongs to its parent menu entry.
+// Some pages are sub-pages of a menu item and have no entry of their own - /annual_view
+// and /annual_compare both live under the ./annual tab. Without this they matched
+// nothing and fell through to the default below, which highlighted Dashboard while the
+// user was plainly on another tab.
+//
+// Only runs when the first pass found no exact match, so a page that DOES have its own
+// entry can never be captured by a shorter one - /apps_editor keeps its own highlight
+// rather than lighting up /apps. The longest matching prefix wins for the same reason.
+if (!activeFound && menuLinks.length > 0) {
+    let bestLink = null;
+    let bestLength = 0;
+    menuLinks.forEach(link => {
+        const linkPath = new URL(link.href).pathname;
+        const cleanLinkPath = linkPath.endsWith('/') ? linkPath.slice(0, -1) : linkPath;
+        const cleanCurrentPage = currentPage.endsWith('/') ? currentPage.slice(0, -1) : currentPage;
+        // Require a separator so /annual matches /annual_view but /app never matches
+        // /apps - a bare prefix would capture unrelated pages that merely start alike.
+        if (cleanLinkPath.length > bestLength &&
+            (cleanCurrentPage.startsWith(cleanLinkPath + '_') || cleanCurrentPage.startsWith(cleanLinkPath + '/'))) {
+            bestLink = link;
+            bestLength = cleanLinkPath.length;
+        }
+    });
+    if (bestLink) {
+        bestLink.classList.add('active');
+        activeFound = true;
+    }
+}
+
 // If no active item was found, set default
 if (!activeFound && menuLinks.length > 0) {
     const defaultLink = menuLinks[0]; // Set first menu item as default
@@ -4793,9 +8706,52 @@ if (activeItem) {
 }
 }
 
-// Initialize menu on page load
+// Live status update functionality
+let statusUpdateInterval = null;
+
+function updateLiveStatus() {
+    fetch('./api/status')
+        .then(response => response.json())
+        .then(data => {
+            // Update calculating/idle icon
+            const statusIcon = document.getElementById('status-icon');
+            if (statusIcon) {
+                if (data.calculating) {
+                    statusIcon.innerHTML = '<span class="mdi mdi-autorenew mdi-spin calculating-icon" style="color: #4CAF50; font-size: 24px; margin-left: 10px; margin-right: 10px;" title="Calculation in progress..."></span>';
+                } else {
+                    statusIcon.innerHTML = '<span class="mdi mdi-check-circle idle-icon" style="color: #4CAF50; font-size: 24px; margin-left: 10px; margin-right: 10px;" title="System idle"></span>';
+                }
+            }
+
+            // Update battery status
+            const batteryStatus = document.getElementById('battery-status');
+            if (batteryStatus && data.battery_html) {
+                batteryStatus.innerHTML = data.battery_html;
+            }
+        })
+        .catch(error => {
+            console.error('Error updating status:', error);
+        });
+}
+
+function startStatusUpdates() {
+    // Initial update
+    updateLiveStatus();
+    // Update every 5 seconds
+    statusUpdateInterval = setInterval(updateLiveStatus, 5000);
+}
+
+function stopStatusUpdates() {
+    if (statusUpdateInterval) {
+        clearInterval(statusUpdateInterval);
+        statusUpdateInterval = null;
+    }
+}
+
+// Initialise menu on page load
 document.addEventListener("DOMContentLoaded", function() {
 setActiveMenuItem();
+startStatusUpdates();
 
 // For each menu item, add click handler to set it as active
 const menuLinks = document.querySelectorAll('.menu-bar a');
@@ -4846,17 +8802,17 @@ setTimeout(function() {
 <div class="menu-bar">
 <div class="logo">
     <img id="logo-image"
-            src="https://raw.githubusercontent.com/springfall2008/batpred/refs/heads/main/docs/images/bat_logo_light.png"
-            data-light-src="https://raw.githubusercontent.com/springfall2008/batpred/refs/heads/main/docs/images/bat_logo_light.png"
-            data-dark-src="https://raw.githubusercontent.com/springfall2008/batpred/refs/heads/main/docs/images/bat_logo_dark.png"
+            src="./images/bat_logo_light.png"
+            data-light-src="./images/bat_logo_light.png"
+            data-dark-src="./images/bat_logo_dark.png"
             alt="Predbat Logo"
             onclick="flyBat()"
             style="cursor: pointer;"
     >
-    """
+    <span id="status-icon">"""
         + status_icon
-        + """
-    <div class="battery-wrapper">
+        + """</span>
+    <div class="battery-wrapper" id="battery-status">
         """
         + battery_status_icon
         + """
@@ -4867,14 +8823,20 @@ setTimeout(function() {
 <a href='./entity'>Entities</a>
 <a href='./charts'>Charts</a>
 <a href='./compare'>Compare</a>
+<a href='./annual'>WhatIf</a>
+"""
+        + ("<a href='./chat'>Chat</a>\n" if chat_enabled else "")
+        + """<a href='./log'>Log</a>
 <a href='./config'>Config</a>
 <a href='./apps'>Apps"""
         + config_warning
         + """</a>
-<a href='./browse'>Browse</a>
 <a href='./components'>Components</a>
+<a href='./discovery'>Discovery</a>
 <a href='./apps_editor'>Editor</a>
-<a href='./log'>Log</a>
+<a href='./browse'>Browse</a>
+<a href='./internals'>Internals</a>
+<a href='./metrics_dashboard'>Metrics</a>
 <a href='https://springfall2008.github.io/batpred/'>Docs</a>
 <div class="dark-mode-toggle">
     """
@@ -4987,6 +8949,32 @@ def get_browse_css():
     border-bottom: 1px solid #ddd;
 }
 
+.file-actions {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
+
+.download-button {
+    background-color: #2196F3;
+    color: white;
+    padding: 8px 16px;
+    text-decoration: none;
+    border-radius: 4px;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.download-button:hover {
+    background-color: #0b7dda;
+}
+
+.download-button .mdi {
+    font-size: 16px;
+}
+
 .back-button {
     background-color: #4CAF50;
     color: white;
@@ -5081,5 +9069,671 @@ body.dark-mode .back-button:hover {
     background-color: #444;
     color: #fff;
 }
+
+body.dark-mode .download-button {
+    background-color: #1976D2;
+    color: #e0e0e0;
+    border: 1px solid #1565C0;
+}
+
+body.dark-mode .download-button:hover {
+    background-color: #1565C0;
+    color: #fff;
+}
 </style>
+    """
+
+
+def get_internals_css():
+    """
+    Return CSS styles for the internals page
+    """
+    return """
+<style>
+.internals-container {
+    margin: 20px;
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+}
+
+.threads-section {
+    margin-bottom: 30px;
+    padding: 15px;
+    background-color: #f8f9fa;
+    border-radius: 5px;
+    border: 1px solid #ddd;
+}
+
+.threads-section h3 {
+    margin-top: 0;
+    margin-bottom: 15px;
+    color: #333;
+}
+
+.threads-container {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.thread-item {
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+}
+
+.thread-header {
+    padding: 10px 15px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background-color: #fff;
+    transition: background-color 0.2s;
+}
+
+.thread-header:hover {
+    background-color: #f0f0f0;
+}
+
+.thread-name {
+    font-weight: bold;
+    color: #2196F3;
+    flex: 0 0 200px;
+}
+
+.thread-id {
+    color: #666;
+    font-size: 0.9em;
+    flex: 0 0 150px;
+}
+
+.thread-status {
+    color: #4CAF50;
+    font-size: 0.9em;
+}
+
+.thread-stack {
+    max-height: 500px;
+    overflow-y: auto;
+    background-color: #fafafa;
+    border-top: 1px solid #ddd;
+}
+
+.thread-stack.collapsed {
+    display: none;
+}
+
+.thread-stack.expanded {
+    display: block;
+}
+
+.stack-frames {
+    padding: 10px;
+}
+
+.stack-frame {
+    padding: 8px 10px;
+    margin-bottom: 5px;
+    background: white;
+    border-left: 3px solid #2196F3;
+    font-family: 'Courier New', monospace;
+    font-size: 0.85em;
+}
+
+.frame-number {
+    display: inline-block;
+    width: 40px;
+    color: #999;
+    font-weight: bold;
+}
+
+.frame-file {
+    color: #FF9800;
+    margin-right: 10px;
+}
+
+.frame-function {
+    color: #9C27B0;
+}
+
+.frame-code {
+    margin-top: 5px;
+    padding: 5px 10px;
+    background-color: #f5f5f5;
+    border-left: 2px solid #ddd;
+    color: #333;
+    margin-left: 40px;
+}
+
+.asyncio-tasks {
+    margin-top: 15px;
+    padding: 10px;
+    background-color: #e3f2fd;
+    border-left: 3px solid #2196F3;
+}
+
+.asyncio-tasks h4 {
+    margin: 0 0 10px 0;
+    color: #1976D2;
+    font-size: 0.9em;
+}
+
+.asyncio-task {
+    margin-bottom: 10px;
+    padding: 8px;
+    background: white;
+    border-radius: 3px;
+    border: 1px solid #90CAF9;
+}
+
+.task-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 5px;
+}
+
+.task-name {
+    font-weight: bold;
+    color: #1976D2;
+}
+
+.task-state {
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-size: 0.85em;
+    background-color: #4CAF50;
+    color: white;
+}
+
+.task-stack {
+    margin-top: 8px;
+    padding-left: 10px;
+}
+
+.tree-section {
+    margin-bottom: 30px;
+    padding: 15px;
+    background-color: #f8f9fa;
+    border-radius: 5px;
+    border: 1px solid #ddd;
+}
+
+.tree-section h3 {
+    margin-top: 0;
+    margin-bottom: 15px;
+    color: #333;
+}
+
+.tree-container {
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    padding: 10px;
+}
+
+.tree-view {
+    margin-top: 20px;
+}
+
+.tree-node {
+    margin-left: 0;
+    list-style: none;
+    padding: 0;
+}
+
+.tree-item {
+    padding: 4px 8px;
+    margin: 2px 0;
+    cursor: pointer;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    border-radius: 3px;
+}
+
+.tree-item:hover {
+    background-color: #f0f0f0;
+}
+
+.tree-item .expand-icon {
+    width: 20px;
+    display: inline-block;
+    cursor: pointer;
+    font-weight: bold;
+    color: #666;
+    text-align: center;
+}
+
+.tree-item .expand-icon.expandable {
+    color: #4CAF50;
+}
+
+.tree-item .refresh-icon {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 2px 6px;
+    font-size: 14px;
+    color: #007bff;
+    background-color: rgba(0, 123, 255, 0.1);
+    border: none;
+    border-radius: 3px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.tree-item .refresh-icon:hover {
+    background-color: rgba(0, 123, 255, 0.2);
+    transform: rotate(180deg);
+}
+
+.tree-item .download-icon {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 2px 6px;
+    font-size: 14px;
+    color: #28a745;
+    text-decoration: none;
+    border-radius: 3px;
+    background-color: rgba(40, 167, 69, 0.1);
+    transition: all 0.2s;
+}
+
+.tree-item .download-icon:hover {
+    background-color: rgba(40, 167, 69, 0.2);
+    transform: scale(1.1);
+}
+
+.tree-item .key {
+    font-weight: bold;
+    color: #2196F3;
+    margin-right: 8px;
+}
+
+.tree-item .type {
+    color: #999;
+    font-size: 0.9em;
+    margin-right: 8px;
+}
+
+.tree-item .value {
+    color: #333;
+    word-break: break-all;
+}
+
+.tree-item .value.string {
+    color: #4CAF50;
+}
+
+.tree-item .value.number {
+    color: #FF9800;
+}
+
+.tree-item .value.boolean {
+    color: #9C27B0;
+}
+
+.tree-item .value.none {
+    color: #999;
+    font-style: italic;
+}
+
+.tree-children {
+    margin-left: 20px;
+    border-left: 1px solid #ddd;
+    padding-left: 10px;
+    display: none;
+}
+
+.tree-children.expanded {
+    display: block;
+}
+
+.loading {
+    color: #999;
+    font-style: italic;
+}
+
+.error {
+    background-color: #f8d7da;
+    color: #721c24;
+    border: 1px solid #f5c6cb;
+    border-radius: 4px;
+    padding: 12px;
+    margin: 10px 0;
+}
+
+.breadcrumb-container {
+    margin-bottom: 20px;
+    border-bottom: 1px solid #ddd;
+    padding-bottom: 10px;
+}
+
+.breadcrumb {
+    margin-top: 10px;
+    font-size: 14px;
+    color: #666;
+}
+
+/* Dark mode styles */
+body.dark-mode .threads-section {
+    background-color: #2a2a2a;
+    border-color: #444;
+}
+
+body.dark-mode .threads-section h3 {
+    color: #e0e0e0;
+}
+
+body.dark-mode .thread-item {
+    background: #1e1e1e;
+    border-color: #444;
+}
+
+body.dark-mode .thread-header {
+    background-color: #1e1e1e;
+}
+
+body.dark-mode .thread-header:hover {
+    background-color: #333;
+}
+
+body.dark-mode .thread-name {
+    color: #64B5F6;
+}
+
+body.dark-mode .thread-id {
+    color: #999;
+}
+
+body.dark-mode .thread-status {
+    color: #81C784;
+}
+
+body.dark-mode .thread-stack {
+    background-color: #252525;
+    border-top-color: #444;
+}
+
+body.dark-mode .stack-frame {
+    background: #2a2a2a;
+    border-left-color: #64B5F6;
+}
+
+body.dark-mode .frame-file {
+    color: #FFB74D;
+}
+
+body.dark-mode .frame-function {
+    color: #BA68C8;
+}
+
+body.dark-mode .frame-code {
+    background-color: #1a1a1a;
+    border-left-color: #444;
+    color: #e0e0e0;
+}
+
+body.dark-mode .asyncio-tasks {
+    background-color: #1a2332;
+    border-left-color: #64B5F6;
+}
+
+body.dark-mode .asyncio-tasks h4 {
+    color: #64B5F6;
+}
+
+body.dark-mode .asyncio-task {
+    background: #2a2a2a;
+    border-color: #64B5F6;
+}
+
+body.dark-mode .task-name {
+    color: #64B5F6;
+}
+
+body.dark-mode .tree-section {
+    background-color: #2a2a2a;
+    border-color: #444;
+}
+
+body.dark-mode .tree-section h3 {
+    color: #e0e0e0;
+}
+
+body.dark-mode .tree-container {
+    background: #1e1e1e;
+    border-color: #444;
+}
+
+body.dark-mode .tree-item:hover {
+    background-color: #333;
+}
+
+body.dark-mode .tree-item .key {
+    color: #64B5F6;
+}
+
+body.dark-mode .tree-item .type {
+    color: #999;
+}
+
+body.dark-mode .tree-item .value {
+    color: #e0e0e0;
+}
+
+body.dark-mode .tree-item .value.string {
+    color: #81C784;
+}
+
+body.dark-mode .tree-item .value.number {
+    color: #FFB74D;
+}
+
+body.dark-mode .tree-item .value.boolean {
+    color: #BA68C8;
+}
+
+body.dark-mode .tree-item .refresh-icon {
+    color: #64B5F6;
+    background-color: rgba(100, 181, 246, 0.15);
+}
+
+body.dark-mode .tree-item .refresh-icon:hover {
+    background-color: rgba(100, 181, 246, 0.25);
+}
+
+body.dark-mode .tree-item .download-icon {
+    color: #4CAF50;
+    background-color: rgba(76, 175, 80, 0.15);
+}
+
+body.dark-mode .tree-item .download-icon:hover {
+    background-color: rgba(76, 175, 80, 0.25);
+}
+
+body.dark-mode .tree-children {
+    border-left-color: #444;
+}
+
+body.dark-mode .breadcrumb-container {
+    border-bottom-color: #333;
+}
+
+body.dark-mode .error {
+    background-color: #3c2124;
+    color: #f5b5c4;
+    border-color: #662c34;
+}
+</style>
+    """
+
+
+def get_internals_js():
+    """
+    Return JavaScript for the internals page
+    """
+    return """
+<script>
+async function toggleThreadStack(headerElement) {
+    const stackContainer = headerElement.nextElementSibling;
+    const expandIcon = headerElement.querySelector('.expand-icon');
+
+    if (!stackContainer || !stackContainer.classList.contains('thread-stack')) {
+        return;
+    }
+
+    if (stackContainer.classList.contains('expanded')) {
+        // Collapse
+        stackContainer.classList.remove('expanded');
+        stackContainer.classList.add('collapsed');
+        expandIcon.textContent = '+';
+    } else {
+        // Expand
+        stackContainer.classList.remove('collapsed');
+        stackContainer.classList.add('expanded');
+        expandIcon.textContent = '−';
+    }
+}
+
+async function toggleNode(element, path) {
+    const childrenContainer = element.nextElementSibling;
+    const expandIcon = element.querySelector('.expand-icon');
+
+    if (!childrenContainer || !childrenContainer.classList.contains('tree-children')) {
+        return;
+    }
+
+    if (childrenContainer.classList.contains('expanded')) {
+        // Collapse
+        childrenContainer.classList.remove('expanded');
+        expandIcon.textContent = '+';
+    } else {
+        // Expand
+        if (childrenContainer.children.length === 0) {
+            // Load children if not already loaded
+            childrenContainer.innerHTML = '<div class="loading">Loading...</div>';
+
+            try {
+                const response = await fetch(`./api/internals?path=${encodeURIComponent(path)}`);
+                const data = await response.json();
+
+                if (data.success) {
+                    childrenContainer.innerHTML = '';
+                    renderTreeNodes(childrenContainer, data.members, path);
+                } else {
+                    childrenContainer.innerHTML = `<div class="error">${data.error}</div>`;
+                }
+            } catch (error) {
+                childrenContainer.innerHTML = `<div class="error">Error loading: ${error.message}</div>`;
+            }
+        }
+
+        childrenContainer.classList.add('expanded');
+        expandIcon.textContent = '−';
+    }
+}
+
+async function refreshNode(buttonElement, path) {
+    // Find the parent tree-item
+    const treeItem = buttonElement.closest('.tree-item');
+    if (!treeItem) return;
+
+    // Find the children container
+    const childrenContainer = treeItem.nextElementSibling;
+    if (!childrenContainer || !childrenContainer.classList.contains('tree-children')) return;
+
+    // Only refresh if already expanded
+    if (!childrenContainer.classList.contains('expanded')) return;
+
+    // Show loading state
+    childrenContainer.innerHTML = '<div class="loading">Refreshing...</div>';
+
+    try {
+        const response = await fetch(`./api/internals?path=${encodeURIComponent(path)}`);
+        const data = await response.json();
+
+        if (data.success) {
+            childrenContainer.innerHTML = '';
+            renderTreeNodes(childrenContainer, data.members, path);
+        } else {
+            childrenContainer.innerHTML = `<div class="error">${data.error}</div>`;
+        }
+    } catch (error) {
+        childrenContainer.innerHTML = `<div class="error">Error refreshing: ${error.message}</div>`;
+    }
+}
+
+function renderTreeNodes(container, members, basePath) {
+    members.forEach(member => {
+        const itemDiv = document.createElement('div');
+        itemDiv.className = 'tree-item';
+
+        // Use the path provided by the server
+        const path = member.path || (basePath ? `${basePath}.${member.key}` : member.key);
+
+        // Add tooltip showing full path
+        itemDiv.title = path;
+
+        let expandIcon = '';
+        let refreshButton = '';
+        let downloadButton = '';
+        if (member.expandable) {
+            expandIcon = `<span class="expand-icon expandable">+</span>`;
+            // Add refresh button for expandable items
+            const safePathJs = path.replace(/'/g, "\\'");
+            refreshButton = `<button class="refresh-icon" title="Refresh this node" onclick="event.stopPropagation(); refreshNode(this, '${safePathJs}')">🔄</button>`;
+            // Add download button for expandable items
+            const safePathUrl = encodeURIComponent(path);
+            downloadButton = `<a href="./api/internals/download?path=${safePathUrl}" class="download-icon" title="Download as YAML" onclick="event.stopPropagation()">⬇</a>`;
+            itemDiv.onclick = function() { toggleNode(this, path); };
+        } else {
+            expandIcon = `<span class="expand-icon"></span>`;
+        }
+
+        let valueHtml = '';
+        if (!member.expandable && member.value !== undefined) {
+            let valueClass = 'value';
+            if (member.type === 'str') {
+                valueClass += ' string';
+                valueHtml = `<span class="${valueClass}">"${escapeHtml(member.value)}"</span>`;
+            } else if (member.type === 'int' || member.type === 'float') {
+                valueClass += ' number';
+                valueHtml = `<span class="${valueClass}">${member.value}</span>`;
+            } else if (member.type === 'bool') {
+                valueClass += ' boolean';
+                valueHtml = `<span class="${valueClass}">${member.value}</span>`;
+            } else if (member.type === 'NoneType') {
+                valueClass += ' none';
+                valueHtml = `<span class="${valueClass}">None</span>`;
+            } else {
+                valueHtml = `<span class="${valueClass}">${escapeHtml(String(member.value))}</span>`;
+            }
+        }
+
+        itemDiv.innerHTML = `
+            ${expandIcon}
+            ${refreshButton}
+            ${downloadButton}
+            <span class="key">${escapeHtml(member.key)}</span>
+            <span class="type">&lt;${member.type}${member.size !== undefined ? ': ' + member.size + ' items' : ''}&gt;</span>
+            ${valueHtml}
+        `;
+
+        container.appendChild(itemDiv);
+
+        if (member.expandable) {
+            const childrenDiv = document.createElement('div');
+            childrenDiv.className = 'tree-children';
+            container.appendChild(childrenDiv);
+        }
+    });
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+</script>
     """

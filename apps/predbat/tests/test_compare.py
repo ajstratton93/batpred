@@ -1,0 +1,642 @@
+# -----------------------------------------------------------------------------
+# Predbat Home Battery System
+# Copyright Trefor Southwell 2026 - All Rights Reserved
+# This application maybe used for personal use only and not for commercial use
+# -----------------------------------------------------------------------------
+# fmt: off
+# pylint: disable=consider-using-f-string
+# pylint: disable=line-too-long
+# pylint: disable=attribute-defined-outside-init
+
+"""Unit tests for the Compare tariff engine.
+
+Covers:
+  - apply_hardware_overrides: verify each override key sets the right attribute, including
+    that the export rate follows the discharge override unless overridden explicitly (#4895)
+  - hardware isolation between tariffs: overrides applied for tariff N must not
+    bleed into tariff N+1 in run_all() (regression for the bug where agile_fixed
+    reported a final SOC larger than the normal battery size)
+"""
+
+import inspect
+
+from compare import Compare
+from const import MINUTE_WATT
+
+
+class _FakePredbat:
+    """Minimal predbat stub sufficient for Compare tests that don't run a full plan."""
+
+    def __init__(self):
+        """Initialise stub with representative hardware defaults."""
+        self.soc_kw = 5.0
+        self.soc_max = 10.0
+        self.battery_rate_max_charge = 3.0 * 1000 / MINUTE_WATT
+        self.battery_rate_max_charge_dc = 3.0 * 1000 / MINUTE_WATT
+        self.battery_rate_max_discharge = 3.0 * 1000 / MINUTE_WATT
+        # Deliberately lower than the discharge rate, as real hardware often is: it is derived from
+        # min(inverter_limit_export, battery_rate_max_raw), so a discharge override that failed to
+        # move it left export windows pinned at the real rate (issue #4895)
+        self.battery_rate_max_export = 2.6 * 1000 / MINUTE_WATT
+        self.inverter_limit = 3.6 * 1000 / MINUTE_WATT
+        self.config_root = "."
+        self.prefix = "predbat"
+        self.currency_symbols = ["£", "p"]
+        self.comparisons = {}
+
+    def log(self, msg):
+        """Discard log messages."""
+        pass
+
+    def dashboard_item(self, *args, **kwargs):
+        """Stub."""
+        pass
+
+
+def _make_compare():
+    """Return a Compare instance wired to a _FakePredbat, bypassing load_yaml."""
+    pb = _FakePredbat()
+    cmp = Compare.__new__(Compare)
+    cmp.pb = pb
+    cmp.log = pb.log
+    cmp.config_root = pb.config_root
+    cmp.dashboard_item = pb.dashboard_item
+    cmp.currency_symbols = pb.currency_symbols
+    cmp.prefix = pb.prefix
+    cmp.comparisons = {}
+    return cmp, pb
+
+
+def test_compare(my_predbat):
+    """Run all compare unit tests."""
+    failed = 0
+    print("**** Running compare tests ****\n")
+
+    # ------------------------------------------------------------------
+    # T1: apply_hardware_overrides – soc_max override
+    # ------------------------------------------------------------------
+    cmp, pb = _make_compare()
+    original_soc_kw = pb.soc_kw
+    original_charge_dc = pb.battery_rate_max_charge_dc
+    tariff = {"override_soc_max_kwh": 20.0}
+    cmp.apply_hardware_overrides(tariff, pb)
+    if pb.soc_max != 20.0:
+        print("ERROR T1: soc_max should be 20.0, got {}".format(pb.soc_max))
+        failed += 1
+    # soc_kw must not exceed new soc_max
+    if pb.soc_kw > pb.soc_max:
+        print("ERROR T1b: soc_kw {} > soc_max {} after override".format(pb.soc_kw, pb.soc_max))
+        failed += 1
+    # When soc_kw is already within capacity it must be unchanged
+    if pb.soc_kw != original_soc_kw:
+        print("ERROR T1c: soc_kw changed unexpectedly from {} to {}".format(original_soc_kw, pb.soc_kw))
+        failed += 1
+    else:
+        print("PASS T1: soc_max override")
+
+    # ------------------------------------------------------------------
+    # T2: apply_hardware_overrides – soc_kw clamped when over new capacity
+    # ------------------------------------------------------------------
+    cmp, pb = _make_compare()
+    pb.soc_kw = 15.0  # above the override capacity
+    tariff = {"override_soc_max_kwh": 10.0}
+    cmp.apply_hardware_overrides(tariff, pb)
+    if pb.soc_kw != 10.0:
+        print("ERROR T2: soc_kw should be clamped to 10.0, got {}".format(pb.soc_kw))
+        failed += 1
+    else:
+        print("PASS T2: soc_kw clamped to new soc_max")
+
+    # ------------------------------------------------------------------
+    # T3: apply_hardware_overrides – charge rate override also scales DC rate
+    # ------------------------------------------------------------------
+    cmp, pb = _make_compare()
+    # Set DC rate double the AC rate to verify proportional scaling
+    pb.battery_rate_max_charge = 3.0 * 1000 / MINUTE_WATT
+    pb.battery_rate_max_charge_dc = 6.0 * 1000 / MINUTE_WATT
+    tariff = {"override_battery_rate_max_charge_kw": 6.0}
+    cmp.apply_hardware_overrides(tariff, pb)
+    expected_ac = 6.0 * 1000 / MINUTE_WATT
+    expected_dc = 12.0 * 1000 / MINUTE_WATT  # doubled proportionally
+    if abs(pb.battery_rate_max_charge - expected_ac) > 1e-9:
+        print("ERROR T3: battery_rate_max_charge should be {}, got {}".format(expected_ac, pb.battery_rate_max_charge))
+        failed += 1
+    elif abs(pb.battery_rate_max_charge_dc - expected_dc) > 1e-9:
+        print("ERROR T3b: battery_rate_max_charge_dc should be {} (proportional), got {}".format(expected_dc, pb.battery_rate_max_charge_dc))
+        failed += 1
+    else:
+        print("PASS T3: battery_rate_max_charge and battery_rate_max_charge_dc override")
+
+    # ------------------------------------------------------------------
+    # T4: apply_hardware_overrides – discharge rate override
+    # ------------------------------------------------------------------
+    cmp, pb = _make_compare()
+    tariff = {"override_battery_rate_max_discharge_kw": 5.0}
+    cmp.apply_hardware_overrides(tariff, pb)
+    expected = 5.0 * 1000 / MINUTE_WATT
+    if abs(pb.battery_rate_max_discharge - expected) > 1e-9:
+        print("ERROR T4: battery_rate_max_discharge should be {}, got {}".format(expected, pb.battery_rate_max_discharge))
+        failed += 1
+    else:
+        print("PASS T4: battery_rate_max_discharge override")
+
+    # ------------------------------------------------------------------
+    # T5: apply_hardware_overrides – inverter limit override
+    # ------------------------------------------------------------------
+    cmp, pb = _make_compare()
+    tariff = {"override_inverter_limit_kw": 5.0}
+    cmp.apply_hardware_overrides(tariff, pb)
+    expected = 5.0 * 1000 / MINUTE_WATT
+    if abs(pb.inverter_limit - expected) > 1e-9:
+        print("ERROR T5: inverter_limit should be {}, got {}".format(expected, pb.inverter_limit))
+        failed += 1
+    else:
+        print("PASS T5: inverter_limit override")
+
+    # ------------------------------------------------------------------
+    # T6: apply_hardware_overrides – empty tariff leaves attrs unchanged
+    # ------------------------------------------------------------------
+    cmp, pb = _make_compare()
+    original_soc_max = pb.soc_max
+    original_charge = pb.battery_rate_max_charge
+    original_discharge = pb.battery_rate_max_discharge
+    original_export = pb.battery_rate_max_export
+    original_limit = pb.inverter_limit
+    cmp.apply_hardware_overrides({}, pb)
+    if pb.soc_max != original_soc_max or pb.battery_rate_max_charge != original_charge or pb.battery_rate_max_discharge != original_discharge or pb.battery_rate_max_export != original_export or pb.inverter_limit != original_limit:
+        print("ERROR T6: empty tariff should not change hardware attrs")
+        failed += 1
+    else:
+        print("PASS T6: empty tariff leaves attrs unchanged")
+
+    # ------------------------------------------------------------------
+    # T7: hardware isolation – simulate the run_all mid-loop restore pattern
+    #     so that a big-battery tariff's overrides do NOT bleed into the
+    #     subsequent tariff (regression test for the soc_max bleed bug)
+    # ------------------------------------------------------------------
+    cmp, pb = _make_compare()
+    # Save hardware state (as run_all does before the loop)
+    save_soc_max = pb.soc_max
+    save_charge = pb.battery_rate_max_charge
+    save_charge_dc = pb.battery_rate_max_charge_dc
+    save_discharge = pb.battery_rate_max_discharge
+    save_export = pb.battery_rate_max_export
+    save_limit = pb.inverter_limit
+
+    big_battery_tariff = {
+        "override_soc_max_kwh": 20.0,
+        "override_battery_rate_max_charge_kw": 6.0,
+        "override_battery_rate_max_discharge_kw": 6.0,
+        "override_inverter_limit_kw": 6.0,
+    }
+    # Simulate running the first tariff (big battery)
+    cmp.apply_hardware_overrides(big_battery_tariff, pb)
+    # Confirm the override was applied
+    if pb.soc_max != 20.0:
+        print("ERROR T7 setup: soc_max should be 20.0 after big-battery tariff, got {}".format(pb.soc_max))
+        failed += 1
+
+    # Mid-loop restore (this is the fix)
+    pb.soc_max = save_soc_max
+    pb.battery_rate_max_charge = save_charge
+    pb.battery_rate_max_charge_dc = save_charge_dc
+    pb.battery_rate_max_discharge = save_discharge
+    pb.battery_rate_max_export = save_export
+    pb.inverter_limit = save_limit
+
+    # Now simulate running the second tariff (no overrides)
+    normal_tariff = {}
+    cmp.apply_hardware_overrides(normal_tariff, pb)
+
+    if pb.soc_max != save_soc_max:
+        print("ERROR T7: soc_max leaked from big-battery tariff into next tariff: expected {}, got {}".format(save_soc_max, pb.soc_max))
+        failed += 1
+    elif pb.battery_rate_max_charge != save_charge:
+        print("ERROR T7: battery_rate_max_charge leaked: expected {}, got {}".format(save_charge, pb.battery_rate_max_charge))
+        failed += 1
+    elif pb.battery_rate_max_charge_dc != save_charge_dc:
+        print("ERROR T7: battery_rate_max_charge_dc leaked: expected {}, got {}".format(save_charge_dc, pb.battery_rate_max_charge_dc))
+        failed += 1
+    elif pb.battery_rate_max_discharge != save_discharge:
+        print("ERROR T7: battery_rate_max_discharge leaked: expected {}, got {}".format(save_discharge, pb.battery_rate_max_discharge))
+        failed += 1
+    elif pb.battery_rate_max_export != save_export:
+        print("ERROR T7: battery_rate_max_export leaked: expected {}, got {}".format(save_export, pb.battery_rate_max_export))
+        failed += 1
+    elif pb.inverter_limit != save_limit:
+        print("ERROR T7: inverter_limit leaked: expected {}, got {}".format(save_limit, pb.inverter_limit))
+        failed += 1
+    else:
+        print("PASS T7: hardware attrs restored correctly between tariffs")
+
+    # ------------------------------------------------------------------
+    # T8: hardware isolation – WITHOUT mid-loop restore the bleed is visible
+    #     (validates that the test would have caught the original bug)
+    # ------------------------------------------------------------------
+    cmp, pb = _make_compare()
+    save_soc_max = pb.soc_max  # 10 kWh
+
+    # First tariff with big battery override – no restore after
+    cmp.apply_hardware_overrides({"override_soc_max_kwh": 20.0}, pb)
+    # Do NOT restore – replicate the old buggy code
+
+    # Second tariff with no override
+    cmp.apply_hardware_overrides({}, pb)
+
+    # Without the fix, soc_max stays at 20 (the bleed)
+    bleed_detected = pb.soc_max != save_soc_max
+    if not bleed_detected:
+        print("ERROR T8: expected to detect bleed when restore is skipped, but soc_max == {}".format(pb.soc_max))
+        failed += 1
+    else:
+        print("PASS T8: bleed correctly detected when mid-loop restore is absent (confirms T7 tests the right thing)")
+
+    # ------------------------------------------------------------------
+    # T9: config isolation – the mid-loop config snapshot/restore pattern
+    #     prevents fetch_config() overrides bleeding into later tariffs
+    # ------------------------------------------------------------------
+    cmp, pb = _make_compare()
+    # Give pb a minimal config_index with one overridable item
+    pb.config_index = {"best_soc_min": {"value": 0.5}}
+    fetch_config_calls = []
+
+    def _mock_fetch_config_options():
+        fetch_config_calls.append(1)
+
+    pb.fetch_config_options = _mock_fetch_config_options
+
+    tariff_with_config = {"config": {"best_soc_min": 2.0}}
+
+    # Simulate the snapshot-before / restore-after pattern from run_all()
+    config_snapshot = {}
+    for key in tariff_with_config.get("config", {}):
+        item = pb.config_index.get(key)
+        if item is not None:
+            config_snapshot[key] = item.get("value")
+
+    # Simulate fetch_config() running inside run_single()
+    cmp.fetch_config(tariff_with_config)
+
+    if pb.config_index["best_soc_min"]["value"] != 2.0:
+        print("ERROR T9 setup: config override was not applied, got {}".format(pb.config_index["best_soc_min"]["value"]))
+        failed += 1
+
+    # Now simulate the mid-loop restore
+    if config_snapshot:
+        for key, orig_value in config_snapshot.items():
+            item = pb.config_index.get(key)
+            if item is not None:
+                item["value"] = orig_value
+        pb.fetch_config_options()
+
+    if pb.config_index["best_soc_min"]["value"] != 0.5:
+        print("ERROR T9: config bled after restore: expected 0.5, got {}".format(pb.config_index["best_soc_min"]["value"]))
+        failed += 1
+    elif not fetch_config_calls:
+        print("ERROR T9: fetch_config_options() not called during restore")
+        failed += 1
+    else:
+        print("PASS T9: config values restored between tariffs")
+
+    # ------------------------------------------------------------------
+    # T10: config isolation – WITHOUT restore the config bleed is detectable
+    # ------------------------------------------------------------------
+    cmp, pb = _make_compare()
+    pb.config_index = {"best_soc_min": {"value": 0.5}}
+    pb.fetch_config_options = lambda: None
+
+    cmp.fetch_config({"config": {"best_soc_min": 2.0}})
+    # Do NOT restore – replicate the old buggy code
+
+    # Now run a second tariff with no config – value should still be 2.0 (bleed)
+    cmp.fetch_config({})  # empty config → no changes
+
+    if pb.config_index["best_soc_min"]["value"] == 0.5:
+        print("ERROR T10: expected to detect config bleed when restore is skipped")
+        failed += 1
+    else:
+        print("PASS T10: config bleed correctly detected when restore is absent (confirms T9 tests the right thing)")
+
+    # ------------------------------------------------------------------
+    # T11: apply_hardware_overrides – non-numeric values are skipped safely
+    # ------------------------------------------------------------------
+    cmp, pb = _make_compare()
+    original_soc_max = pb.soc_max
+    original_charge = pb.battery_rate_max_charge
+    original_charge_dc = pb.battery_rate_max_charge_dc
+    original_discharge = pb.battery_rate_max_discharge
+    original_export = pb.battery_rate_max_export
+    original_limit = pb.inverter_limit
+    bad_tariff = {
+        "id": "bad_tariff",
+        "override_soc_max_kwh": "not_a_number",
+        "override_battery_rate_max_charge_kw": "bad",
+        "override_battery_rate_max_discharge_kw": None,
+        "override_battery_rate_max_export_kw": "nope",
+        "override_inverter_limit_kw": "oops",
+    }
+    try:
+        cmp.apply_hardware_overrides(bad_tariff, pb)
+        # All attrs must be unchanged since every value was bad
+        if pb.soc_max != original_soc_max:
+            print("ERROR T11: soc_max changed on bad input: got {}".format(pb.soc_max))
+            failed += 1
+        elif pb.battery_rate_max_charge != original_charge:
+            print("ERROR T11: battery_rate_max_charge changed on bad input")
+            failed += 1
+        elif pb.battery_rate_max_charge_dc != original_charge_dc:
+            print("ERROR T11: battery_rate_max_charge_dc changed on bad input")
+            failed += 1
+        elif pb.battery_rate_max_discharge != original_discharge:
+            print("ERROR T11: battery_rate_max_discharge changed on bad input")
+            failed += 1
+        elif pb.battery_rate_max_export != original_export:
+            print("ERROR T11: battery_rate_max_export changed on bad input")
+            failed += 1
+        elif pb.inverter_limit != original_limit:
+            print("ERROR T11: inverter_limit changed on bad input")
+            failed += 1
+        else:
+            print("PASS T11: non-numeric override values are skipped without raising")
+    except (ValueError, TypeError) as e:
+        print("ERROR T11: apply_hardware_overrides raised on bad input: {}".format(e))
+        failed += 1
+
+    # ------------------------------------------------------------------
+    # T12: run_all() source actually contains the mid-loop config restore
+    #      (T9/T10 above only prove the pattern works in isolation - this
+    #      closes the gap by checking it's genuinely wired into run_all()
+    #      itself, not just demonstrated as a standalone snippet - #4156)
+    # ------------------------------------------------------------------
+    run_all_source = inspect.getsource(Compare.run_all)
+    # The restore block must appear between the "restore hardware settings" comment (which is
+    # inside the per-tariff loop) and the loop's closing use of publish_data(), otherwise it's
+    # not actually running once per tariff.
+    hardware_restore_idx = run_all_source.find("Restore hardware settings after each tariff")
+    publish_data_idx = run_all_source.find("self.publish_data()")
+    config_restore_idx = run_all_source.find("config_snapshot", hardware_restore_idx + 1) if hardware_restore_idx >= 0 else -1
+
+    if hardware_restore_idx < 0 or publish_data_idx < 0:
+        print("ERROR T12: could not locate expected markers in run_all() source - test may need updating")
+        failed += 1
+    elif not (hardware_restore_idx < config_restore_idx < publish_data_idx):
+        print("ERROR T12: config_snapshot restore is not positioned inside the per-tariff loop in run_all() - the #4156 leak is not actually fixed")
+        failed += 1
+    else:
+        print("PASS T12: run_all() restores config: overrides inside the per-tariff loop, not just once at the end")
+
+    # ------------------------------------------------------------------
+    # T13: run_single() re-plans iBoost against the tariff's own rates
+    #      instead of leaving it stuck with the plan computed for the live
+    #      tariff (the compare-plan iBoost timing bug)
+    # ------------------------------------------------------------------
+    cmp, pb = _make_compare()
+    pb.iboost_enable = True
+    pb.iboost_solar = False
+    pb.iboost_charging = False
+    pb.iboost_smart = True
+    pb.iboost_today = 3.0
+    pb.import_today_now = 0
+    pb.export_today_now = 0
+    pb.cost_today_sofar = 0
+    pb.carbon_today_sofar = 0
+    pb.forecast_plan_hours = 48
+    pb.manual_charge_times = None
+    pb.manual_export_times = None
+    pb.manual_freeze_charge_times = None
+    pb.manual_freeze_export_times = None
+    pb.manual_demand_times = None
+    pb.manual_all_times = None
+    pb.octopus_intelligent_charging = False
+    pb.iboost_plan = ["stale_plan_from_live_tariff"]
+
+    tariff_plan_calls = []
+
+    def _mock_plan_iboost_smart():
+        tariff_plan_calls.append(1)
+        return ["fresh_plan_for_this_tariff"]
+
+    pb.plan_iboost_smart = _mock_plan_iboost_smart
+
+    cmp.fetch_config = lambda tariff: None
+    cmp.apply_hardware_overrides = lambda tariff, pb: None
+    cmp.fetch_rates = lambda tariff, base_import, base_export: "existing"
+    cmp.recompute_car_charging = lambda slots: None
+    cmp.run_scenario = lambda end_record: {"cost": 0, "metric": 0}
+
+    cmp.run_single({"name": "test_tariff", "id": "test"}, {}, {}, 48 * 60, fetch_sensor=False)
+
+    if not tariff_plan_calls:
+        print("ERROR T13: plan_iboost_smart() was not called during run_single()")
+        failed += 1
+    elif pb.iboost_plan != ["fresh_plan_for_this_tariff"]:
+        print("ERROR T13: iboost_plan should be replaced with the tariff-specific plan, got {}".format(pb.iboost_plan))
+        failed += 1
+    else:
+        print("PASS T13: run_single() re-plans iBoost using the compared tariff's own rates")
+
+    # ------------------------------------------------------------------
+    # T14: run_single() clears iboost_plan (rather than reusing a stale one)
+    #      when iBoost smart-rate planning isn't applicable for this tariff run
+    # ------------------------------------------------------------------
+    cmp, pb = _make_compare()
+    pb.iboost_enable = True
+    pb.iboost_solar = True
+    pb.iboost_charging = True
+    pb.iboost_smart = False
+    pb.iboost_today = 0
+    pb.import_today_now = 0
+    pb.export_today_now = 0
+    pb.cost_today_sofar = 0
+    pb.carbon_today_sofar = 0
+    pb.forecast_plan_hours = 48
+    pb.manual_charge_times = None
+    pb.manual_export_times = None
+    pb.manual_freeze_charge_times = None
+    pb.manual_freeze_export_times = None
+    pb.manual_demand_times = None
+    pb.manual_all_times = None
+    pb.octopus_intelligent_charging = False
+    pb.iboost_plan = ["stale_plan_from_live_tariff"]
+    pb.plan_iboost_smart = lambda: tariff_plan_calls.append(1) or []
+
+    cmp.fetch_config = lambda tariff: None
+    cmp.apply_hardware_overrides = lambda tariff, pb: None
+    cmp.fetch_rates = lambda tariff, base_import, base_export: "existing"
+    cmp.recompute_car_charging = lambda slots: None
+    cmp.run_scenario = lambda end_record: {"cost": 0, "metric": 0}
+
+    tariff_plan_calls.clear()
+    cmp.run_single({"name": "test_tariff2", "id": "test2"}, {}, {}, 48 * 60, fetch_sensor=False)
+
+    if tariff_plan_calls:
+        print("ERROR T14: plan_iboost_smart() should not be called when iboost_charging/iboost_solar handle boosting and iboost_smart is off")
+        failed += 1
+    elif pb.iboost_plan != []:
+        print("ERROR T14: stale iboost_plan from the live tariff should be cleared, got {}".format(pb.iboost_plan))
+        failed += 1
+    else:
+        print("PASS T14: run_single() clears stale iboost_plan when smart-rate planning isn't applicable")
+
+    # ------------------------------------------------------------------
+    # T15: apply_hardware_overrides - a discharge override also moves the
+    #      export rate, otherwise export windows stay pinned at the real
+    #      hardware rate and export earnings are understated (#4895)
+    # ------------------------------------------------------------------
+    cmp, pb = _make_compare()
+    real_export = pb.battery_rate_max_export
+    cmp.apply_hardware_overrides({"override_battery_rate_max_discharge_kw": 30.0}, pb)
+    expected = 30.0 * 1000 / MINUTE_WATT
+    if abs(pb.battery_rate_max_export - expected) > 1e-9:
+        print("ERROR T15: battery_rate_max_export should follow the discharge override to {}, got {} (real hardware was {})".format(expected, pb.battery_rate_max_export, real_export))
+        failed += 1
+    else:
+        print("PASS T15: discharge override carries battery_rate_max_export with it")
+
+    # ------------------------------------------------------------------
+    # T16: apply_hardware_overrides - an explicit export override wins over
+    #      the discharge override, so export-limited hardware can be modelled
+    # ------------------------------------------------------------------
+    cmp, pb = _make_compare()
+    cmp.apply_hardware_overrides({"override_battery_rate_max_discharge_kw": 30.0, "override_battery_rate_max_export_kw": 5.0}, pb)
+    expected_discharge = 30.0 * 1000 / MINUTE_WATT
+    expected_export = 5.0 * 1000 / MINUTE_WATT
+    if abs(pb.battery_rate_max_discharge - expected_discharge) > 1e-9:
+        print("ERROR T16: battery_rate_max_discharge should be {}, got {}".format(expected_discharge, pb.battery_rate_max_discharge))
+        failed += 1
+    elif abs(pb.battery_rate_max_export - expected_export) > 1e-9:
+        print("ERROR T16: explicit battery_rate_max_export override should be {}, got {}".format(expected_export, pb.battery_rate_max_export))
+        failed += 1
+    else:
+        print("PASS T16: explicit export override takes precedence over the discharge override")
+
+    # ------------------------------------------------------------------
+    # T17: apply_hardware_overrides - export override on its own leaves the
+    #      discharge rate alone
+    # ------------------------------------------------------------------
+    cmp, pb = _make_compare()
+    original_discharge = pb.battery_rate_max_discharge
+    cmp.apply_hardware_overrides({"override_battery_rate_max_export_kw": 8.0}, pb)
+    expected_export = 8.0 * 1000 / MINUTE_WATT
+    if abs(pb.battery_rate_max_export - expected_export) > 1e-9:
+        print("ERROR T17: battery_rate_max_export should be {}, got {}".format(expected_export, pb.battery_rate_max_export))
+        failed += 1
+    elif pb.battery_rate_max_discharge != original_discharge:
+        print("ERROR T17: battery_rate_max_discharge should be untouched, got {}".format(pb.battery_rate_max_discharge))
+        failed += 1
+    else:
+        print("PASS T17: export override alone leaves the discharge rate unchanged")
+
+    # ------------------------------------------------------------------
+    # T18: apply_hardware_overrides - a non-numeric export override falls
+    #      back to the discharge override rather than silently reinstating
+    #      the real hardware export rate
+    # ------------------------------------------------------------------
+    cmp, pb = _make_compare()
+    real_export = pb.battery_rate_max_export
+    cmp.apply_hardware_overrides({"id": "typo", "override_battery_rate_max_discharge_kw": 12.0, "override_battery_rate_max_export_kw": "twelve"}, pb)
+    expected = 12.0 * 1000 / MINUTE_WATT
+    if abs(pb.battery_rate_max_export - expected) > 1e-9:
+        print("ERROR T18: bad export override should fall back to the discharge rate {}, got {} (real hardware was {})".format(expected, pb.battery_rate_max_export, real_export))
+        failed += 1
+    else:
+        print("PASS T18: bad export override value falls back to the discharge override")
+
+    # ------------------------------------------------------------------
+    # T19: run_all() actually saves and restores battery_rate_max_export,
+    #      both mid-loop and at the end, so an export override can't bleed
+    #      into the next tariff (T7 only proves the pattern in isolation).
+    #      Positional checks (T12-style) so the snapshot must sit before the
+    #      tariff loop, not just anywhere in the source.
+    # ------------------------------------------------------------------
+    run_all_source = inspect.getsource(Compare.run_all)
+    loop_idx = run_all_source.find("for tariff in compare_list:")
+    snapshot_idx = run_all_source.find("save_battery_rate_max_export = my_predbat.battery_rate_max_export")
+    if loop_idx < 0 or snapshot_idx < 0:
+        print("ERROR T19: could not locate the tariff loop or the battery_rate_max_export snapshot in run_all() source - test may need updating")
+        failed += 1
+    elif not (snapshot_idx < loop_idx):
+        print("ERROR T19: battery_rate_max_export snapshot must appear before the tariff loop in run_all()")
+        failed += 1
+    elif run_all_source.count("my_predbat.battery_rate_max_export = save_battery_rate_max_export") < 2:
+        print("ERROR T19: run_all() must restore battery_rate_max_export both inside the tariff loop and at the end")
+        failed += 1
+    else:
+        print("PASS T19: run_all() snapshots and restores battery_rate_max_export")
+
+    # ------------------------------------------------------------------
+    # T20: apply_hardware_overrides - a non-numeric export override with no
+    #      discharge override leaves the real hardware export rate in place
+    #      (there is nothing to fall back to, and the guard must not regress
+    #      to `not export_overridden`, which would copy the discharge rate)
+    # ------------------------------------------------------------------
+    cmp, pb = _make_compare()
+    real_export = pb.battery_rate_max_export
+    real_discharge = pb.battery_rate_max_discharge
+    cmp.apply_hardware_overrides({"id": "typo", "override_battery_rate_max_export_kw": "twelve"}, pb)
+    if abs(pb.battery_rate_max_export - real_export) > 1e-9:
+        print("ERROR T20: export rate changed to {} on a bad export-only override, expected real hardware {}".format(pb.battery_rate_max_export, real_export))
+        failed += 1
+    elif pb.battery_rate_max_discharge != real_discharge:
+        print("ERROR T20: discharge rate changed to {} on a bad export-only override".format(pb.battery_rate_max_discharge))
+        failed += 1
+    else:
+        print("PASS T20: bad export-only override keeps the real hardware export rate")
+
+    # ------------------------------------------------------------------
+    # T21: apply_hardware_overrides - a numeric-string discharge override
+    #      ("12.0" from a template) parses, applies, and correctly sets the
+    #      flag so the export rate follows it - previously the raw-string log
+    #      format raised and left the flag unset so export kept real hardware
+    # ------------------------------------------------------------------
+    cmp, pb = _make_compare()
+    cmp.apply_hardware_overrides({"override_battery_rate_max_discharge_kw": "12.0"}, pb)
+    expected = 12.0 * 1000 / MINUTE_WATT
+    if abs(pb.battery_rate_max_discharge - expected) > 1e-9:
+        print("ERROR T21: numeric-string discharge override should apply as {}, got {}".format(expected, pb.battery_rate_max_discharge))
+        failed += 1
+    elif abs(pb.battery_rate_max_export - expected) > 1e-9:
+        print("ERROR T21: numeric-string discharge override must still carry the export rate with it, export got {}".format(pb.battery_rate_max_export))
+        failed += 1
+    else:
+        print("PASS T21: numeric-string discharge override applies and carries the export rate")
+
+    # ------------------------------------------------------------------
+    # T22: apply_hardware_overrides - a numeric-string export override on
+    #      its own applies without raising
+    # ------------------------------------------------------------------
+    cmp, pb = _make_compare()
+    original_discharge = pb.battery_rate_max_discharge
+    cmp.apply_hardware_overrides({"override_battery_rate_max_export_kw": "7.5"}, pb)
+    expected = 7.5 * 1000 / MINUTE_WATT
+    if abs(pb.battery_rate_max_export - expected) > 1e-9:
+        print("ERROR T22: numeric-string export override should apply as {}, got {}".format(expected, pb.battery_rate_max_export))
+        failed += 1
+    elif pb.battery_rate_max_discharge != original_discharge:
+        print("ERROR T22: discharge rate should be untouched, got {}".format(pb.battery_rate_max_discharge))
+        failed += 1
+    else:
+        print("PASS T22: numeric-string export override applies")
+
+    # ------------------------------------------------------------------
+    # T23: apply_hardware_overrides - non-finite values (nan/inf, which
+    #      float() accepts) are rejected like any other bad value
+    # ------------------------------------------------------------------
+    cmp, pb = _make_compare()
+    original_discharge = pb.battery_rate_max_discharge
+    original_export = pb.battery_rate_max_export
+    cmp.apply_hardware_overrides({"override_battery_rate_max_discharge_kw": "nan", "override_battery_rate_max_export_kw": "inf"}, pb)
+    if pb.battery_rate_max_discharge != original_discharge:
+        print("ERROR T23: nan discharge override should be skipped, got {}".format(pb.battery_rate_max_discharge))
+        failed += 1
+    elif pb.battery_rate_max_export != original_export:
+        print("ERROR T23: inf export override should be skipped, got {}".format(pb.battery_rate_max_export))
+        failed += 1
+    else:
+        print("PASS T23: non-finite override values are skipped")
+
+    if failed:
+        print("**** compare tests FAILED: {} errors ****\n".format(failed))
+    else:
+        print("**** compare tests PASSED ****\n")
+    return failed

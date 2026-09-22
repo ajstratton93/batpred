@@ -1,6 +1,6 @@
 # -----------------------------------------------------------------------------
 # Predbat Home Battery System
-# Copyright Trefor Southwell 2024 - All Rights Reserved
+# Copyright Trefor Southwell 2026 - All Rights Reserved
 # This application maybe used for personal use only and not for commercial use
 # -----------------------------------------------------------------------------
 # fmt off
@@ -10,17 +10,39 @@
 #
 # This code creates a web server and serves up the Predbat web pages
 
+
+"""Built-in web dashboard server.
+
+Provides the PredBat web interface using aiohttp, serving dashboard pages,
+configuration editors, entity browsers, plan visualisations, and REST API
+endpoints. Includes 50+ HTTP routes for monitoring and control.
+"""
+
 from aiohttp import web
 import asyncio
 import os
+import os.path
+import sys
 import re
 from datetime import datetime, timedelta
 import json
 import shutil
 import html as html_module
+import urllib.parse
+import traceback
+import bisect
+import threading
+import io
+from io import StringIO
+import hashlib
+import copy
+from ruamel.yaml import YAML
+from ruamel.yaml.scalarstring import DoubleQuotedScalarString
+
 from web_helper import (
     get_header_html,
     get_plan_css,
+    get_plan_renderer_js,
     get_editor_js,
     get_editor_css,
     get_log_css,
@@ -29,25 +51,288 @@ from web_helper import (
     get_html_config_css,
     get_apps_js,
     get_components_css,
+    get_discovery_css,
+    get_entity_modal_css,
+    get_component_edit_modal_css,
+    get_entity_modal_js,
+    get_component_edit_modal_js,
     get_logfile_js,
     get_entity_toggle_js,
     get_entity_control_css,
     get_entity_css,
     get_entity_js,
+    get_refresh_inverter_js,
     get_restart_button_js,
     get_browse_css,
+    get_entity_detailed_row_js,
+    get_internals_css,
+    get_internals_js,
+    get_dashboard_css,
+    get_dashboard_collapsible_js,
 )
 
-from utils import calc_percent_limit, str2time, dp0, dp2, format_time_ago, get_override_time_from_string, history_attribute, prune_today
-from config import TIME_FORMAT, TIME_FORMAT_DAILY
-from predbat import THIS_VERSION
-import urllib.parse
+from utils import (
+    calc_percent_limit,
+    str2time,
+    dp0,
+    dp2,
+    dp4,
+    format_time_ago,
+    get_override_time_from_string,
+    history_attribute,
+    prune_today,
+    mask_secret_args,
+    mask_secret_yaml_text,
+    read_predbat_log,
+    classify_log_line,
+    log_line_included,
+    predbat_log_file_prev,
+    is_secret_key,
+)
+from utils import is_data_numerical, ROOT_YAML_KEY, SECRET_MASK, YAML_DUMP_WIDTH, parse_yaml_path, update_nested_yaml_value  # noqa: F401 - re-exported: moved to utils.py, agent_tools.py/chat_tools.py must not import from web.py
+from const import TIME_FORMAT, TIME_FORMAT_DAILY, TIME_FORMAT_HA, MANUAL_RATE_MAX_MINUTES, MANUAL_TIME_MAX_MINUTES
+from predbat import THIS_VERSION_DISPLAY
 from component_base import ComponentBase
+from config import APPS_SCHEMA
+import debug_history
+from web_annual import AnnualPage
+from web_chat import WebChat
+from web_metrics_dashboard import get_metrics_dashboard_css, get_metrics_dashboard_body
+from predbat_metrics import metrics_handler, metrics_json_handler, metrics, PROMETHEUS_AVAILABLE
+from marginal import MARGINAL_EXTRA_KWH_LEVEL_NAMES, MARGINAL_EXTRA_KWH_LEVELS, MARGINAL_TIME_OFFSETS
 
-ROOT_YAML_KEY = "pred_bat"
+# How many of the newest debug-history snapshots the dashboard's one-click archive bundles.
+# debug_history_count reaches 500 since #5070 and the archive is built in memory, so this is the
+# point where a single download stops being practical - not a limit on what is retained on disk.
+DEBUG_HISTORY_DOWNLOAD_MAX = 16
+
+
+def state_as_of_slots(records, slots):
+    """
+    Resolve each slot to the state in effect at it - the most recent record at or before the slot.
+
+    records must be a list of (timestamp, value) ordered oldest first. Returns
+    {slot: (value, changed, prev_value)} where value is "-" for slots preceding the first record and
+    changed marks a slot whose value differs from the one shown at the previous slot.
+    """
+    filled = {}
+    last_value = None
+    previous = None
+    index = 0
+
+    for slot in sorted(slots):
+        while index < len(records) and records[index][0] <= slot:
+            last_value = records[index][1]
+            index += 1
+        value = last_value if last_value is not None else "-"
+        filled[slot] = (value, value != "-" and value != previous, previous)
+        previous = value
+
+    return filled
+
+
+def build_entity_history_table_data(entity_selections, entity_data_fetch):
+    """
+    Resolve the /entity history table's 30-minute rows and their 5-minute detail slots.
+
+    entity_selections: list of {"entity_id": ..., "attribute": ...} (attribute may be None for state)
+    entity_data_fetch: dict of entity_id -> history as returned by get_history_with_now(), i.e. [[record, ...]]
+
+    Every slot reports the state as of its own timestamp. Summarising a window by the last sample
+    taken inside it instead let a momentary blip stand for the whole window - one stray "Lost"
+    record at 21:57 made the entire 21:30 row read "Lost" - and that value then carried forward
+    into every later slot that had no sample of its own, turning a blip into hours of downtime.
+
+    Returns (entity_filled_30min, entity_filled_5min, sorted_timestamps_30min, all_display_slots_5min):
+      entity_filled_30min / entity_filled_5min: one dict per selection, {slot: (value, changed, prev_value)}
+      sorted_timestamps_30min: the 30-min row timestamps, newest first
+      all_display_slots_5min: the 5-min slots covering each 30-min row's own window (offsets 0 to +25)
+    """
+    entity_records = []
+    all_timestamps_30min = set()
+
+    for selection in entity_selections:
+        entity_id = selection["entity_id"]
+        attribute = selection["attribute"]
+        history = entity_data_fetch[entity_id]
+        records = []
+
+        if history and len(history) >= 1:
+            history = history[0]
+            if history:
+                for item in history:
+                    if "last_updated" not in item:
+                        continue
+                    try:
+                        last_updated_stamp = str2time(item["last_updated"])
+                    except (ValueError, TypeError):
+                        continue
+
+                    # Get state or attribute value
+                    if attribute:
+                        state = item.get("attributes", {}).get(attribute, None)
+                    else:
+                        state = item.get("state", None)
+
+                    if state is None:
+                        state = "None"
+
+                    records.append((last_updated_stamp, state))
+
+                    # A record makes the window it landed in a row, so activity is always on screen
+                    minutes = last_updated_stamp.hour * 60 + last_updated_stamp.minute
+                    rounded_minutes_30 = (minutes // 30) * 30
+                    all_timestamps_30min.add(last_updated_stamp.replace(minute=rounded_minutes_30 % 60, hour=rounded_minutes_30 // 60, second=0, microsecond=0))
+
+        # str2time is only reliable for ordering once parsed - the raw strings mix UTC history with
+        # the local-time "now" record get_history_with_now() appends
+        records.sort(key=lambda record: record[0])
+        entity_records.append(records)
+
+    # Sort timestamps in reverse chronological order
+    sorted_timestamps_30min = sorted(all_timestamps_30min, reverse=True)
+
+    # Detail slots are the 5-min marks INSIDE each row's own half hour, so expanding a row explains
+    # that row rather than describing the preceding half hour
+    all_display_slots_5min = set()
+    for ts_30 in sorted_timestamps_30min:
+        for offset in range(0, 30, 5):
+            all_display_slots_5min.add(ts_30 + timedelta(minutes=offset))
+
+    entity_filled_30min = []
+    entity_filled_5min = []
+    for records in entity_records:
+        entity_filled_30min.append(state_as_of_slots(records, sorted_timestamps_30min))
+        entity_filled_5min.append(state_as_of_slots(records, all_display_slots_5min))
+
+    return entity_filled_30min, entity_filled_5min, sorted_timestamps_30min, all_display_slots_5min
+
+
+def split_entities_for_charting(entities, entity_data_fetch):
+    """
+    Fetch each entity's history and split a unit group into numeric vs non-numeric entries.
+
+    Deciding numeric-vs-timeline per entity (rather than once for the whole group, from
+    whichever entity happened to be processed last) means a numeric entity doesn't end up
+    silently rendered as a broken timeline chart just because another entity sharing the same
+    unit group is non-numerical.
+
+    entities: list of {"id": entity_id, "friendly_name": ..., "attribute": ...}
+    entity_data_fetch: dict of entity_id -> history as returned by get_history_with_now()
+
+    Returns (numeric_entries, timeline_entries), each a list of
+    {"name": display_name, "friendly_name": ..., "entity_id": ..., "data": history_chart}.
+    """
+    numeric_entries = []
+    timeline_entries = []
+
+    for entity_info in entities:
+        entity_id = entity_info["id"]
+        friendly_name = entity_info["friendly_name"]
+        attribute = entity_info.get("attribute")
+
+        history = entity_data_fetch.get(entity_id)
+        is_numerical = is_data_numerical(history, attribute=attribute)
+
+        if attribute:
+            history_chart = history_attribute(history, state_key=attribute, attributes=True, is_numerical=is_numerical)
+            display_name = f"{friendly_name} ({attribute})"
+        else:
+            history_chart = history_attribute(history, is_numerical=is_numerical)
+            display_name = friendly_name
+
+        if not history_chart:
+            continue
+
+        entry = {"name": display_name, "friendly_name": friendly_name, "entity_id": entity_id, "data": history_chart}
+        (numeric_entries if is_numerical else timeline_entries).append(entry)
+
+    return numeric_entries, timeline_entries
+
+
+def resolve_group_unit_and_name(entity_id, dashboard_values, live_unit=None, live_friendly_name=None):
+    """
+    Resolve the unit_of_measurement/friendly_name to group and label an entity by for the
+    /entity charts.
+
+    Prefers Predbat's own dashboard_values cache, falling back to a caller-supplied live HA
+    lookup (mirroring html_get_entity_text's fallback) for entities Predbat doesn't track
+    itself - e.g. inverter control entities that are selectable on this page but were never
+    published via dashboard_item(), which otherwise silently grouped every such entity into
+    "(no unit)" regardless of their real HA unit.
+
+    live_unit/live_friendly_name should only be looked up by the caller when entity_id isn't
+    in dashboard_values, since that's the only case they're used.
+    """
+    attributes = dashboard_values.get(entity_id, {}).get("attributes", {})
+    if entity_id in dashboard_values:
+        unit = attributes.get("unit_of_measurement") or ""
+        friendly_name = attributes.get("friendly_name") or ""
+    else:
+        unit = live_unit or ""
+        friendly_name = live_friendly_name or ""
+    return unit or "(no unit)", friendly_name or entity_id
+
+
+def subtract_series(base, subtract, max_gap_seconds=300):
+    """Subtract one time series from another, matching on nearest time rather than on exact timestamp.
+
+    The two series come from different entities, which Home Assistant records independently - their
+    samples land a moment apart and prune_today() keys each result on its own source timestamp, so a
+    dict lookup by key misses essentially every time and silently subtracts nothing, leaving two
+    identical lines on the chart.
+
+    Nearest rather than most-recent-at-or-before: both are published in the same cycle, so the skew
+    between them is jitter rather than a real time difference, and it falls either way. Taking only
+    the earlier sample would pair a load reading with a car value from the previous cycle whenever the
+    jitter went the wrong way - visible the moment the car stops, where a stale reading would wipe out
+    the whole house figure for one point.
+
+    Clamped at zero: the two sensors run on their own cadences, so one can momentarily exceed the
+    other, and that has to read as nothing left rather than as negative power.
+
+    Matching is bounded by max_gap_seconds, one publish cycle. Beyond that the nearest sample is not
+    evidence of anything - a car sensor that stopped reporting hours ago would otherwise keep being
+    subtracted from every later point, wiping out the house figure for as long as it stayed away.
+
+    Args:
+    - base: {timestamp: value} to subtract from
+    - subtract: {timestamp: value} to subtract, may be empty
+    - max_gap_seconds: how far a sample may be from a base point and still count
+
+    Returns:
+    - dict: same keys as base, or empty when there is nothing to subtract
+    """
+    if not base or not subtract:
+        return {}
+    points = sorted((str2time(stamp), value) for stamp, value in subtract.items())
+    times = [point[0] for point in points]
+    result = {}
+    for stamp, value in base.items():
+        when = str2time(stamp)
+        index = bisect.bisect_left(times, when)
+        candidates = []
+        if index < len(points):
+            candidates.append(points[index])
+        if index > 0:
+            candidates.append(points[index - 1])
+        other = 0
+        if candidates:
+            nearest = min(candidates, key=lambda point: abs((point[0] - when).total_seconds()))
+            if abs((nearest[0] - when).total_seconds()) <= max_gap_seconds:
+                other = nearest[1]
+        result[stamp] = dp4(max(value - other, 0))
+    return result
 
 
 class WebInterface(ComponentBase):
+    """Built-in web dashboard server using aiohttp.
+
+    Serves the PredBat dashboard with 50+ HTTP routes for monitoring,
+    configuration, entity browsing, plan visualisation, and REST API
+    endpoints. Supports plugin endpoint registration.
+    """
+
     def initialize(self, web_port):
         self.default_page = "./dash"
         self.web_port = web_port
@@ -55,6 +340,9 @@ class WebInterface(ComponentBase):
 
         # Plugin registration system
         self.registered_endpoints = []
+
+        self.annual_page = AnnualPage(self)
+        self.chat_page = WebChat(self)
 
     def register_endpoint(self, path, handler, method="GET"):
         """
@@ -80,6 +368,142 @@ class WebInterface(ComponentBase):
                 results[key] = hist1[key]
         return results
 
+    def history_daily_at_hour(self, history_raw, hour_limit=3):
+        """
+        For each calendar day (local time), return the last recorded entity state
+        whose local hour falls in [0, hour_limit).  This captures the result of
+        the overnight compare run (which completes around 1am) without being
+        influenced by any later manual re-runs during the day.
+        Returns {YYYY-MM-DD: float} with values in the raw unit of the entity state.
+        """
+        results = {}
+        if not isinstance(history_raw, list) or not history_raw:
+            return results
+        history = history_raw[0] if isinstance(history_raw[0], list) else history_raw
+        for item in history:
+            last_updated = item.get("last_updated")
+            state = item.get("state")
+            if not last_updated or state in (None, "unavailable", "unknown"):
+                continue
+            try:
+                state = float(state)
+            except (ValueError, TypeError):
+                continue
+            try:
+                ts = str2time(last_updated).astimezone()
+            except (ValueError, TypeError):
+                continue
+            if ts.hour >= hour_limit:
+                continue
+            day_str = ts.strftime(TIME_FORMAT_DAILY)
+            # Keep the latest record within the overnight window for this day
+            results[day_str] = state
+        return results
+
+    def average_cost_window(self, daily_pence, days):
+        """
+        Return the mean daily cost (in pence) and the number of days with data
+        over the last `days` calendar days, excluding today.
+        Returns (None, 0) when there are no data points in the window.
+        """
+        today = self.now_utc.astimezone().date()
+        total = 0.0
+        count = 0
+        for d in range(1, days + 1):
+            day_str = (today - timedelta(days=d)).strftime(TIME_FORMAT_DAILY)
+            if day_str in daily_pence:
+                total += daily_pence[day_str]
+                count += 1
+        return ((total / count), count) if count else (None, 0)
+
+    def rolling_7d_average(self, daily_pence):
+        """
+        For every date that has a data point, compute the 7-day trailing average
+        (the mean of that day and up to 6 preceding days that have data).
+        Returns {YYYY-MM-DD: float} in the same unit as daily_pence (pence),
+        only for days where at least one data point exists in the window.
+        """
+        if not daily_pence:
+            return {}
+        from datetime import date as date_cls
+
+        # Sort dates so we can iterate chronologically
+        sorted_days = sorted(daily_pence.keys())
+        results = {}
+        for day_str in sorted_days:
+            try:
+                anchor = date_cls.fromisoformat(day_str)
+            except (ValueError, TypeError):
+                continue
+            total = 0.0
+            count = 0
+            for d in range(7):
+                candidate = (anchor - timedelta(days=d)).strftime(TIME_FORMAT_DAILY)
+                if candidate in daily_pence:
+                    total += daily_pence[candidate]
+                    count += 1
+            if count:
+                results[day_str] = dp2(total / count)
+        return results
+
+    def _register_annual_routes(self, app):
+        """Register the Annual tab's routes on ``app``.
+
+        Split out from start() so a test can register these onto a bare aiohttp
+        Application and assert they exist, without booting a real TCP listener -
+        the constructor for that Application performs no network I/O of its own.
+        """
+        app.router.add_get("/annual", self.annual_page.html_annual)
+        app.router.add_post("/annual", self.annual_page.html_annual_post)
+        app.router.add_post("/annual_reset", self.annual_page.html_annual_reset)
+        app.router.add_post("/annual_array", self.annual_page.html_annual_array)
+        app.router.add_post("/annual_delete", self.annual_page.html_annual_delete)
+        app.router.add_get("/annual_cost_preview", self.annual_page.html_annual_cost_preview)
+        app.router.add_post("/annual_run", self.annual_page.html_annual_run)
+        app.router.add_get("/annual_status", self.annual_page.html_annual_status)
+        app.router.add_post("/annual_cancel", self.annual_page.html_annual_cancel)
+        app.router.add_get("/annual_download", self.annual_page.html_annual_download)
+        app.router.add_get("/annual_plan", self.annual_page.html_annual_plan)
+        app.router.add_get("/annual_view", self.annual_page.html_annual_view)
+        app.router.add_get("/annual_compare", self.annual_page.html_annual_compare)
+
+    def chat_enabled(self):
+        """Return whether the chat component is configured and running."""
+        components = getattr(self.base, "components", None)
+        return bool(components and components.get_component("chat"))
+
+    def _register_chat_routes(self, app):
+        """Register the Chat tab's routes on ``app``, unconditionally.
+
+        Split out of start() the same way the annual routes are, so a test can assert the routes
+        exist against a bare aiohttp Application without opening a socket.
+
+        These must be registered regardless of whether chat is configured yet: phase 0 (which
+        builds this Application and starts the site) runs before phase 1 (which initialises the
+        chat component), so gating on chat_enabled() here would freeze the router with the routes
+        permanently absent. Each handler already checks self.agent and returns 404 "Chat is not
+        configured" when the component is not up yet - that per-request check is what stands in
+        for a boot-time gate.
+        """
+        app.router.add_get("/chat", self.chat_page.html_chat)
+        app.router.add_get("/chat/conversations", self.chat_page.html_chat_conversations)
+        app.router.add_post("/chat/conversations", self.chat_page.html_chat_create)
+        app.router.add_post("/chat/rename", self.chat_page.html_chat_rename)
+        app.router.add_post("/chat/delete", self.chat_page.html_chat_delete)
+        app.router.add_get("/chat/history", self.chat_page.html_chat_history)
+        app.router.add_post("/chat/send", self.chat_page.html_chat_send)
+        app.router.add_get("/chat/stream", self.chat_page.html_chat_stream)
+        app.router.add_post("/chat/confirm", self.chat_page.html_chat_confirm)
+        app.router.add_post("/chat/cancel", self.chat_page.html_chat_cancel)
+        app.router.add_get("/chat/models", self.chat_page.html_chat_models)
+        app.router.add_post("/chat/model", self.chat_page.html_chat_model)
+        app.router.add_get("/chat/status", self.chat_page.html_chat_status)
+        app.router.add_post("/chat/status", self.chat_page.html_chat_status_post)
+        app.router.add_get("/chat/providers", self.chat_page.html_chat_providers)
+        app.router.add_post("/chat/providers", self.chat_page.html_chat_providers_post)
+        app.router.add_post("/chat/providers/models", self.chat_page.html_chat_provider_models)
+        app.router.add_post("/chat/provider", self.chat_page.html_chat_provider_select)
+
     async def start(self):
         # Start the web server
         app = web.Application()
@@ -95,27 +519,50 @@ class WebInterface(ComponentBase):
         app.router.add_post("/config", self.html_config_post)
         app.router.add_get("/dash", self.html_dash)
         app.router.add_post("/dash", self.html_dash_post)
+        app.router.add_get("/dash_content", self.html_dash_content)
         app.router.add_get("/components", self.html_components)
+        app.router.add_get("/discovery", self.html_discovery)
+        app.router.add_get("/component_entities", self.html_component_entities)
         app.router.add_post("/component_restart", self.html_component_restart)
+        app.router.add_get("/component_config", self.html_component_config)
+        app.router.add_post("/component_config_save", self.html_component_config_save)
         app.router.add_get("/debug_yaml", self.html_debug_yaml)
         app.router.add_get("/debug_log", self.html_debug_log)
         app.router.add_get("/debug_apps", self.html_debug_apps)
+        app.router.add_get("/debug_apps_live", self.html_debug_apps_live)
         app.router.add_get("/debug_plan", self.html_debug_plan)
+        app.router.add_get("/debug_history_list", self.html_debug_history_list)
+        app.router.add_get("/debug_history_download", self.html_debug_history_download)
+        app.router.add_get("/debug_history_download_recent", self.html_debug_history_download_recent)
         app.router.add_get("/compare", self.html_compare)
         app.router.add_post("/compare", self.html_compare_post)
+        self._register_annual_routes(app)
+        self._register_chat_routes(app)
         app.router.add_get("/apps_editor", self.html_apps_editor)
         app.router.add_post("/apps_editor", self.html_apps_editor_post)
+        app.router.add_get("/apps_editor_checksum", self.html_apps_editor_checksum)
         app.router.add_post("/plan_override", self.html_plan_override)
         app.router.add_post("/rate_override", self.html_rate_override)
         app.router.add_post("/restart", self.html_restart)
+        app.router.add_post("/inverter_refresh", self.html_inverter_refresh)
         app.router.add_get("/api/state", self.html_api_get_state)
         app.router.add_get("/api/ping", self.html_api_ping)
         app.router.add_post("/api/state", self.html_api_post_state)
         app.router.add_post("/api/service", self.html_api_post_service)
+        app.router.add_get("/api/plan_data", self.html_api_plan_data)
         app.router.add_get("/api/log", self.html_api_get_log)
         app.router.add_get("/api/entities", self.html_api_get_entities)
         app.router.add_post("/api/login", self.html_api_login)
         app.router.add_get("/browse", self.html_browse)
+        app.router.add_get("/download", self.html_download_file)
+        app.router.add_get("/images/{filename}", self.html_logo_image)
+        app.router.add_get("/internals", self.html_internals)
+        app.router.add_get("/api/internals", self.html_api_internals)
+        app.router.add_get("/api/internals/download", self.html_api_internals_download)
+        app.router.add_get("/api/status", self.html_api_get_status)
+        app.router.add_get("/metrics", metrics_handler)
+        app.router.add_get("/metrics/json", metrics_json_handler)
+        app.router.add_get("/metrics_dashboard", self.html_metrics_dashboard)
 
         # Notify plugin system that web interface is ready
         if hasattr(self.base, "plugin_system") and self.base.plugin_system:
@@ -143,6 +590,12 @@ class WebInterface(ComponentBase):
             if count % 60 == 0:
                 self.update_success_timestamp()
             count += 1
+
+        # Otherwise a restart mid-run leaves the annual engine's child process
+        # orphaned - burning a CPU core for up to several minutes with nothing left
+        # tracking it - while the fresh AnnualPage created on the next start() reports
+        # idle and would happily let a second run be started alongside it.
+        await self.annual_page.job.cancel()
         await runner.cleanup()
 
         self.api_started = False
@@ -169,9 +622,15 @@ class WebInterface(ComponentBase):
             if key in ["icon", "device_class", "state_class", "unit_of_measurement", "friendly_name"]:
                 continue
             value = attributes[key]
-            if len(str(value)) > 1024:
-                value = "(large data)"
-            text += "<tr><td>{}</td><td>{}</td></tr>".format(key, value)
+            full_value = str(value)[:16384]  # Limit to 16k
+            full_value = full_value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;")
+            if len(str(value)) > 128:
+                display_value = str(full_value)[:128] + " ... "
+                # Escape HTML entities for tooltip
+                text += '<tr><td>{}</td><td title="{}">{}</td></tr>'.format(key, full_value, display_value)
+            else:
+                # Also escape HTML entities for short values
+                text += "<tr><td>{}</td><td>{}</td></tr>".format(key, full_value)
         text += "</table>"
         return text
 
@@ -179,6 +638,24 @@ class WebInterface(ComponentBase):
         if icon:
             icon = '<span class="mdi mdi-{}"></span>'.format(icon.replace("mdi:", ""))
         return icon
+
+    def get_battery_icon(self, soc_percent, charging):
+        """
+        Pick the Material Design Icon showing how full the battery is and whether it is charging
+
+        The charging variants carry the same three levels plus a bolt, so the level survives in
+        both directions. battery-plus and battery-minus exist but have no level in them, so they
+        would trade the state of charge away for the sign.
+        """
+        if soc_percent < 30:
+            level = 0
+        elif soc_percent < 70:
+            level = 1
+        else:
+            level = 2
+        if charging:
+            return ["&#xF12A4;", "&#xF12A5;", "&#xF12A6;"][level]  # battery-charging low/medium/high
+        return ["&#xF12A1;", "&#xF12A2;", "&#xF12A3;"][level]  # battery low/medium/high
 
     def get_power_flow_diagram(self):
         """
@@ -199,14 +676,30 @@ class WebInterface(ComponentBase):
         pv_power = self.base.pv_power
         load_power = self.base.load_power
 
-        # Determine flow directions
-        grid_importing = grid_power <= -10  # Grid is importing power (negative value)
-        grid_exporting = grid_power >= 10  # Grid is exporting power (positive value)
+        # Car charging only appears when a car_charging_power sensor is configured (execute.py
+        # update_car_charging_power). Where the charger sits relative to the house CT clamp is what
+        # car_energy_reported_load records. With it on the charger is behind the clamp and its power
+        # is already inside load_power, so subtract it and the House circle reads as the rest of the
+        # house rather than counting the car twice. Clamped at zero because the two readings come
+        # from different meters and a slow-updating load sensor can briefly read below the car.
+        # With it off the charger is outside the clamp and was never in load_power, so subtracting
+        # would take the car off a figure that never held it and the clamp would then swallow the
+        # whole house load - leave the reading alone and feed the car from the Grid instead (#4788).
+        car_configured = self.base.car_charging_power_configured
+        car_power = self.base.car_charging_power
+        car_inside_clamp = self.base.car_energy_reported_load
+        house_power = max(0, load_power - car_power) if (car_configured and car_inside_clamp) else load_power
 
-        battery_charging = battery_power >= 10  # Battery is charging (positive value)
-        battery_discharging = battery_power <= -10  # Battery is discharging (negative value)
+        # Determine flow directions. battery_power is positive when the battery is DISCHARGING
+        # (gateway.py negates the firmware's sign for exactly this reason) and grid_power is
+        # negative when importing, so the reading and the arrow run opposite ways round.
+        grid_importing = grid_power <= -10  # Grid is importing power (negative value)
+
+        battery_to_house = battery_power >= 10  # Battery is discharging into the house
+        battery_charging = battery_power <= -10  # Power is flowing into the battery
 
         pv_generating = pv_power > 0  # PV is generating power
+        battery_icon = self.get_battery_icon(self.base.soc_percent, battery_charging)
         html = ""
 
         html += """
@@ -214,40 +707,106 @@ class WebInterface(ComponentBase):
             <svg width="600" height="400" viewBox="0 0 600 400" xmlns="http://www.w3.org/2000/svg">
 
                 <!-- Grid Circle -->
-                <circle cx="450" cy="300" r="50" fill="#4CAF50" />
-                <text x="450" y="300" text-anchor="middle" dy=".3em" fill="#fff">Grid</text>
+                <circle cx="450" cy="300" r="50" fill="#757575"><title>Grid</title></circle>
+                <text x="450" y="300" text-anchor="middle" dy=".35em" font-family="Material Design Icons" font-size="44" fill="#fff">&#xF0D3E;</text>
 
                 <!-- Battery Circle -->
-                <circle cx="150" cy="300" r="50" fill="#FF9800" />
-                <text x="150" y="300" text-anchor="middle" dy=".3em" fill="#fff">Battery</text>
+                <circle cx="150" cy="300" r="50" fill="#43A047"><title>Battery</title></circle>
+                <text x="150" y="300" text-anchor="middle" dy=".35em" font-family="Material Design Icons" font-size="44" fill="#fff">{}</text>
 
                 <!-- PV Circle -->
-                <circle cx="150" cy="100" r="50" fill="#2196F3" />
-                <text x="150" y="100" text-anchor="middle" dy=".3em" fill="#fff">PV</text>
+                <circle cx="150" cy="100" r="50" fill="#FDD835"><title>PV</title></circle>
+                <text x="150" y="100" text-anchor="middle" dy=".35em" font-family="Material Design Icons" font-size="44" fill="#fff">&#xF0D9B;</text>
 
                 <!-- House Circle -->
-                <circle cx="300" cy="200" r="50" fill="#9C27B0" />
-                <text x="300" y="190" text-anchor="middle" dy=".3em" fill="#fff">House</text>
+                <circle cx="300" cy="200" r="50" fill="#6D4C41"><title>House</title></circle>
+                <text x="300" y="186" text-anchor="middle" dy=".35em" font-family="Material Design Icons" font-size="34" fill="#fff">&#xF02DC;</text>
                 <text x="300" y="215" text-anchor="middle" dy=".3em" fill="#fff">{} W</text>
 
                 <!-- Define animation paths -->
                 <defs>
                     <!-- PV to House path -->
-                    <path id="pv-house-path" d="M200,100 L250,150" stroke="transparent" fill="none" />
+                    <path id="pv-house-path" d="M192,128 L241,161" stroke="transparent" fill="none" />
                     <!-- House to PV path -->
-                    <path id="house-pv-path" d="M250,150 L200,100" stroke="transparent" fill="none" />
+                    <path id="house-pv-path" d="M241,161 L192,128" stroke="transparent" fill="none" />
                     <!-- Battery to House path -->
-                    <path id="battery-house-path" d="M200,300 L250,250" stroke="transparent" fill="none" />
+                    <path id="battery-house-path" d="M192,272 L241,239" stroke="transparent" fill="none" />
                     <!-- House to Battery path -->
-                    <path id="house-battery-path" d="M265,235 L215,275" stroke="transparent" fill="none" />
+                    <path id="house-battery-path" d="M258,228 L209,261" stroke="transparent" fill="none" />
                     <!-- Grid to House path -->
-                    <path id="grid-house-path" d="M410,290 L355,240" stroke="transparent" fill="none" />
+                    <path id="grid-house-path" d="M408,272 L359,239" stroke="transparent" fill="none" />
                     <!-- House to Grid path -->
-                    <path id="house-grid-path" d="M340,230 L390,270" stroke="transparent" fill="none" />
+                    <path id="house-grid-path" d="M342,228 L391,261" stroke="transparent" fill="none" />
                 </defs>
         """.format(
-            dp0(load_power)
+            battery_icon, dp0(house_power)
         )
+
+        # Car charging arm - drawn top right, the corner left free by PV/battery/grid. It runs from
+        # whichever node is actually feeding the charger: the House when the charger is behind the
+        # CT clamp, otherwise the Grid, since the incoming supply is then the only thing left that
+        # can be feeding it. Both run circle edge to circle edge, stopping short of the Car by the
+        # length of the arrowhead the marker draws past the end of the line.
+        if car_configured:
+            car_charging = car_power >= 10
+            if car_inside_clamp:
+                car_source = "House"
+                car_line = 'x1="342" y1="172" x2="391" y2="139"'
+                car_path = "M342,172 L391,139"
+                car_label = 'x="356" y="122"'
+            else:
+                car_source = "Grid"
+                car_line = 'x1="450" y1="250" x2="450" y2="170"'
+                car_path = "M450,250 L450,170"
+                car_label = 'x="485" y="205"'
+
+            html += """
+                <!-- Car Circle -->
+                <circle cx="450" cy="100" r="50" fill="#E53935"><title>Car</title></circle>
+                <text x="450" y="100" text-anchor="middle" dy=".35em" font-family="Material Design Icons" font-size="44" fill="#fff">&#xF010B;</text>
+
+                <defs>
+                    <!-- {source} to Car path -->
+                    <path id="{source_id}-car-path" d="{path}" stroke="transparent" fill="none" />
+                    <marker id="car-arrow" markerWidth="10" markerHeight="7" refX="0" refY="3.5" orient="auto">
+                    <polygon points="0 0, 10 3.5, 0 7" fill="#E53935"/>
+                    </marker>
+                </defs>
+            """.format(
+                source=car_source, source_id=car_source.lower(), path=car_path
+            )
+            if car_charging:
+                # Calculate animation speed based on power flow - faster for higher power
+                car_speed = max(0.5, min(3.0, 2.0 - (abs(car_power) / 3000)))
+
+                html += """
+                <!-- {source} to Car Arrow -->
+                <line {line} stroke="#E53935" stroke-width="2" marker-end="url(#car-arrow)" />
+                <text {label} text-anchor="middle" fill="#E53935">{power} W</text>
+
+                <!-- Moving dots for {source} to Car -->
+                <circle r="4" fill="#E53935" opacity="0.8">
+                    <animateMotion dur="{speed}s" repeatCount="indefinite" path="{path}" />
+                </circle>
+                <circle r="3" fill="#E53935" opacity="0.6">
+                    <animateMotion dur="{speed}s" repeatCount="indefinite" begin="0.5s" path="{path}" />
+                </circle>
+                <circle r="2" fill="#E53935" opacity="0.4">
+                    <animateMotion dur="{speed}s" repeatCount="indefinite" begin="1.0s" path="{path}" />
+                </circle>
+                """.format(
+                    source=car_source, line=car_line, label=car_label, power=dp0(car_power), speed=car_speed, path=car_path
+                )
+            else:
+                html += """
+                <!-- {source} to Car Arrow (dashed) -->
+                <line {line} stroke="#E53935" stroke-width="2" stroke-dasharray="5,5" marker-end="url(#car-arrow)" />
+                <text {label} text-anchor="middle" fill="#E53935">{power} W</text>
+                <!-- No moving dot when the car is not charging -->
+                """.format(
+                    source=car_source, line=car_line, label=car_label, power=dp0(car_power)
+                )
+
         # Draw arrows and labels
         if pv_generating:
             # Calculate animation speed based on power flow - faster for higher power
@@ -255,18 +814,18 @@ class WebInterface(ComponentBase):
 
             html += """
                 <!-- PV to House Arrow -->
-                <line x1="200" y1="100" x2="250" y2="150" stroke="#2196F3" stroke-width="2" marker-end="url(#pv-arrow)" />
-                <text x="250" y="120" text-anchor="middle" fill="#2196F3">{} W</text>
+                <line x1="192" y1="128" x2="241" y2="161" stroke="#F9A825" stroke-width="2" marker-end="url(#pv-arrow)" />
+                <text x="244" y="122" text-anchor="middle" fill="#F9A825">{} W</text>
 
                 <!-- Moving dots for PV to House -->
-                <circle r="4" fill="#2196F3" opacity="0.8">
-                    <animateMotion dur="{}s" repeatCount="indefinite" path="M200,100 L250,150" />
+                <circle r="4" fill="#F9A825" opacity="0.8">
+                    <animateMotion dur="{}s" repeatCount="indefinite" path="M192,128 L241,161" />
                 </circle>
-                <circle r="3" fill="#2196F3" opacity="0.6">
-                    <animateMotion dur="{}s" repeatCount="indefinite" begin="0.5s" path="M200,100 L250,150" />
+                <circle r="3" fill="#F9A825" opacity="0.6">
+                    <animateMotion dur="{}s" repeatCount="indefinite" begin="0.5s" path="M192,128 L241,161" />
                 </circle>
-                <circle r="2" fill="#2196F3" opacity="0.4">
-                    <animateMotion dur="{}s" repeatCount="indefinite" begin="1.0s" path="M200,100 L250,150" />
+                <circle r="2" fill="#F9A825" opacity="0.4">
+                    <animateMotion dur="{}s" repeatCount="indefinite" begin="1.0s" path="M192,128 L241,161" />
                 </circle>
             """.format(
                 dp0(pv_power), pv_speed, pv_speed, pv_speed
@@ -275,30 +834,30 @@ class WebInterface(ComponentBase):
             # Make the PV to House line dashed if not generating
             html += """
                 <!-- PV to House Arrow (dashed) -->
-                <line x1="200" y1="100" x2="250" y2="150" stroke="#2196F3" stroke-width="2" stroke-dasharray="5,5" marker-end="url(#pv-arrow)" />
-                <text x="250" y="120" text-anchor="middle" fill="#2196F3">{} W</text>
+                <line x1="192" y1="128" x2="241" y2="161" stroke="#F9A825" stroke-width="2" stroke-dasharray="5,5" marker-end="url(#pv-arrow)" />
+                <text x="244" y="122" text-anchor="middle" fill="#F9A825">{} W</text>
                 <!-- No moving dot when PV is not generating -->
             """.format(
                 dp0(pv_power)
             )
-        if battery_charging:
+        if battery_to_house:
             # Calculate animation speed based on power flow - faster for higher power
             battery_speed = max(0.5, min(3.0, 2.0 - (abs(battery_power) / 3000)))
 
             html += """
                 <!-- Battery to House Arrow -->
-                <line x1="200" y1="300" x2="250" y2="250" stroke="#FF9800" stroke-width="2" marker-end="url(#battery-arrow)" />
-                <text x="260" y="280" text-anchor="middle" fill="#FF9800">{} W</text>
+                <line x1="192" y1="272" x2="241" y2="239" stroke="#43A047" stroke-width="2" marker-end="url(#battery-arrow)" />
+                <text x="244" y="278" text-anchor="middle" fill="#43A047">{} W</text>
 
                 <!-- Moving dots for Battery to House -->
-                <circle r="4" fill="#FF9800" opacity="0.8">
-                    <animateMotion dur="{}s" repeatCount="indefinite" path="M200,300 L250,250" />
+                <circle r="4" fill="#43A047" opacity="0.8">
+                    <animateMotion dur="{}s" repeatCount="indefinite" path="M192,272 L241,239" />
                 </circle>
-                <circle r="3" fill="#FF9800" opacity="0.6">
-                    <animateMotion dur="{}s" repeatCount="indefinite" begin="0.5s" path="M200,300 L250,250" />
+                <circle r="3" fill="#43A047" opacity="0.6">
+                    <animateMotion dur="{}s" repeatCount="indefinite" begin="0.5s" path="M192,272 L241,239" />
                 </circle>
-                <circle r="2" fill="#FF9800" opacity="0.4">
-                    <animateMotion dur="{}s" repeatCount="indefinite" begin="1.0s" path="M200,300 L250,250" />
+                <circle r="2" fill="#43A047" opacity="0.4">
+                    <animateMotion dur="{}s" repeatCount="indefinite" begin="1.0s" path="M192,272 L241,239" />
                 </circle>
             """.format(
                 dp0(battery_power), battery_speed, battery_speed, battery_speed
@@ -309,18 +868,18 @@ class WebInterface(ComponentBase):
 
             html += """
                 <!-- House to Battery Arrow -->
-                <line x1="265" y1="235" x2="215" y2="275" stroke="#FF9800" stroke-width="2" marker-end="url(#battery-arrow)" />
-                <text x="260" y="280" text-anchor="middle" fill="#FF9800">{} W</text>
+                <line x1="258" y1="228" x2="209" y2="261" stroke="#43A047" stroke-width="2" marker-end="url(#battery-arrow)" />
+                <text x="244" y="278" text-anchor="middle" fill="#43A047">{} W</text>
 
                 <!-- Moving dots for House to Battery -->
-                <circle r="4" fill="#FF9800" opacity="0.8">
-                    <animateMotion dur="{}s" repeatCount="indefinite" path="M265,235 L215,275" />
+                <circle r="4" fill="#43A047" opacity="0.8">
+                    <animateMotion dur="{}s" repeatCount="indefinite" path="M258,228 L209,261" />
                 </circle>
-                <circle r="3" fill="#FF9800" opacity="0.6">
-                    <animateMotion dur="{}s" repeatCount="indefinite" begin="0.5s" path="M265,235 L215,275" />
+                <circle r="3" fill="#43A047" opacity="0.6">
+                    <animateMotion dur="{}s" repeatCount="indefinite" begin="0.5s" path="M258,228 L209,261" />
                 </circle>
-                <circle r="2" fill="#FF9800" opacity="0.4">
-                    <animateMotion dur="{}s" repeatCount="indefinite" begin="1.0s" path="M265,235 L215,275" />
+                <circle r="2" fill="#43A047" opacity="0.4">
+                    <animateMotion dur="{}s" repeatCount="indefinite" begin="1.0s" path="M258,228 L209,261" />
                 </circle>
             """.format(
                 dp0(battery_power), battery_speed, battery_speed, battery_speed
@@ -332,18 +891,18 @@ class WebInterface(ComponentBase):
 
             html += """
                 <!-- Grid to House Arrow -->
-                <line x1="410" y1="290" x2="355" y2="240" stroke="#4CAF50" stroke-width="2" marker-end="url(#grid-arrow)" />
-                <text x="350" y="280" text-anchor="middle" fill="#4CAF50">{} W</text>
+                <line x1="408" y1="272" x2="359" y2="239" stroke="#757575" stroke-width="2" marker-end="url(#grid-arrow)" />
+                <text x="356" y="278" text-anchor="middle" fill="#757575">{} W</text>
 
                 <!-- Moving dots for Grid to House -->
-                <circle r="4" fill="#4CAF50" opacity="0.8">
-                    <animateMotion dur="{}s" repeatCount="indefinite" path="M410,290 L355,240" />
+                <circle r="4" fill="#757575" opacity="0.8">
+                    <animateMotion dur="{}s" repeatCount="indefinite" path="M408,272 L359,239" />
                 </circle>
-                <circle r="3" fill="#4CAF50" opacity="0.6">
-                    <animateMotion dur="{}s" repeatCount="indefinite" begin="0.5s" path="M410,290 L355,240" />
+                <circle r="3" fill="#757575" opacity="0.6">
+                    <animateMotion dur="{}s" repeatCount="indefinite" begin="0.5s" path="M408,272 L359,239" />
                 </circle>
-                <circle r="2" fill="#4CAF50" opacity="0.4">
-                    <animateMotion dur="{}s" repeatCount="indefinite" begin="1.0s" path="M410,290 L355,240" />
+                <circle r="2" fill="#757575" opacity="0.4">
+                    <animateMotion dur="{}s" repeatCount="indefinite" begin="1.0s" path="M408,272 L359,239" />
                 </circle>
             """.format(
                 dp0(grid_power), grid_speed, grid_speed, grid_speed
@@ -354,18 +913,18 @@ class WebInterface(ComponentBase):
 
             html += """
                 <!-- House to Grid Arrow -->
-                <line x1="340" y1="230" x2="390" y2="270" stroke="#4CAF50" stroke-width="2" marker-end="url(#grid-arrow)" />
-                <text x="340" y="280" text-anchor="middle" fill="#4CAF50">{} W</text>
+                <line x1="342" y1="228" x2="391" y2="261" stroke="#757575" stroke-width="2" marker-end="url(#grid-arrow)" />
+                <text x="356" y="278" text-anchor="middle" fill="#757575">{} W</text>
 
                 <!-- Moving dots for House to Grid -->
-                <circle r="4" fill="#4CAF50" opacity="0.8">
-                    <animateMotion dur="{}s" repeatCount="indefinite" path="M340,230 L390,270" />
+                <circle r="4" fill="#757575" opacity="0.8">
+                    <animateMotion dur="{}s" repeatCount="indefinite" path="M342,228 L391,261" />
                 </circle>
-                <circle r="3" fill="#4CAF50" opacity="0.6">
-                    <animateMotion dur="{}s" repeatCount="indefinite" begin="0.5s" path="M340,230 L390,270" />
+                <circle r="3" fill="#757575" opacity="0.6">
+                    <animateMotion dur="{}s" repeatCount="indefinite" begin="0.5s" path="M342,228 L391,261" />
                 </circle>
-                <circle r="2" fill="#4CAF50" opacity="0.4">
-                    <animateMotion dur="{}s" repeatCount="indefinite" begin="1.0s" path="M340,230 L390,270" />
+                <circle r="2" fill="#757575" opacity="0.4">
+                    <animateMotion dur="{}s" repeatCount="indefinite" begin="1.0s" path="M342,228 L391,261" />
                 </circle>
             """.format(
                 dp0(grid_power), grid_speed, grid_speed, grid_speed
@@ -374,13 +933,13 @@ class WebInterface(ComponentBase):
                 <!-- Arrowhead Marker -->
                 <defs>
                     <marker id="pv-arrow" markerWidth="10" markerHeight="7" refX="0" refY="3.5" orient="auto">
-                    <polygon points="0 0, 10 3.5, 0 7" fill="#2196F3"/>
+                    <polygon points="0 0, 10 3.5, 0 7" fill="#F9A825"/>
                     </marker>
                     <marker id="battery-arrow" markerWidth="10" markerHeight="7" refX="0" refY="3.5" orient="auto">
-                    <polygon points="0 0, 10 3.5, 0 7" fill="#FF9800"/>
+                    <polygon points="0 0, 10 3.5, 0 7" fill="#43A047"/>
                     </marker>
                     <marker id="grid-arrow" markerWidth="10" markerHeight="7" refX="0" refY="3.5" orient="auto">
-                    <polygon points="0 0, 10 3.5, 0 7" fill="#4CAF50"/>
+                    <polygon points="0 0, 10 3.5, 0 7" fill="#757575"/>
                     </marker>
                 </defs>
             </svg>
@@ -402,7 +961,7 @@ class WebInterface(ComponentBase):
 
         return html
 
-    def get_status_html(self, status, version):
+    def get_status_html(self, version):
         text = ""
         if not self.base.dashboard_index:
             text += "<h2>Loading please wait...</h2>"
@@ -426,14 +985,33 @@ class WebInterface(ComponentBase):
             self.log("Error checking if Predbat is running: {}".format(e))
             is_running = False
 
-        last_updated = self.get_state_wrapper("predbat.status", attribute="last_updated", default=None)
+        status_entity = self.prefix + ".status"
+        last_updated = self.get_state_wrapper(status_entity, attribute="last_updated", default=None)
+        if last_updated:
+            try:
+                last_updated = str2time(last_updated).replace(tzinfo=None, microsecond=0)
+            except (ValueError, TypeError) as e:
+                self.log("Warn: Failed to parse last_updated time {}: {}".format(last_updated, e))
+        status = self.get_state_wrapper(status_entity, default="Unknown")
+        detail = self.get_state_wrapper(status_entity, attribute="detail", default="")
+        debug = self.get_state_wrapper(status_entity, attribute="debug", default="")
+        status_full = status + " " + detail
+        debug_escaped = str(debug).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+        debug_title = ' title="{}"'.format(debug_escaped) if debug else ""
         if status and (("Warn:" in status) or ("Error:" in status)):
-            text += "<tr><td>Status</td><td bgcolor=#ff7777>{}</td></tr>\n".format(status)
+            text += "<tr><td>Status</td><td bgcolor=#ff7777{}>{}</td></tr>\n".format(debug_title, status_full)
         elif not is_running:
-            text += "<tr><td colspan='2' bgcolor='#ff7777'>{} (unhealthy)</td></tr>\n".format(status)
+            text += "<tr><td colspan='2' bgcolor='#ff7777'{}>{} (unhealthy)</td></tr>\n".format(debug_title, status_full)
         else:
-            text += "<tr><td>Status</td><td>{}</td></tr>\n".format(status)
+            text += "<tr><td>Status</td><td{}>{}</td></tr>\n".format(debug_title, status_full)
         text += "<tr><td>Last Updated</td><td>{}</td></tr>\n".format(last_updated)
+        last_started = self.get_state_wrapper(self.prefix + ".last_started", default=None)
+        if last_started:
+            try:
+                last_started = str2time(last_started).replace(tzinfo=None)
+            except (ValueError, TypeError) as e:
+                self.log("Warn: Failed to parse last_started time {}: {}".format(last_started, e))
+        text += "<tr><td>Last Started</td><td>{}</td></tr>\n".format(last_started)
         text += "<tr><td>Version</td><td>{}</td></tr>\n".format(version)
 
         # Editable Mode field
@@ -460,6 +1038,14 @@ class WebInterface(ComponentBase):
         toggle_class = "toggle-switch active" if read_only else "toggle-switch"
         text += f'<button class="{toggle_class}" type="button" onclick="toggleSwitch(this, \'set_read_only\')"></button>'
         text += "</form></td></tr>\n"
+
+        # Editable Predbat Active field
+        predbat_active, ignore = self.get_ha_config("active", None)
+        text += "<tr><td>Predbat Active</td><td>"
+        text += f'<form style="display: inline;" method="post" action="./dash">'
+        toggle_class = "toggle-switch active" if predbat_active else "toggle-switch"
+        text += f'<button class="{toggle_class}" type="button" onclick="toggleSwitch(this, \'active\')" title="On during calculations, off otherwise"></button>'
+        text += "</form></td></tr>\n"
         if self.arg_errors:
             count_errors = len(self.arg_errors)
             text += "<tr><td>Config</td><td bgcolor=#ff7777>apps.yaml has {} errors</td></tr>\n".format(count_errors)
@@ -472,11 +1058,21 @@ class WebInterface(ComponentBase):
         text += '<div style="flex: 1;">\n'
         text += "<h2>Debug</h2>\n"
         text += "<table>\n"
-        text += "<tr><td>Download</td><td><a href='./debug_apps'>apps.yaml</a></td></tr>\n"
+        text += "<tr><td>Download</td><td><a href='javascript:void(0)' onclick='downloadLiveApps()'>apps.yaml (live)</a> | <a href='javascript:void(0)' onclick='downloadFileApps()'>apps.yaml (file)</a></td></tr>\n"
         text += "<tr><td>Create</td><td><a href='./debug_yaml'>predbat_debug.yaml</a></td></tr>\n"
         text += "<tr><td>Download</td><td><a href='./debug_log'>predbat.log</a></td></tr>\n"
         text += "<tr><td>Download</td><td><a href='./debug_plan'>predbat_plan.html</a></td></tr>\n"
+        text += "<tr><td>History</td><td><a href='./debug_history_download_recent'>Download recent</a></td></tr>\n"
         text += "<tr><td>Restart</td><td><button onclick='restartPredbat()' style='background-color: #ff4444; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: bold;'>Restart Predbat</button></td></tr>\n"
+        # The HA Companion app's embedded webview does not act on Content-Disposition: attachment,
+        # so it renders these downloads inline instead of saving them - a client limitation with no
+        # server-side fix (see #4720). Rather than try to detect the app (its webview sends no
+        # reliable identifying User-Agent - see #4720 discussion) and grey the links out, which risks
+        # false-positives against a genuine desktop browser, just say so for everyone.
+        text += "<tr><td colspan='2' style='font-size:0.85em; color:var(--text-secondary,#888); padding-top:6px;'>"
+        text += "'Create' and 'Download' above need a web browser - the HA Companion app cannot save files from them. "
+        text += "Companion app users can instead browse to <code>{}/debug/</code>, which also holds the rolling snapshot history as plain, readable files.".format(self.base.config_root_p)
+        text += "</td></tr>\n"
         text += "</table>\n"
         text += "</div>\n"
 
@@ -485,6 +1081,12 @@ class WebInterface(ComponentBase):
 
         # Add power flow diagram
         text += "<h2>Power Flow</h2>\n"
+        text += """<div style="margin-bottom: 8px; display: flex; align-items: center; gap: 10px;">
+            <button id="inverterRefreshBtn" onclick="refreshInverterData()" style="background-color: #2196F3; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: bold;">Refresh</button>
+            <span id="inverterRefreshStatus" style="font-size: 13px; color: #666;"></span>
+        </div>
+        """
+        text += get_refresh_inverter_js()
         text += self.get_power_flow_diagram()
 
         # Text description of the plan
@@ -501,11 +1103,16 @@ class WebInterface(ComponentBase):
             if app not in app_list:
                 app_list.append(app)
 
+        # Add expand/collapse all button
+        text += '<div style="margin: 20px 0;">\n'
+        text += '<button id="expandAllBtn" class="expand-all-button" onclick="toggleAllSections()">Expand All</button>\n'
+        text += "</div>\n"
+
         # Display per app
         for app in app_list:
-            text += "<h2>{} Entities</h2>\n".format(app[0].upper() + app[1:])
-            text += "<table>\n"
-            text += "<tr><th></th><th>Name</th><th>Entity</th><th>State</th><th>Attributes</th></tr>\n"
+            section_id = f"section-{app}"
+
+            # Build entity list first to get count
             if app == "predbat":
                 entity_list = self.base.dashboard_index
             else:
@@ -514,9 +1121,22 @@ class WebInterface(ComponentBase):
                     if self.base.dashboard_index_app[entity_id] == app:
                         entity_list.append(entity_id)
 
+            entity_count = len(entity_list)
+            entity_word = "entity" if entity_count == 1 else "entities"
+
+            text += f'<div class="dashboard-section">\n'
+            text += f'<h2 class="dashboard-section-header" onclick="toggleDashboardSection(\'{section_id}\')">\n'
+            text += f'<span class="expand-icon" id="icon-{section_id}">+</span> {app[0].upper() + app[1:]} Entities ({entity_count} {entity_word})\n'
+            text += "</h2>\n"
+            text += f'<div id="{section_id}" class="dashboard-section-content collapsed">\n'
+            text += "<table>\n"
+            text += "<tr><th></th><th>Name</th><th>Entity</th><th>State</th><th>Attributes</th></tr>\n"
+
             for entity in entity_list:
                 text += self.html_get_entity_text(entity)
             text += "</table>\n"
+            text += "</div>\n"
+            text += "</div>\n"
 
         return text
 
@@ -565,7 +1185,11 @@ class WebInterface(ComponentBase):
 
             for entity_id in entity_list:
                 if hasattr(self.base, "dashboard_values") and self.base.dashboard_values:
-                    entity_friendly_name = self.base.dashboard_values.get(entity_id, {}).get("attributes", {}).get("friendly_name", entity_id)
+                    attributes = self.base.dashboard_values.get(entity_id, {}).get("attributes", {})
+                    entity_friendly_name = attributes.get("friendly_name", entity_id)
+                    unit = attributes.get("unit_of_measurement", "")
+                    if unit:
+                        entity_friendly_name = f"{entity_friendly_name} ({unit})"
                 else:
                     entity_friendly_name = entity_id
 
@@ -577,9 +1201,34 @@ class WebInterface(ComponentBase):
                 if self.base.user_config_item_enabled(item):
                     entity_id = item.get("entity", "")
                     entity_friendly_name = item.get("friendly_name", "")
+                    unit = self.base.convert_currency_unit(item.get("unit", ""))
+                    if unit:
+                        entity_friendly_name = f"{entity_friendly_name} ({unit})"
                     if entity_id:
                         entity_data_list.append({"id": entity_id, "name": entity_friendly_name, "group": "Config Settings"})
 
+        return entity_data_list
+
+    def get_all_entity_list_data(self):
+        """
+        Return all Home Assistant entities grouped by domain.
+        """
+        state_data = self.get_state_wrapper()
+        entity_data_list = []
+        if isinstance(state_data, dict):
+            for entity_id in sorted(state_data.keys()):
+                state_info = state_data[entity_id]
+                if isinstance(state_info, dict):
+                    attributes = state_info.get("attributes", {})
+                    friendly_name = attributes.get("friendly_name", entity_id)
+                    unit = attributes.get("unit_of_measurement", "")
+                    if unit:
+                        friendly_name = f"{friendly_name} ({unit})"
+                else:
+                    friendly_name = entity_id
+                domain = entity_id.split(".")[0] if "." in entity_id else "other"
+                group = domain[0].upper() + domain[1:] + " Entities"
+                entity_data_list.append({"id": entity_id, "name": friendly_name, "group": group})
         return entity_data_list
 
     async def html_api_get_entities(self, request):
@@ -587,60 +1236,175 @@ class WebInterface(ComponentBase):
         API endpoint to get entity list as JSON
         """
         try:
-            entity_list = self.get_entity_list_data()
+            show_all = request.query.get("all", "0") == "1"
+            if show_all:
+                entity_list = self.get_all_entity_list_data()
+            else:
+                entity_list = self.get_entity_list_data()
             return web.json_response(entity_list)
         except Exception as e:
             self.base.log(f"Error in html_api_get_entities: {e}")
             return web.json_response({"error": str(e)}, status=500)
 
+    async def get_history_with_now(self, entity_id, days, attribute=None):
+        """
+        Get history for an entity including the current state
+        """
+        history = copy.deepcopy(self.get_history_wrapper(entity_id, days, required=False, tracked=False))  # Copy to avoid modifying original history
+        current_value = self.get_state_wrapper(entity_id=entity_id, attribute=attribute)
+        if current_value is not None:
+            if not history:
+                history = [[]]
+                if attribute:
+                    history[0].append({"attributes": {attribute: current_value}, "last_updated": (self.now_now_utc - timedelta(days=days)).strftime(TIME_FORMAT_HA)})
+                else:
+                    history[0].append({"state": current_value, "last_updated": (self.now_utc - timedelta(days=days)).strftime(TIME_FORMAT_HA)})
+            if attribute:
+                history[0].append({"attributes": {attribute: current_value}, "last_updated": self.now_utc.strftime(TIME_FORMAT_HA)})
+            else:
+                history[0].append({"state": current_value, "last_updated": self.now_utc.strftime(TIME_FORMAT_HA)})
+
+        return history
+
+    def get_history_with_now_attrs(self, entity_id, days):
+        """
+        Get history for an entity and append a record at now_utc containing all current
+        attributes. This keeps chart series up-to-date when entities publish infrequently.
+
+        Args:
+            entity_id: HA entity ID
+            days: Number of days of history to fetch
+
+        Returns:
+            History list [[records...]] with current attributes appended at self.now_utc
+        """
+        history = copy.deepcopy(self.get_history_wrapper(entity_id, days, required=False, tracked=False))
+        current_state = self.get_state_wrapper(entity_id, raw=True)
+        if current_state and isinstance(current_state, dict) and "attributes" in current_state:
+            curr_record = {"state": current_state.get("state"), "attributes": current_state["attributes"], "last_updated": self.now_utc.strftime(TIME_FORMAT_HA)}
+            if history and isinstance(history, list) and len(history) > 0:
+                history[0].append(curr_record)
+            else:
+                history = [[curr_record]]
+        return history
+
+    def get_entity_attributes(self, entity_id):
+        """
+        get_entity_attributes returns a list of attribute names for the given entity_id
+        """
+        state_info = self.get_state_wrapper(entity_id=entity_id, raw=True)
+        if state_info and ("attributes" in state_info) and isinstance(state_info["attributes"], dict):
+            attr_list = sorted(list(state_info["attributes"].keys()))
+            for attr in ["friendly_name", "icon", "unit_of_measurement", "device_class", "state_class"]:
+                try:
+                    attr_list.remove(attr)
+                except ValueError:
+                    pass
+            return attr_list
+        return []
+
     async def html_entity(self, request):
         """
         Return the Predbat entity as an HTML page
         """
-        entity = request.query.get("entity_id", "")
+        # Support multiple entity_id parameters
+        entity_ids = request.query.getall("entity_id", [])
+        if not entity_ids:
+            # Fallback to single entity_id for backward compatibility
+            single_entity = request.query.get("entity_id", "")
+            entity_ids = [single_entity] if single_entity else []
+
+        # Get attribute selections (parallel to entity_ids)
+        entity_attributes = request.query.getall("entity_attribute", [])
+
+        # Build entity_selections list pairing entity IDs with attributes
+        # Each entity can have multiple attributes (comma-separated)
+        entity_selections = []
+        for i, entity_id in enumerate(entity_ids):
+            if entity_id:
+                attr_string = entity_attributes[i] if i < len(entity_attributes) else ""
+                # Parse comma-separated attributes
+                if attr_string:
+                    # Keep empty strings (they represent state)
+                    attrs = [a.strip() if a.strip() else None for a in attr_string.split(",")]
+                else:
+                    attrs = [None]  # Default to state
+
+                # Create one selection per attribute
+                for attr in attrs:
+                    entity_selections.append({"entity_id": entity_id, "attribute": attr})
+
         days = int(request.query.get("days", 7))  # Default to 7 days if not specified
 
-        text = self.get_header("Predbat Entity", refresh=60)
+        text = self.get_header("Predbat Entity", refresh=0)
 
-        # Include a back button to return the previous page
+        # Include a back button to return the previous page, and a reload button in case the
+        # entities selected weren't available yet when the page was first loaded
         text += """<div style="margin-bottom: 15px;">
             <a href="{}" class="button" style="display: inline-block; padding: 8px 15px; background-color: #4CAF50; color: white; text-decoration: none; border-radius: 4px; font-weight: bold;">
                 <span class="mdi mdi-arrow-left" style="margin-right: 5px;"></span>Back
             </a>
+            <button onclick="location.reload()" style="display: inline-block; margin-left: 10px; padding: 8px 15px; background-color: #2196F3; color: white; border: none; text-decoration: none; border-radius: 4px; font-weight: bold; cursor: pointer;">
+                <span class="mdi mdi-refresh" style="margin-right: 5px;"></span>Reload
+            </button>
         </div>""".format(
             self.default_page
         )
 
-        attributes = self.base.dashboard_values.get(entity, {}).get("attributes", {})
-        unit_of_measurement = attributes.get("unit_of_measurement", "")
-        friendly_name = attributes.get("friendly_name", "")
+        # Collect available attributes for all selected entities
+        entity_attributes_map = {}
+        entity_data_fetch = {}
+        for selection in entity_selections:
+            entity_id = selection["entity_id"]
+            attribute = selection["attribute"]
+            history = await self.get_history_with_now(entity_id, days, attribute=None)
+            entity_data_fetch[entity_id] = history
+            available_attrs = self.get_entity_attributes(entity_id)
+            entity_attributes_map[entity_id] = available_attrs
 
-        # Add entity dropdown selector with search functionality
+        # Build selected entities data structure with attributes grouped by entity
+        entity_attr_groups = {}
+        for selection in entity_selections:
+            entity_id = selection["entity_id"]
+            attr = selection["attribute"] or ""
+            if entity_id not in entity_attr_groups:
+                entity_attr_groups[entity_id] = []
+            if attr not in entity_attr_groups[entity_id]:
+                entity_attr_groups[entity_id].append(attr)
+
+        # Convert to array format for JavaScript
+        selected_entities_data = [{"entity": entity_id, "attributes": attrs} for entity_id, attrs in entity_attr_groups.items()]
+        selected_entities_json = json.dumps(selected_entities_data)
+        entity_attributes_json = json.dumps(entity_attributes_map)
+
+        # Add entity multi-select dropdown with checkboxes
         text += """<div style="margin-bottom: 20px;">
-            <form id="entitySelectForm" style="display: flex; align-items: center;">
-                <label for="entitySearchInput" style="margin-right: 10px; font-weight: bold;">Select Entity: </label>
-                <div class="entity-search-container" style="position: relative; flex-grow: 1; max-width: 800px;">
+            <form id="entitySelectForm" method="get" action="./entity">
+                <label for="entitySearchInput" style="margin-right: 10px; font-weight: bold;">Select Entities: </label>
+                <label style="margin-right: 15px; font-weight: normal; white-space: nowrap;"><input type="checkbox" id="showAllEntities" onchange="toggleShowAll(this.checked)" /> Show All</label>
+                <div class="entity-search-container" style="position: relative; max-width: 800px;">
                     <input type="text" id="entitySearchInput" name="entity_search"
-                           placeholder="Type to search entities..."
+                           placeholder="Type to search entities... (click to show all)"
                            style="width: 100%; padding: 8px 30px 8px 8px; border-radius: 4px; border: 1px solid #ddd; box-sizing: border-box;"
                            autocomplete="off" />
                     <button type="button" id="clearEntitySearch"
                             style="position: absolute; right: 5px; top: 50%; transform: translateY(-50%); background: none; border: none; font-size: 16px; color: #999; cursor: pointer; padding: 2px 5px;"
                             title="Clear search">×</button>
                     <div id="entityDropdown" class="entity-dropdown"
-                         style="position: absolute; top: 100%; left: 0; right: 0; background: white; border: 1px solid #ddd; border-top: none; max-height: 300px; overflow-y: auto; z-index: 1000; display: none; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+                         style="position: absolute; top: 100%; left: 0; right: 0; background: white; border: 1px solid #ddd; border-top: none; max-height: 400px; overflow-y: auto; z-index: 1000; display: none; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
                     </div>
-                    <input type="hidden" id="selectedEntityId" name="entity_id" value="{}" />
                 </div>
+                <div id="selectedEntitiesDisplay" style="margin-top: 10px; padding: 10px; border: 1px solid #ddd; border-radius: 4px; min-height: 40px; background-color: var(--background-secondary, #f9f9f9);"></div>
                 <input type="hidden" name="days" value="{}" />
+                <button type="submit" style="margin-top: 10px; padding: 8px 16px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">Update Chart</button>
             </form>
         </div>""".format(
-            entity, days
+            days
         )
 
         # Add days selector
         text += """<div style="margin-bottom: 20px;">
-            <form id="daysSelectForm" style="display: flex; align-items: center;">
+            <form id="daysSelectForm" style="display: flex; align-items: center;" method="get" action="./entity">
                 <label for="daysSelect" style="margin-right: 10px; font-weight: bold;">History Days: </label>
                 <select id="daysSelect" name="days" style="padding: 8px; border-radius: 4px; border: 1px solid #ddd;" onchange="document.getElementById('daysSelectForm').submit();">
         """
@@ -652,68 +1416,245 @@ class WebInterface(ComponentBase):
 
         text += """
                 </select>
-                <input type="hidden" name="entity_id" value="{}" />
+        """
+
+        # Add hidden inputs for all selected entities with attributes
+        for entity_id, attrs in entity_attr_groups.items():
+            attr_string = ",".join(attrs)
+            text += f'<input type="hidden" name="entity_id" value="{entity_id}" />'
+            text += f'<input type="hidden" name="entity_attribute" value="{attr_string}" />'
+
+        text += """
             </form>
-        </div>""".format(
-            entity
-        )
+        </div>"""
         # CSS
         text += get_entity_css()
 
-        # Add JavaScript and CSS for entity list and search
-        text += get_entity_js(entity)
+        # Add JavaScript and CSS for entity list and search (with attribute selection support)
+        text += get_entity_js(selected_entities_json, entity_attributes_json)
 
-        if entity:
-            config_text = self.html_config_item_text(entity)
-            if not config_text:
-                text += "<table>\n"
-                text += "<tr><th></th><th>Name</th><th>Entity</th><th>State</th><th>Attributes</th></tr>\n"
-                text += self.html_get_entity_text(entity)
-                text += "</table>\n"
+        if entity_selections:
+            # Group entities by unit of measurement
+            entity_groups = {}
+            for selection in entity_selections:
+                entity_id = selection["entity_id"]
+                attribute = selection["attribute"]
+
+                live_unit = live_friendly_name = None
+                if entity_id not in self.base.dashboard_values:
+                    live_unit = self.get_state_wrapper(entity_id=entity_id, attribute="unit_of_measurement")
+                    live_friendly_name = self.get_state_wrapper(entity_id=entity_id, attribute="friendly_name")
+                unit, friendly_name = resolve_group_unit_and_name(entity_id, self.base.dashboard_values, live_unit, live_friendly_name)
+
+                if unit not in entity_groups:
+                    entity_groups[unit] = []
+
+                entity_groups[unit].append({"id": entity_id, "friendly_name": friendly_name, "unit": unit, "attribute": attribute, "available_attrs": entity_attributes_map.get(entity_id, [])})
+
+            # Display entity details table for first selected entity
+            if len(entity_selections) == 1:
+                entity = entity_selections[0]["entity_id"]
+                config_text = self.html_config_item_text(entity)
+                if not config_text:
+                    text += "<table>\n"
+                    text += "<tr><th></th><th>Name</th><th>Entity</th><th>State</th><th>Attributes</th></tr>\n"
+                    text += self.html_get_entity_text(entity)
+                    text += "</table>\n"
+                else:
+                    text += config_text
+
+                control_html = self.get_entity_control_html(entity, days)
+                if control_html:
+                    text += control_html
             else:
-                text += config_text
+                # Show summary of selected entities
+                text += "<h2>Selected Entities ({})</h2>\n".format(len(entity_selections))
+                text += "<table>\n"
+                text += "<tr><th>Name</th><th>Entity</th><th>Attribute</th><th>Current State</th><th>Unit</th></tr>\n"
+                for selection in entity_selections:
+                    entity_id = selection["entity_id"]
+                    attribute = selection["attribute"]
+                    if entity_id:
+                        text += self.html_get_entity_text(entity_id)
+                text += "</table>\n"
 
-            control_html = self.get_entity_control_html(entity, days)
-            if control_html:
-                text += control_html
-
-            text += "<h2>History Chart</h2>\n"
-            text += '<div id="chart"></div>'
+            # Create separate charts for each unit group
             now_str = self.now_utc.strftime(TIME_FORMAT)
-            history = self.get_history_wrapper(entity, days, required=False, tracked=False)
-            history_chart = history_attribute(history)
-            series_data = []
-            series_data.append({"name": "entity_id", "data": history_chart, "chart_type": "line", "stroke_width": "3", "stroke_curve": "stepline"})
-            text += self.render_chart(series_data, unit_of_measurement, friendly_name, now_str)
 
-            # History table
-            text += "<h2>History</h2>\n"
-            text += "<table>\n"
-            text += "<tr><th>Time</th><th>State</th></tr>\n"
+            for unit, entities in entity_groups.items():
+                # Numeric and non-numeric entities are split per-entity (not decided once for the
+                # whole group) so a numeric entity sharing a unit with a non-numerical one still
+                # gets a proper line chart instead of being dropped into a broken timeline chart.
+                numeric_entries, timeline_entries = split_entities_for_charting(entities, entity_data_fetch)
+                if not numeric_entries and not timeline_entries:
+                    continue
 
-            prev_stamp = None
-            if history and len(history) >= 1:
-                history = history[0]
-                if history:
-                    count = 0
-                    history.reverse()
-                    for item in history:
-                        if "last_updated" not in item:
-                            continue
-                        last_updated_time = item["last_updated"]
-                        last_updated_stamp = str2time(last_updated_time)
-                        state = item.get("state", None)
-                        if state is None:
-                            state = "None"
-                        # Only show in 30 minute intervals
-                        if prev_stamp and ((prev_stamp - last_updated_stamp) < timedelta(minutes=30)):
-                            continue
-                        text += "<tr><td>{}</td><td>{}</td></tr>\n".format(last_updated_stamp.strftime(TIME_FORMAT), state)
-                        prev_stamp = last_updated_stamp
-                        count += 1
-            text += "</table>\n"
+                text += "<h2>History Chart - {}</h2>\n".format(unit if unit != "(no unit)" else "(no unit)")
+                base_chart_id = "chart_{}".format(unit.replace("/", "_").replace(" ", "_").replace("(", "").replace(")", ""))
+
+                if numeric_entries:
+                    chart_id = base_chart_id
+                    text += '<div id="{}"></div>'.format(chart_id)
+                    series_data = [{"name": item["name"], "data": item["data"], "chart_type": "line", "stroke_width": "2", "stroke_curve": "stepline"} for item in numeric_entries]
+                    chart_unit = unit if unit != "(no unit)" else ""
+                    chart_title = "{} entities".format(len(numeric_entries)) if len(numeric_entries) > 1 else numeric_entries[0]["friendly_name"]
+                    text += self.render_chart(series_data, chart_unit, chart_title, now_str, tagname=chart_id)
+
+                if timeline_entries:
+                    chart_id = base_chart_id + "_timeline" if numeric_entries else base_chart_id
+                    text += '<div id="{}"></div>'.format(chart_id)
+                    text += self.render_timeline_chart(timeline_entries, chart_id, days)
+
+            # History table showing all selected entities
+            if entity_selections:
+                text += "<h2>History</h2>\n"
+                text += """
+                <style>
+                .history-row { cursor: pointer; }
+                .history-row:hover { background-color: var(--hover-color, #f5f5f5); }
+                .detail-row { display: none; background-color: var(--detail-bg, #fafafa); }
+                .detail-row td { padding-left: 30px; font-size: 0.9em; color: var(--text-secondary, #666); }
+                .expanded { background-color: var(--expanded-bg, #e8f4f8) !important; }
+                .changed-cell { font-weight: bold; background-color: #ffd6e0; }
+                body.dark-mode .changed-cell { background-color: #5c1a2e; color: #ffb3c6; }
+                .reverted-cell { font-weight: bold; background-color: #cce8ff; }
+                body.dark-mode .reverted-cell { background-color: #0d2e4a; color: #90caff; }
+                </style>
+                """
+                text += '<button onclick="downloadEntityCSV()" style="margin-bottom: 10px; padding: 7px 14px; background-color: #2196F3; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">&#11015; Download CSV</button>\n'
+                text += "<table>\n"
+
+                # Build header row
+                text += "<tr><th>Time</th>"
+                for selection in entity_selections:
+                    entity_id = selection["entity_id"]
+                    attribute = selection["attribute"]
+                    attributes = self.base.dashboard_values.get(entity_id, {}).get("attributes", {})
+                    friendly_name = attributes.get("friendly_name", entity_id)
+                    unit = attributes.get("unit_of_measurement", "")
+                    unit_display = f" ({unit})" if unit else ""
+                    attr_display = f" - {attribute}" if attribute else ""
+                    text += f"<th>{friendly_name}{attr_display}{unit_display}</th>"
+                text += "</tr>\n"
+
+                # Collect and bucket history data for all entities (both 30-min summary and 5-min detail)
+                entity_filled_30min, entity_filled_5min, sorted_timestamps_30min, _ = build_entity_history_table_data(entity_selections, entity_data_fetch)
+
+                # Pre-compute per-row cell classes so we can decide which rows to show
+                num_cols = len(entity_selections)
+                row_data = []  # list of (timestamp_30, [(value, cell_class), ...], has_highlight)
+                for timestamp_30 in sorted_timestamps_30min:
+                    cells = []
+                    has_highlight = False
+                    for filled_30, filled_5 in zip(entity_filled_30min, entity_filled_5min):
+                        value, is_changed, prev_value = filled_30.get(timestamp_30, ("-", False, None))
+                        if is_changed:
+                            cell_class = ' class="changed-cell"'
+                            has_highlight = True
+                        else:
+                            # Flag a row that held its value at both ends but moved somewhere inside its own half hour
+                            sub_vals = [filled_5.get(timestamp_30 + timedelta(minutes=off), ("-", False, None))[0] for off in range(5, 30, 5)]
+                            if any(v != value for v in sub_vals):
+                                cell_class = ' class="reverted-cell"'
+                                has_highlight = True
+                            else:
+                                cell_class = ""
+                        cells.append((value, cell_class))
+                    row_data.append((timestamp_30, cells, has_highlight))
+
+                # Build table rows — skip unchanged rows (except the oldest), inserting gap rows on skips
+                row_index = 0
+                oldest_idx = len(row_data) - 1
+                skipped_count = 0
+                prev_row_ts = None  # Previous row_data entry (visible or skipped) — for detecting history gaps
+                for i, (timestamp_30, cells, has_highlight) in enumerate(row_data):
+                    is_oldest = i == oldest_idx
+
+                    # Count slots absent from history entirely (gap between consecutive row_data entries).
+                    # Using prev_row_ts (not prev visible ts) avoids double-counting rows already
+                    # incremented via skipped_count += 1 below.
+                    if prev_row_ts is not None:
+                        gap_minutes = int((prev_row_ts - timestamp_30).total_seconds() / 60)
+                        missing_slots = max(0, (gap_minutes // 30) - 1)
+                        skipped_count += missing_slots
+
+                    prev_row_ts = timestamp_30
+
+                    if not has_highlight and not is_oldest:
+                        skipped_count += 1
+                        continue
+
+                    # If we skipped rows (present-but-unchanged OR absent from history), emit a gap separator
+                    if skipped_count > 0:
+                        col_span = 1 + num_cols
+                        text += f'<tr class="gap-row"><td colspan="{col_span}" style="text-align:center; font-style:italic; font-size:0.85em; color:var(--text-secondary,#888); border-top:2px dashed #aaa; border-bottom:2px dashed #aaa; padding:4px;">— {skipped_count} unchanged slot{"s" if skipped_count != 1 else ""} hidden —</td></tr>\n'
+                        skipped_count = 0
+
+                    # Main 30-minute row (clickable)
+                    text += f'<tr class="history-row" onclick="toggleDetailRow({row_index})" id="row_{row_index}">'
+                    text += f"<td>▶ {timestamp_30.strftime(TIME_FORMAT)}</td>"
+                    for value, cell_class in cells:
+                        text += f"<td{cell_class}>{value}</td>"
+                    text += "</tr>\n"
+
+                    # Detail rows: the remaining 5-minute slots inside this row's own half hour,
+                    # newest first to match the table's ordering (the row itself covers offset 0)
+                    for offset in range(25, 0, -5):
+                        detail_time = timestamp_30 + timedelta(minutes=offset)
+                        text += f'<tr class="detail-row" id="detail_{row_index}">'
+                        text += f"<td>  {detail_time.strftime(TIME_FORMAT)}</td>"
+                        for filled in entity_filled_5min:
+                            value, is_changed, prev_value = filled.get(detail_time, ("-", False, None))
+                            cell_class = ' class="changed-cell"' if is_changed else ""
+                            text += f"<td{cell_class}>{value}</td>"
+                        text += "</tr>\n"
+
+                    row_index += 1
+
+                text += "</table><br>\n"
+
+                # Build CSV data for download (all 30-min slots, unfiltered, with carry-forward values)
+                csv_col_headers = ["Time"]
+                for sel in entity_selections:
+                    sel_eid = sel["entity_id"]
+                    sel_attr = sel["attribute"]
+                    sel_attrs = self.base.dashboard_values.get(sel_eid, {}).get("attributes", {})
+                    sel_friendly = sel_attrs.get("friendly_name", sel_eid)
+                    sel_unit = sel_attrs.get("unit_of_measurement", "")
+                    sel_unit_disp = f" ({sel_unit})" if sel_unit else ""
+                    sel_attr_disp = f" - {sel_attr}" if sel_attr else ""
+                    csv_col_headers.append(f"{sel_friendly}{sel_attr_disp}{sel_unit_disp}")
+                csv_all_rows = []
+                for ts in sorted_timestamps_30min:
+                    row_vals = [ts.strftime(TIME_FORMAT)]
+                    for filled_30 in entity_filled_30min:
+                        val, _, _ = filled_30.get(ts, ("-", False, None))
+                        row_vals.append(str(val))
+                    csv_all_rows.append(row_vals)
+                csv_data_json = json.dumps({"headers": csv_col_headers, "rows": csv_all_rows})
+                text += f"<script>var csvData = {csv_data_json};\n"
+                text += """function downloadEntityCSV() {
+    var h = csvData.headers.map(function(v) { return '"' + String(v).replace(/"/g, '""') + '"'; });
+    var lines = [h.join(',')];
+    for (var i = 0; i < csvData.rows.length; i++) {
+        var r = csvData.rows[i].map(function(v) { return '"' + String(v).replace(/"/g, '""') + '"'; });
+        lines.push(r.join(','));
+    }
+    var blob = new Blob([lines.join('\\n')], {type: 'text/csv'});
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'entity_history.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(a.href);
+}
+</script>"""
+
+                # Add JavaScript for toggling detail rows
+                text += get_entity_detailed_row_js()
         else:
-            text += "<h2>Select an entity</h2>\n"
+            text += "<h2>Select one or more entities</h2>\n"
 
         # Return web response
         text += "</body></html>\n"
@@ -748,7 +1689,7 @@ class WebInterface(ComponentBase):
                     pass
 
                 # Set the entity state
-                await self.base.ha_interface.set_state_external(entity_id, new_value, attributes=attributes)
+                await self.set_state_external(entity_id, new_value, attributes=attributes)
                 self.log(f"Entity {entity_id} updated to {new_value} via web interface")
 
         except Exception as e:
@@ -860,7 +1801,7 @@ class WebInterface(ComponentBase):
         if self.base.update_pending:
             calculating = True
         self.update_success_timestamp()
-        return get_header_html(title, calculating, self.default_page, self.arg_errors, THIS_VERSION, self.get_battery_status_icon(), refresh, codemirror=codemirror)
+        return get_header_html(title, calculating, self.default_page, self.arg_errors, THIS_VERSION_DISPLAY, self.get_battery_status_icon(), refresh, codemirror=codemirror, chat_enabled=self.chat_enabled())
 
     def get_chart_series(self, name, results, chart_type, color):
         """
@@ -932,6 +1873,10 @@ var width = window.innerWidth;
 var height = window.innerHeight;
 width = width / 3 * 2;
 height = height / 3 * 2;
+
+if (width < 600) {
+    width = 600
+}
 
 if (height * 1.68 > width) {
    height = width / 1.68;
@@ -1085,10 +2030,314 @@ var options = {
         text += "   ]\n"
         text += "  }\n"
         text += "}\n"
-        text += "var chart = new ApexCharts(document.querySelector('#{}'), options);\n".format(tagname)
+        # getElementById (not a '#id' CSS selector) - tagname can be unit-derived (e.g. "chart_%")
+        # and '%' is not a valid unescaped CSS identifier character, which would throw in querySelector
+        text += "var chart = new ApexCharts(document.getElementById('{}'), options);\n".format(tagname)
         text += "chart.render();\n"
         text += "</script>\n"
         return text
+
+    def render_heatmap_chart(self, series_data, title, range_min, range_max, chart_id="chart", fixed_height=None):
+        """
+        Render a rounded heatmap chart using ApexCharts.
+
+        series_data is a list of dicts: [{"name": str, "data": [{"x": str, "y": float}, ...]}, ...]
+        range_min and range_max define the full colour scale (green -> red).
+        chart_id is the DOM element id to render into.
+        fixed_height overrides the responsive height calculation when set.
+        """
+        # Build a 5-stop green-to-red colour gradient across the value range
+        span = max(range_max - range_min, 0.01)
+        gradient_colors = ["#00B050", "#85C21A", "#FFFF00", "#FFA500", "#FF0000"]
+        num_stops = len(gradient_colors)
+        ranges_js = ""
+        for i, color in enumerate(gradient_colors):
+            from_val = round(range_min + span * i / num_stops, 4)
+            to_val = round(range_min + span * (i + 1) / num_stops, 4)
+            if i == num_stops - 1:
+                to_val = round(range_max + 0.01, 4)
+            name_str = "{:.1f}-{:.1f}".format(from_val, to_val)
+            ranges_js += "            {{ from: {}, to: {}, color: '{}', name: '{}' }},\n".format(from_val, to_val, color, name_str)
+
+        # Build series JSON inline
+        series_js = ""
+        for series in series_data:
+            name = series.get("name", "")
+            data_points = series.get("data", [])
+            points_js = ", ".join("{{ x: '{}', y: {} }}".format(p["x"], "null" if p["y"] is None else p["y"]) for p in data_points)
+            series_js += "    {{ name: '{}', data: [{}] }},\n".format(name, points_js)
+
+        # chart_id is only safe to interpolate as a *string* (DOM id, inside quotes) - it may
+        # contain characters (e.g. "%") that are invalid in a JS identifier, so a separate
+        # sanitised name is used anywhere it needs to appear as a variable name
+        js_id = re.sub(r"[^0-9A-Za-z_]", "_", chart_id)
+
+        text = ""
+        text += "<script>\n"
+        text += "window.onresize = function(){ location.reload(); };\n"
+        text += "var width = window.innerWidth;\n"
+        text += "var height = window.innerHeight;\n"
+        text += "if (width < 400) { width = 400; }\n"
+        text += "width = width - 50;\n"
+        if fixed_height is not None:
+            text += "var height_{} = {};\n".format(js_id, fixed_height)
+        else:
+            num_rows = max(len(series_data), 1)
+            text += "var height_{} = {};\n".format(js_id, num_rows * 80 + 80)
+        text += "var options = {\n"
+        text += "  chart: {{ type: 'heatmap', width: width, height: height_{}, animations: {{ enabled: false }} }},\n".format(js_id)
+        text += "  plotOptions: {\n"
+        text += "    heatmap: {\n"
+        text += "      radius: 2,\n"
+        text += "      enableShades: false,\n"
+        text += "      colorScale: {\n"
+        text += "        ranges: [\n"
+        text += ranges_js
+        text += "        ]\n"
+        text += "      }\n"
+        text += "    }\n"
+        text += "  },\n"
+        text += "  dataLabels: { enabled: true, style: { colors: ['#000'] } },\n"
+        text += "  series: [\n"
+        text += series_js
+        text += "  ],\n"
+        text += "  xaxis: { type: 'category' },\n"
+        text += "  title: {{ text: '{}' }},\n".format(title)
+        text += "  tooltip: { y: { formatter: function(val) { return val !== null ? val.toFixed(2) : 'N/A'; } } }\n"
+        text += "};\n"
+        # getElementById, not a '#id' CSS selector - chart_id may contain characters (e.g. "%") that
+        # are invalid in an unescaped CSS identifier and would throw in querySelector
+        text += "var chart_{jid} = new ApexCharts(document.getElementById('{cid}'), options);\n".format(jid=js_id, cid=chart_id)
+        text += "chart_{}.render();\n".format(js_id)
+        text += "</script>\n"
+        return text
+
+    def render_timeline_chart(self, timeline_data, tagname, days):
+        """
+        Render a timeline chart for non-numerical data (like on/off states)
+        Shows horizontal bars with different states as colored segments
+        """
+
+        # Escape a value for embedding inside a JS single-quoted string literal
+        def js_str(val):
+            return str(val).replace("\\", "\\\\").replace("'", "\\'")
+
+        # Build the initial template - use direct substitution, NOT .format(), to avoid
+        # breakage when state values or entity names contain { or } characters
+        series_count = len(timeline_data)
+        text = (
+            """
+<script>
+window.onresize = function() { location.reload(); };
+var width = window.innerWidth;
+var height = window.innerHeight;
+
+// Use full width minus small margins
+width = Math.max(800, width - 100);
+
+// Calculate height based on number of series (compact timeline view)
+var seriesCount = """
+            + str(series_count)
+            + """;
+var baseHeight = Math.max(200, seriesCount * 50 + 100);
+height = Math.min(400, baseHeight);
+
+var options = {
+  chart: {
+    type: 'rangeBar',
+    width: width,
+    height: height,
+    animations: {
+      enabled: false
+    },
+    toolbar: {
+      show: true
+    }
+  },
+  plotOptions: {
+    bar: {
+      horizontal: true,
+      barHeight: '70%',
+      rangeBarGroupRows: false
+    }
+  },
+  series: [
+"""
+        )
+
+        # Process each entity's timeline data
+        first_series = True
+        all_states = set()
+
+        # A rangeBar data point's "x" is the y-axis category, so entities whose friendly names
+        # collide (every GivEnergy Cloud inverter publishes a "Status" sensor, for instance) would
+        # otherwise share a single unlabelled row with no way to tell which bar is which inverter.
+        name_counts = {}
+        for entity_timeline in timeline_data:
+            name_counts[entity_timeline["name"]] = name_counts.get(entity_timeline["name"], 0) + 1
+
+        for entity_timeline in timeline_data:
+            entity_name = entity_timeline["name"]
+            if name_counts.get(entity_name, 0) > 1:
+                entity_name = "{} ({})".format(entity_name, entity_timeline.get("entity_id", ""))
+            history_chart = entity_timeline["data"]  # Dict with timestamp keys and state values
+
+            # Sort by the instant each record represents rather than by its raw timestamp text:
+            # HA/DB history is UTC while get_history_with_now() appends the current state stamped
+            # in local time, so a string sort can order records by their offset instead of by time.
+            sorted_items = []
+            for timestamp_str, state in history_chart.items():
+                try:
+                    sorted_items.append((int(str2time(timestamp_str).timestamp() * 1000), str(state)))
+                except (ValueError, TypeError):
+                    continue
+            sorted_items.sort(key=lambda item: item[0])
+
+            # Convert history data to timeline ranges. Every sample is folded into a range: unlike a
+            # numerical series, thinning a state series does not merely lower the resolution, it
+            # rewrites history. Sampling the records by array index used to alias a flapping state
+            # away entirely whenever the step kept landing on one phase of the flap, leaving the
+            # chart asserting a single multi-day run that the history table flatly contradicted.
+            # Only transitions produce a range, so an entity that rarely changes stays cheap.
+            ranges = []
+            current_state = None
+            start_time = None
+            last_timestamp_ms = None
+
+            for timestamp_ms, state in sorted_items:
+                all_states.add(state)
+                last_timestamp_ms = timestamp_ms
+
+                if current_state is None:
+                    # First point
+                    current_state = state
+                    start_time = timestamp_ms
+                elif current_state != state:
+                    # State changed, save previous range and start new one
+                    if start_time is not None:
+                        ranges.append({"x": entity_name, "y": [start_time, timestamp_ms], "fillColor": self.get_state_color(current_state), "label": current_state})
+                    current_state = state
+                    start_time = timestamp_ms
+                # else: state is the same, just extend the current range (don't create duplicate)
+
+            # Add final range
+            if start_time is not None and last_timestamp_ms is not None:
+                ranges.append({"x": entity_name, "y": [start_time, last_timestamp_ms], "fillColor": self.get_state_color(current_state), "label": current_state})
+
+            # Add series for this entity
+            if not first_series:
+                text += ","
+            first_series = False
+
+            text += "\n    {\n"
+            text += f"      name: '{js_str(entity_name)}',\n"
+            text += "      data: [\n"
+
+            first_range = True
+            for range_data in ranges:
+                if not first_range:
+                    text += ","
+                first_range = False
+                text += "        {\n"
+                text += f"          x: '{js_str(range_data['x'])}',\n"
+                text += f"          y: [{range_data['y'][0]}, {range_data['y'][1]}],\n"
+                text += f"          fillColor: '{js_str(range_data['fillColor'])}',\n"
+                text += f"          label: '{js_str(range_data['label'])}'\n"
+                text += "        }\n"
+
+            text += "      ]\n"
+            text += "    }\n"
+
+        text += (
+            """
+  ],
+  xaxis: {
+    type: 'datetime',
+    labels: {
+      datetimeUTC: false
+    }
+  },
+  yaxis: {
+    show: true,
+    labels: {
+      style: {
+        fontSize: '14px'
+      }
+    }
+  },
+  tooltip: {
+    custom: function({ seriesIndex, dataPointIndex, w }) {
+      var data = w.config.series[seriesIndex].data[dataPointIndex];
+      var start = new Date(data.y[0]);
+      var end = new Date(data.y[1]);
+      var duration = (data.y[1] - data.y[0]) / (1000 * 60); // minutes
+
+      return '<div style="padding: 10px;">' +
+        '<strong>' + data.x + '</strong><br/>' +
+        'State: <strong>' + data.label + '</strong><br/>' +
+        'From: ' + start.toLocaleString() + '<br/>' +
+        'To: ' + end.toLocaleString() + '<br/>' +
+        'Duration: ' + duration.toFixed(0) + ' minutes' +
+        '</div>';
+    }
+  },
+  legend: {
+    show: false
+  },
+  dataLabels: {
+    enabled: true,
+    formatter: function(val, opts) {
+      var label = opts.w.config.series[opts.seriesIndex].data[opts.dataPointIndex].label;
+      return label;
+    },
+    style: {
+      colors: ['#fff'],
+      fontSize: '14px',
+      fontWeight: 'bold'
+    }
+  }
+};
+
+var chart = new ApexCharts(document.getElementById('"""
+            + tagname
+            + """'), options);
+chart.render();
+</script>
+"""
+        )
+
+        return text
+
+    def get_state_color(self, state):
+        """
+        Get a color for a given state value
+        """
+        state_lower = str(state).lower()
+
+        # Common state colors
+        color_map = {
+            "on": "#4CAF50",  # Green
+            "off": "#9E9E9E",  # Gray
+            "true": "#4CAF50",  # Green
+            "false": "#9E9E9E",  # Gray
+            "open": "#FF9800",  # Orange
+            "closed": "#2196F3",  # Blue
+            "active": "#4CAF50",  # Green
+            "inactive": "#9E9E9E",  # Gray
+            "home": "#4CAF50",  # Green
+            "away": "#FF9800",  # Orange
+            "charging": "#FFC107",  # Amber
+            "discharging": "#03A9F4",  # Light Blue
+            "idle": "#9E9E9E",  # Gray
+        }
+
+        if state_lower in color_map:
+            return color_map[state_lower]
+
+        # Generate a color based on hash of the state string
+        hash_val = sum(ord(c) for c in str(state))
+        hue = (hash_val * 137) % 360  # Use golden angle for better distribution
+        return "hsl({}, 65%, 50%)".format(hue)
 
     async def html_api_get_log(self, request):
         """
@@ -1101,9 +2350,6 @@ var options = {
             """
             if not search_term or not text:
                 return text
-
-            import re
-            import html as html_module
 
             # Create case-insensitive pattern for the original text
             pattern = re.compile(re.escape(search_term), re.IGNORECASE)
@@ -1127,20 +2373,11 @@ var options = {
             return "".join(result_parts)
 
         try:
-            logfile = "predbat.log"
-            logfile_1 = "predbat.1.log"
-            logdata = ""
-
-            if os.path.exists(logfile):
-                with open(logfile, "r") as f:
-                    logdata = f.read()
-            if os.path.exists(logfile_1):
-                with open(logfile_1, "r") as f:
-                    logdata = f.read() + "\n" + logdata
+            logdata = read_predbat_log()
 
             # Get query parameters
             args = request.query
-            filter_type = args.get("filter", "warnings")  # all, warnings, errors
+            filter_type = args.get("filter", "warnings")  # all, info, warnings, errors
             since_line = int(args.get("since", 0))  # Line number to start from
             max_lines = int(args.get("max_lines", 1024))  # Maximum lines to return
             search_term = args.get("search", "").lower().strip()  # Search term
@@ -1164,19 +2401,10 @@ var options = {
                     lineno -= 1
                     continue
 
-                # Apply log level filtering first
-                include_line = False
-                line_type = "info"
-
-                if "error" in line_lower:
-                    line_type = "error"
-                    include_line = True
-                elif "warn" in line_lower:
-                    line_type = "warning"
-                    include_line = filter_type in ["all", "warnings"]
-                else:
-                    line_type = "info"
-                    include_line = filter_type == "all"
+                # Apply log level filtering first - shared with the get_log MCP tool so the
+                # two views of the same log can't drift apart (#4768)
+                line_type = classify_log_line(line)
+                include_line = log_line_included(line_type, filter_type)
 
                 # Apply search filter if search term is provided
                 if include_line and search_term:
@@ -1200,8 +2428,6 @@ var options = {
                         highlighted_full_line = highlight_search_term(line, search_term)
                     else:
                         # Escape HTML characters even when no search highlighting
-                        import html as html_module
-
                         highlighted_timestamp = html_module.escape(start_line)
                         highlighted_message = html_module.escape(rest_line)
                         highlighted_full_line = html_module.escape(line)
@@ -1242,7 +2468,7 @@ var options = {
         JSON API
         """
         json_data = await request.json()
-        entity_id = json.get("entity_id", None)
+        entity_id = json_data.get("entity_id", None)
         state = json_data.get("state", None)
         attributes = json_data.get("attributes", {})
         if entity_id:
@@ -1250,6 +2476,24 @@ var options = {
             return web.Response(content_type="application/json", text='{"result": "ok"}')
         else:
             return web.Response(content_type="application/json", text='{"result": "error"}')
+
+    async def html_api_get_status(self, request):
+        """
+        Get current Predbat status (calculating state and battery info)
+        """
+        try:
+            calculating = self.get_arg("active", False)
+            if self.base.update_pending:
+                calculating = True
+
+            battery_icon = self.get_battery_status_icon()
+
+            status_data = {"calculating": calculating, "battery_html": battery_icon}
+
+            return web.Response(content_type="application/json", text=json.dumps(status_data))
+        except Exception as e:
+            self.log("Error getting status: {}".format(e))
+            return web.Response(status=500, content_type="application/json", text=json.dumps({"error": str(e)}))
 
     async def html_api_ping(self, request):
         """
@@ -1293,307 +2537,193 @@ var options = {
         else:
             return web.Response(content_type="application/json", text='{"result": "error"}')
 
+    async def html_api_plan_data(self, request):
+        """
+        JSON API - Return plan data for all three views
+        Supports conditional fetch: if client's last_received is newer than all server data, returns {unchanged: true}
+        """
+        # Get client's newest data timestamp from query parameters
+        client_newest_timestamp = request.rel_url.query.get("newest_timestamp")
+        client_overrides_hash = request.rel_url.query.get("overrides_hash")
+
+        # Fetch plan data
+        plan_entity = self.prefix + ".plan_html"
+        yesterday_entity = self.prefix + ".cost_yesterday"
+        baseline_entity = self.prefix + ".savings_yesterday_predbat"
+
+        # Get JSON data (with timestamps embedded in the JSON)
+        plan_json = self.get_state_wrapper(entity_id=plan_entity, attribute="raw", default=None)
+        plan_timestamp = plan_json.get("timestamp", None) if plan_json else None
+
+        yesterday_json = self.get_state_wrapper(entity_id=yesterday_entity, attribute="json", default=None)
+        yesterday_timestamp = yesterday_json.get("timestamp", None) if yesterday_json else None
+
+        baseline_json = self.get_state_wrapper(entity_id=baseline_entity, attribute="json", default=None)
+        baseline_timestamp = baseline_json.get("timestamp", None) if baseline_json else None
+
+        # Get current manual overrides
+        # Read-only: these run on the web server's own thread, so writing the decoded
+        # selection back could persist times captured mid-recompute (#4900)
+        manual_charge_times = self.base.manual_times("manual_charge", update=False)
+        manual_export_times = self.base.manual_times("manual_export", update=False)
+        manual_freeze_charge_times = self.base.manual_times("manual_freeze_charge", update=False)
+        manual_freeze_export_times = self.base.manual_times("manual_freeze_export", update=False)
+        manual_demand_times = self.base.manual_times("manual_demand", update=False)
+        manual_import_rates = self.base.manual_rates("manual_import_rates", update=False)
+        manual_export_rates = self.base.manual_rates("manual_export_rates", update=False)
+        manual_load_adjust = self.base.manual_rates("manual_load_adjust", update=False)
+        manual_soc_keep = self.base.manual_rates("manual_soc", update=False)
+        manual_soc_max_keep = self.base.manual_rates("manual_soc_max", update=False)
+
+        # Convert manual rates dicts to list format for JavaScript
+        manual_import_rates_list = [{"minutes": k, "rate": v} for k, v in manual_import_rates.items()]
+        manual_export_rates_list = [{"minutes": k, "rate": v} for k, v in manual_export_rates.items()]
+        manual_load_adjust_list = [{"minutes": k, "adjustment": v} for k, v in manual_load_adjust.items()]
+        manual_soc_list = [{"minutes": k, "target": v} for k, v in manual_soc_keep.items()]
+        manual_soc_max_list = [{"minutes": k, "target": v} for k, v in manual_soc_max_keep.items()]
+
+        # Build overrides object
+        overrides = {
+            "manual_charge_times": manual_charge_times,
+            "manual_export_times": manual_export_times,
+            "manual_freeze_charge_times": manual_freeze_charge_times,
+            "manual_freeze_export_times": manual_freeze_export_times,
+            "manual_demand_times": manual_demand_times,
+            "manual_import_rates": manual_import_rates_list,
+            "manual_export_rates": manual_export_rates_list,
+            "manual_load_adjust": manual_load_adjust_list,
+            "manual_soc": manual_soc_list,
+            "manual_soc_max": manual_soc_max_list,
+        }
+
+        # Calculate hash of overrides for change detection
+        overrides_json = json.dumps(overrides, sort_keys=True)
+        overrides_hash = hashlib.md5(overrides_json.encode()).hexdigest()
+
+        # Find the newest timestamp among all data sources
+        newest_timestamp = None
+        for ts in [plan_timestamp, yesterday_timestamp, baseline_timestamp]:
+            if ts:
+                if newest_timestamp is None or ts > newest_timestamp:
+                    newest_timestamp = ts
+
+        # Check if data has changed - compare client's newest timestamp with server's newest
+        data_unchanged = False
+        if client_newest_timestamp and newest_timestamp:
+            # Client has data and server has data - compare timestamps
+            # If client's newest is >= server's newest, and overrides match, nothing changed
+            timestamp_match = client_newest_timestamp >= newest_timestamp
+            overrides_match = client_overrides_hash == overrides_hash
+            data_unchanged = timestamp_match and overrides_match
+        elif not newest_timestamp:
+            # No server data available yet
+            data_unchanged = True
+
+        if data_unchanged:
+            return web.json_response({"unchanged": True, "overrides_hash": overrides_hash})
+
+        # Build full response with data
+        response_data = {"unchanged": False, "plan": plan_json, "yesterday": yesterday_json, "baseline": baseline_json, "overrides": overrides, "overrides_hash": overrides_hash}
+
+        return web.json_response(response_data)
+
     async def html_plan(self, request):
         """
-        Return the Predbat plan as an HTML page
+        Return the Predbat plan as an HTML page with client-side JSON rendering
         """
         self.default_page = "./plan"
 
-        # Get the view parameter from the request
-        args = request.query
-        view = args.get("view", "plan")  # Default to 'plan' view
+        # Disable page refresh - JavaScript will handle updates
+        text = self.get_header("Predbat Plan", refresh=5 * 60)  # Set a long refresh interval just in case, but JS will handle it
 
-        text = self.get_header("Predbat Plan", refresh=30)
-
-        if not self.base.dashboard_index:
-            text += "<body>"
-            text += "<h2>Loading please wait...</h2>"
-            text += "</body></html>\n"
-            return web.Response(content_type="text/html", text=text)
-
-        """ The table html_plan is already generated in the base class and is in the format
-        <table><tr><tr><th><b>Time</b></th><th><b>Import p (w/loss)</b></th><th><b>Export p (w/loss)</b></th><th colspan=2><b>State</b></th><th><b>Limit %</b></th><th><b>PV kWh (10%)</b></th><th><b>Load kWh (10%)</b></th><th><b>Clip kWh</b></th><th><b>XLoad kWh</b></th><th><b>Car kWh</b></th><th><b>SoC %</b></th><th><b>Cost</b></th><th><b>Total</b></th><th><b>CO2 g/kWh</b></th><th><b>CO2 kg</b></th></tr><tr style="color:black"><td bgcolor=#FFFFFF>Sun 16:00</td><td style="padding: 4px;" bgcolor=#3AEE85><b>7.00 (7.52)</b> </td><td style="padding: 4px;" bgcolor=#FFFFAA>15.00 (13.97) </td><td colspan=2 style="padding: 4px;" bgcolor=#3AEE85>Chrg&nearr;</td><td bgcolor=#FFFFFF> 95 (95)</td><td bgcolor=#FFAAAA>0.83 (0.45)&#9728;</td><td bgcolor=#FFFF00>0.47 (0.57)</td><td bgcolor=#FFFFFF>&#9866;</td><td bgcolor=#FFFF00>0.42</td><td bgcolor=FFFF00>3.84</td><td bgcolor=#3AEE85>92&nearr;</td><td bgcolor=#F18261>+26 p  &nearr;</td><td bgcolor=#FFFFFF>&#163;1.06</td><td bgcolor=#90EE90>57 </td><td bgcolor=#FFAA00> 3.39 &nearr; </td></tr>
-        <tr style="color:black"><td bgcolor=#FFFFFF>Sun 16:30</td><td style="padding: 4px;" bgcolor=#3AEE85><b>7.00 (7.52)</b> </td><td style="padding: 4px;" bgcolor=#FFFFAA>15.00 (13.97) </td><td colspan=2 style="padding: 4px;" rowspan=2 bgcolor=#EEEEEE>FrzChrg&rarr;</td><td rowspan=2 bgcolor=#FFFFFF> 95 (4)</td><td bgcolor=#FFAAAA>0.84 (0.46)&#9728;</td><td bgcolor=#F18261>0.54 (0.64)</td><td bgcolor=#FFFFFF>&#9866;</td><td bgcolor=#FFFF00>0.47</td><td bgcolor=FFFF00>3.84</td><td bgcolor=#3AEE85>95&rarr;</td><td bgcolor=#F18261>+24 p  &nearr;</td><td bgcolor=#FFFFFF>&#163;1.33</td><td bgcolor=#90EE90>60 </td><td bgcolor=#FFAA00> 3.6 &nearr; </td></tr>
-        </table>
-        """
+        # Add CSS
         text += get_plan_css()
 
+        # Add warning/error divs
+        text += '<div id="staleWarning" style="display:none; padding:10px; background:#fff3cd; color:#856404; border:1px solid #ffc107; margin-bottom:10px;">&#9888;&#65039; Plan data is stale (last updated >15 minutes ago)</div>'
+        text += '<div id="planError" style="display:none; padding:10px; background:#fee; color:#c00; border:1px solid #c00; margin-bottom:10px;"></div>'
+
         # Add view switcher buttons
-        text += '<div style="margin-bottom: 15px; display: flex; gap: 8px;">'
-
-        # Determine active button styling
-        plan_active = "background-color: #4CAF50; color: white;" if view == "plan" else "background-color: #f0f0f0; color: black;"
-        yesterday_active = "background-color: #4CAF50; color: white;" if view == "yesterday" else "background-color: #f0f0f0; color: black;"
-        baseline_active = "background-color: #4CAF50; color: white;" if view == "baseline" else "background-color: #f0f0f0; color: black;"
-
-        text += f'<a href="./plan?view=plan" style="padding: 6px 12px; text-decoration: none; border-radius: 3px; font-size: 14px; border: 1px solid #ddd; {plan_active}">Plan</a>'
-        text += f'<a href="./plan?view=yesterday" style="padding: 6px 12px; text-decoration: none; border-radius: 3px; font-size: 14px; border: 1px solid #ddd; {yesterday_active}">History</a>'
-        text += f'<a href="./plan?view=baseline" style="padding: 6px 12px; text-decoration: none; border-radius: 3px; font-size: 14px; border: 1px solid #ddd; {baseline_active}">Yesterday Without Predbat</a>'
+        text += '<div style="margin-bottom: 15px; display: flex; gap: 8px; align-items: center;">'
+        text += '<button class="view-button" data-view="plan" onclick="switchView(\'plan\')" style="padding: 6px 12px; border-radius: 3px; font-size: 14px; border: 1px solid #ddd; background-color: #4CAF50; color: white; cursor: pointer;">Plan</button>'
+        text += '<button class="view-button" data-view="yesterday" onclick="switchView(\'yesterday\')" style="padding: 6px 12px; border-radius: 3px; font-size: 14px; border: 1px solid #ddd; background-color: #f0f0f0; color: black; cursor: pointer;">History</button>'
+        text += '<button class="view-button" data-view="baseline" onclick="switchView(\'baseline\')" style="padding: 6px 12px; border-radius: 3px; font-size: 14px; border: 1px solid #ddd; background-color: #f0f0f0; color: black; cursor: pointer;">Yesterday Without Predbat</button>'
+        text += '<span id="planTimestamp" style="margin-left: 16px; font-size: 13px; color: #666;"></span>'
+        text += '<label id="debugToggleLabel" style="margin-left: auto;"><input type="checkbox" id="debugToggle" onchange="onDebugToggleChange()"> Show Debug</label>'
         text += "</div>"
 
-        # Select the appropriate HTML plan based on the view
-        if view == "yesterday":
-            html_plan = self.get_state_wrapper(entity_id=self.prefix + ".cost_yesterday", attribute="html", default="<p>No yesterday plan available</p>")
-            # Don't process buttons for yesterday view - just display the plan
-            text += html_plan + "</body></html>\n"
-            return web.Response(content_type="text/html", text=text)
-        elif view == "baseline":
-            html_plan = self.get_state_wrapper(entity_id=self.prefix + ".savings_yesterday_predbat", attribute="html", default="<p>No baseline plan available</p>")
-            # Don't process buttons for baseline view - just display the plan
-            text += html_plan + "</body></html>\n"
-            return web.Response(content_type="text/html", text=text)
-        else:
-            # Default to plan view with editing capabilities
-            html_plan = self.get_state_wrapper(entity_id=self.prefix + ".plan_html", attribute="html", default="<p>No plan available</p>")
+        # Add plan container
+        text += '<div id="planContainer"></div>'
 
-        # Process HTML table to add buttons to time cells (only for plan view)
-        # Regular expression to find time cells in the table
-        time_pattern = r"<td id=time.*?>((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{2}:\d{2})</td>"
-        import_pattern = r"<td id=import data-minute=(\S+) data-rate=(\S+)(.*?)>(.*?)</td>"
-        export_pattern = r"<td id=export data-minute=(\S+) data-rate=(\S+)(.*?)>(.*?)</td>"
-        load_pattern = r"<td id=load data-minute=(\S+) (.*?)>(.*?)</td>"
-        soc_pattern = r"<td id=soc data-minute=(\S+)(.*?)>(.*?)</td>"
+        # Fetch all three JSON datasets
+        plan_json = self.get_state_wrapper(entity_id=self.prefix + ".plan_html", attribute="raw", default=None)
+        yesterday_json = self.get_state_wrapper(entity_id=self.prefix + ".cost_yesterday", attribute="json", default=None)
+        baseline_json = self.get_state_wrapper(entity_id=self.prefix + ".savings_yesterday_predbat", attribute="json", default=None)
 
-        # Counter for creating unique IDs for dropdowns
-        dropdown_counter = 0
+        # Fetch override data
+        # Read-only: these run on the web server's own thread, so writing the decoded
+        # selection back could persist times captured mid-recompute (#4900)
+        manual_charge_times = self.base.manual_times("manual_charge", update=False)
+        manual_export_times = self.base.manual_times("manual_export", update=False)
+        manual_freeze_charge_times = self.base.manual_times("manual_freeze_charge", update=False)
+        manual_freeze_export_times = self.base.manual_times("manual_freeze_export", update=False)
+        manual_demand_times = self.base.manual_times("manual_demand", update=False)
+        manual_import_rates = self.base.manual_rates("manual_import_rates", update=False)
+        manual_export_rates = self.base.manual_rates("manual_export_rates", update=False)
+        manual_load_adjust = self.base.manual_rates("manual_load_adjust", update=False)
+        manual_soc_keep = self.base.manual_rates("manual_soc", update=False)
+        manual_soc_max_keep = self.base.manual_rates("manual_soc_max", update=False)
 
-        manual_charge_times = self.base.manual_times("manual_charge")
-        manual_export_times = self.base.manual_times("manual_export")
-        manual_freeze_charge_times = self.base.manual_times("manual_freeze_charge")
-        manual_freeze_export_times = self.base.manual_times("manual_freeze_export")
-        manual_demand_times = self.base.manual_times("manual_demand")
-        manual_all_times = manual_charge_times + manual_export_times + manual_demand_times + manual_freeze_charge_times + manual_freeze_export_times
-        manual_import_rates = self.base.manual_rates("manual_import_rates")
-        manual_export_rates = self.base.manual_rates("manual_export_rates")
-        manual_load_adjust = self.base.manual_rates("manual_load_adjust")
-        manual_soc_keep = self.base.manual_rates("manual_soc")
+        # Convert manual rates dicts to list format for JavaScript
+        manual_import_rates_list = [{"minutes": k, "rate": v} for k, v in manual_import_rates.items()]
+        manual_export_rates_list = [{"minutes": k, "rate": v} for k, v in manual_export_rates.items()]
+        manual_load_adjust_list = [{"minutes": k, "adjustment": v} for k, v in manual_load_adjust.items()]
+        manual_soc_list = [{"minutes": k, "target": v} for k, v in manual_soc_keep.items()]
+        manual_soc_max_list = [{"minutes": k, "target": v} for k, v in manual_soc_max_keep.items()]
 
-        # Function to replace time cells with cells containing dropdowns
-        def add_button_to_time(match):
-            nonlocal dropdown_counter
-            time_text = match.group(1)
-            dropdown_id = f"dropdown_{dropdown_counter}"
-            dropdown_counter += 1
+        # Build overrides object
+        overrides = {
+            "manual_charge_times": manual_charge_times,
+            "manual_export_times": manual_export_times,
+            "manual_freeze_charge_times": manual_freeze_charge_times,
+            "manual_freeze_export_times": manual_freeze_export_times,
+            "manual_demand_times": manual_demand_times,
+            "manual_import_rates": manual_import_rates_list,
+            "manual_export_rates": manual_export_rates_list,
+            "manual_load_adjust": manual_load_adjust_list,
+            "manual_soc": manual_soc_list,
+            "manual_soc_max": manual_soc_max_list,
+        }
 
-            now_utc = self.now_utc
-            time_stamp = get_override_time_from_string(now_utc, time_text, self.plan_interval_minutes)
-            if time_stamp is None:
-                return match.group(0)
+        # Calculate hash of overrides for change detection
+        overrides_json = json.dumps(overrides, sort_keys=True)
+        overrides_hash = hashlib.md5(overrides_json.encode()).hexdigest()
 
-            minutes_from_midnight = (time_stamp - self.midnight_utc).total_seconds() / 60
-            in_override = False
-            cell_bg_color = "#FFFFFF"
-            override_class = ""
-            if minutes_from_midnight in manual_charge_times:
-                in_override = True
-                cell_bg_color = "#3AEE85"  # Matches auto charging green
-                override_class = "override-charge"
-            elif minutes_from_midnight in manual_export_times:
-                in_override = True
-                cell_bg_color = "#FFFF00"  # Matches export yellow
-                override_class = "override-export"
-            elif minutes_from_midnight in manual_demand_times:
-                in_override = True
-                cell_bg_color = "#F18261"  # Matches high-cost demand red
-                override_class = "override-demand"
-            elif minutes_from_midnight in manual_freeze_charge_times:
-                in_override = True
-                cell_bg_color = "#C0C0C0"  # Matches freeze charging grey
-                override_class = "override-freeze-charge"
-            elif minutes_from_midnight in manual_freeze_export_times:
-                in_override = True
-                cell_bg_color = "#AAAAAA"  # Matches freeze exporting dark grey
-                override_class = "override-freeze-export"
+        # Embed initial data in script tags
+        text += "<script>"
+        text += f"window.planData = {json.dumps(plan_json)};"
+        text += f"window.yesterdayData = {json.dumps(yesterday_json)};"
+        text += f"window.baselineData = {json.dumps(baseline_json)};"
+        text += f"window.overridesData = {json.dumps(overrides)};"
+        text += f"window.overridesHash = {json.dumps(overrides_hash)};"
+        text += "</script>"
 
-            # Create clickable cell and dropdown HTML
-            button_html = f"""<td bgcolor={cell_bg_color} onclick="toggleForceDropdown('{dropdown_id}')" class="clickable-time-cell {override_class}">
-                {time_text}
-                <div class="dropdown">
-                    <div id="{dropdown_id}" class="dropdown-content">
-            """
+        # Include renderer JavaScript (which declares newestDataTimestamp variable)
+        text += get_plan_renderer_js()
 
-            if minutes_from_midnight in manual_all_times:
-                button_html += f"""<a onclick="handleTimeOverride('{time_text}', 'Clear')">Clear</a>"""
-            if minutes_from_midnight not in manual_demand_times:
-                button_html += f"""<a onclick="handleTimeOverride('{time_text}', 'Manual Demand')">Manual Demand</a>"""
-            if minutes_from_midnight not in manual_charge_times:
-                button_html += f"""<a onclick="handleTimeOverride('{time_text}', 'Manual Charge')">Manual Charge</a>"""
-            if minutes_from_midnight not in manual_export_times:
-                button_html += f"""<a onclick="handleTimeOverride('{time_text}', 'Manual Export')">Manual Export</a>"""
-            if minutes_from_midnight not in manual_freeze_charge_times:
-                button_html += f"""<a onclick="handleTimeOverride('{time_text}', 'Manual Freeze Charge')">Manual Freeze Charge</a>"""
-            if minutes_from_midnight not in manual_freeze_export_times:
-                button_html += f"""<a onclick="handleTimeOverride('{time_text}', 'Manual Freeze Export')">Manual Freeze Export</a>"""
-            button_html += f"""
-                    </div>
-                </div>
-            </td>"""
+        # Initialise newestDataTimestamp from the initial data loaded, and start automatic updates
+        text += "<script>"
+        text += "// Find newest timestamp from initial data\n"
+        text += "const initialTimestamps = [];\n"
+        text += "if (window.planData && window.planData.timestamp) initialTimestamps.push(window.planData.timestamp);\n"
+        text += "if (window.yesterdayData && window.yesterdayData.timestamp) initialTimestamps.push(window.yesterdayData.timestamp);\n"
+        text += "if (window.baselineData && window.baselineData.timestamp) initialTimestamps.push(window.baselineData.timestamp);\n"
+        text += "if (initialTimestamps.length > 0) newestDataTimestamp = initialTimestamps.reduce((a, b) => a > b ? a : b);\n"
+        text += "window.addEventListener('load', function() { updateTimestampDisplay(); startPlanUpdates(); });\n"
+        text += "window.addEventListener('resize', adjustResponsiveSizes);\n"
+        text += "</script>"
 
-            return button_html
-
-        def add_button_to_export(match):
-            return add_button_to_import(match, is_import=False)
-
-        def add_button_to_import(match, is_import=True):
-            """
-            Add import rate button to import cells
-            """
-            nonlocal dropdown_counter
-            dropdown_id = f"dropdown_{dropdown_counter}"
-            input_id = f"rate_input_{dropdown_counter}"
-            dropdown_counter += 1
-
-            import_minute = match.group(1)
-            import_rate = match.group(2).strip()
-            import_tag = match.group(3).strip()
-            import_rate_text = match.group(4).strip()
-            import_minute_to_time = self.midnight_utc + timedelta(minutes=int(import_minute))
-            import_minute_str = import_minute_to_time.strftime("%a %H:%M")
-            override_active = False
-            if is_import:
-                if int(import_minute) in manual_import_rates:
-                    override_active = True
-                    import_rate = manual_import_rates[int(import_minute)]
-            elif int(import_minute) in manual_export_rates:
-                override_active = True
-                import_rate = manual_export_rates[int(import_minute)]
-
-            button_html = f"""<td {import_tag} class="clickable-time-cell {'override-active' if override_active else ''}" onclick="toggleForceDropdown('{dropdown_id}')">
-                {import_rate_text}
-                <div class="dropdown">
-                    <div id="{dropdown_id}" class="dropdown-content">
-            """
-            if override_active:
-                action = "Clear Import" if is_import else "Clear Export"
-                button_html += f"""<a onclick="handleRateOverride('{import_minute_str}', '{import_rate}', '{action}', true)">{action}</a>"""
-            else:
-                # Add input field for custom rate entry
-                default_rate = self.get_arg("manual_import_value", 0.0) if is_import else self.get_arg("manual_export_value", 0.0)
-                action = "Set Import" if is_import else "Set Export"
-                button_html += f"""
-                    <div style="padding: 12px 16px;">
-                        <label style="display: block; margin-bottom: 5px; color: inherit;">{action} {import_minute_str} Rate:</label>
-                        <input type="number" id="{input_id}" step="0.1" value="{default_rate}"
-                               style="width: 80px; padding: 4px; margin-bottom: 8px; border-radius: 3px;">
-                        <br>
-                        <button onclick="handleRateOverride('{import_minute_str}', document.getElementById('{input_id}').value, '{action}', false)"
-                                style="padding: 6px 12px; border-radius: 3px; font-size: 12px;">
-                            Set Rate
-                        </button>
-                    </div>
-                """
-            button_html += f"""
-                    </div>
-                </div>
-            </td>"""
-
-            return button_html
-
-        def add_button_to_load(match):
-            """
-            Add load rate button to load cells
-            """
-            nonlocal dropdown_counter
-            dropdown_id = f"dropdown_{dropdown_counter}"
-            input_id = f"load_input_{dropdown_counter}"
-            dropdown_counter += 1
-
-            load_minute = match.group(1)
-            load_tag = match.group(2).strip()
-            load_text = match.group(3).strip()
-            load_minute_to_time = self.midnight_utc + timedelta(minutes=int(load_minute))
-            load_minute_str = load_minute_to_time.strftime("%a %H:%M")
-            override_active = False
-            if int(load_minute) in manual_load_adjust:
-                override_active = True
-                load_adjust = manual_load_adjust[int(load_minute)]
-
-            button_html = f"""<td {load_tag} class="clickable-time-cell {'override-active' if override_active else ''}" onclick="toggleForceDropdown('{dropdown_id}')">
-                {load_text}
-                <div class="dropdown">
-                    <div id="{dropdown_id}" class="dropdown-content">
-            """
-            if override_active:
-                action = "Clear Load"
-                button_html += f"""<a onclick="handleLoadOverride('{load_minute_str}', '{load_adjust}', '{action}', true)">{action}</a>"""
-            else:
-                # Add input field for custom rate entry
-                default_adjust = self.get_arg("manual_load_value", 0.0)
-                action = "Set Load"
-                button_html += f"""
-                    <div style="padding: 12px 16px;">
-                        <label style="display: block; margin-bottom: 5px; color: inherit;">{action} {load_minute_str} Adjustment:</label>
-                        <input type="number" id="{input_id}" step="0.1" value="{default_adjust}"
-                               style="width: 80px; padding: 4px; margin-bottom: 8px; border-radius: 3px;">
-                        <br>
-                        <button onclick="handleLoadOverride('{load_minute_str}', document.getElementById('{input_id}').value, '{action}', false)"
-                                style="padding: 6px 12px; border-radius: 3px; font-size: 12px;">
-                            Set Load Adjustment
-                        </button>
-                    </div>
-                """
-            button_html += f"""
-                    </div>
-                </div>
-            </td>"""
-
-            return button_html
-
-        def add_button_to_soc(match):
-            """
-            Add SOC button to limit cells
-            """
-            nonlocal dropdown_counter
-            dropdown_id = f"dropdown_{dropdown_counter}"
-            input_id = f"soc_input_{dropdown_counter}"
-            dropdown_counter += 1
-
-            soc_minute = match.group(1)
-            soc_tag = match.group(2).strip()
-            soc_text = match.group(3).strip()
-            soc_minute_to_time = self.midnight_utc + timedelta(minutes=int(soc_minute))
-            soc_minute_str = soc_minute_to_time.strftime("%a %H:%M")
-            soc_target = manual_soc_keep.get(int(soc_minute), 0)
-
-            button_html = f"""<td {soc_tag} class="clickable-time-cell {'override-active' if soc_target > 0 else ''}" onclick="toggleForceDropdown('{dropdown_id}')">
-                {soc_text}
-                <div class="dropdown">
-                    <div id="{dropdown_id}" class="dropdown-content">
-            """
-            if soc_target > 0:
-                action = "Clear SOC"
-                button_html += f"""<a onclick="handleSocOverride('{soc_minute_str}', '{soc_target}', '{action}', true)">{action}</a>"""
-            else:
-                # Add input field for custom SOC entry
-                default_soc = self.get_arg("manual_soc_value", 100)
-                action = "Set SOC"
-                button_html += f"""
-                    <div style="padding: 12px 16px;">
-                        <label style="display: block; margin-bottom: 5px; color: inherit;">{action} {soc_minute_str} Target (%):</label>
-                        <input type="number" id="{input_id}" step="1" min="0" max="100" value="{default_soc}"
-                               style="width: 80px; padding: 4px; margin-bottom: 8px; border-radius: 3px;">
-                        <br>
-                        <button onclick="handleSocOverride('{soc_minute_str}', document.getElementById('{input_id}').value, '{action}', false)"
-                                style="padding: 6px 12px; border-radius: 3px; font-size: 12px;">
-                            Set SOC Target
-                        </button>
-                    </div>
-                """
-            button_html += f"""
-                    </div>
-                </div>
-            </td>"""
-
-            return button_html
-
-        # Process the HTML plan to add buttons to time cells
-        processed_html = re.sub(time_pattern, add_button_to_time, html_plan)
-        processed_html = re.sub(import_pattern, add_button_to_import, processed_html)
-        processed_html = re.sub(export_pattern, add_button_to_export, processed_html)
-        processed_html = re.sub(load_pattern, add_button_to_load, processed_html)
-        processed_html = re.sub(soc_pattern, add_button_to_soc, processed_html)
-
-        text += processed_html + "</body></html>\n"
+        text += "</body></html>\n"
         return web.Response(content_type="text/html", text=text)
 
     async def html_log(self, request):
@@ -1606,6 +2736,7 @@ var options = {
         args = request.query
         errors = False
         warnings = False
+        info = False
 
         if "errors" in args or (not args and self.default_log == "errors"):
             errors = True
@@ -1613,9 +2744,12 @@ var options = {
         elif "warnings" in args or (not args and self.default_log == "warnings"):
             warnings = True
             self.default_log = "warnings"
+        elif "info" in args or (not args and self.default_log == "info"):
+            info = True
+            self.default_log = "info"
         elif "all" in args or (not args and self.default_log == "all"):
             self.default_log = "all"
-        else:
+        else:  # if no log type parameter specified, open in warnings tab by default
             self.default_log = "warnings"
             warnings = True
 
@@ -1626,16 +2760,25 @@ var options = {
 
         if errors:
             active_all = ""
+            active_info = ""
             active_warnings = ""
             active_errors = "active"
             filter_type = "errors"
         elif warnings:
             active_all = ""
+            active_info = ""
             active_warnings = "active"
             active_errors = ""
             filter_type = "warnings"
+        elif info:
+            active_all = ""
+            active_info = "active"
+            active_warnings = ""
+            active_errors = ""
+            filter_type = "info"
         else:
             active_all = "active"
+            active_info = ""
             active_warnings = ""
             active_errors = ""
             filter_type = "all"
@@ -1643,6 +2786,7 @@ var options = {
         text += '<div class="log-menu">'
         text += "<h3>Logfile</h3> "
         text += f'<a href="./log?all" class="{active_all}">All</a>'
+        text += f'<a href="./log?info" class="{active_info}">Info</a>'
         text += f'<a href="./log?warnings" class="{active_warnings}">Warnings</a>'
         text += f'<a href="./log?errors" class="{active_errors}">Errors</a>'
         text += '<a href="./debug_log">Download</a>'
@@ -1692,9 +2836,26 @@ var options = {
                 new_value = float(new_value)
 
             self.log("Web interface setting {} to {}".format(pitem, new_value))
-            await self.base.ha_interface.set_state_external(pitem, new_value)
+            await self.set_state_external(pitem, new_value)
 
         raise web.HTTPFound("./config")
+
+    def render_delete_button(self, nested_row_id):
+        """
+        Render the delete button shown against a nested list item or dictionary key
+        """
+        return f'<button class="delete-button" id="delete_button_{nested_row_id}" onclick="deleteNestedValue({nested_row_id})">Delete</button>'
+
+    def render_add_row(self, function, js_args, label, row_counter):
+        """
+        Render the trailing table row holding an add button, which doubles as the anchor new rows are inserted before
+        """
+        if row_counter is None:
+            return ""
+        row_counter[0] += 1
+        anchor_id = row_counter[0]
+        args = ", ".join(["'{}'".format(html_module.escape(str(item), quote=True)) for item in js_args] + [str(anchor_id)])
+        return f"<tr id='add_anchor_{anchor_id}'><td colspan='2'></td><td><button class=\"add-button\" onclick=\"{function}({args})\">{label}</button></td></tr>\n"
 
     def render_type(self, arg, value, parent_path="", row_counter=None):
         """
@@ -1713,77 +2874,96 @@ var options = {
         """
         text = ""
         if isinstance(value, list):
+            list_path = parent_path if parent_path else arg
             text += "<table>"
             for idx, item in enumerate(value):
-                nested_path = f"{parent_path}[{idx}]" if parent_path else f"{arg}[{idx}]"
+                nested_path = f"{list_path}[{idx}]"
 
                 # Check if this list item is editable
                 can_edit = self.is_editable_value(item)
                 actions_cell = ""
+                nested_row_id = None
 
-                if can_edit and row_counter is not None:
+                if row_counter is not None:
                     row_counter[0] += 1
                     nested_row_id = row_counter[0]
 
-                    if isinstance(item, bool):
-                        toggle_class = "toggle-button active" if item else "toggle-button"
-                        actions_cell = f'<button class="{toggle_class}" onclick="toggleNestedValue({nested_row_id})" data-value="{str(item).lower()}" data-path="{nested_path}"></button>'
-                    else:
-                        actions_cell = f'<button class="edit-button" onclick="editNestedValue({nested_row_id})" data-path="{nested_path}">Edit</button>'
+                    if can_edit:
+                        if isinstance(item, bool):
+                            toggle_class = "toggle-button active" if item else "toggle-button"
+                            actions_cell = f'<button class="{toggle_class}" onclick="toggleNestedValue({nested_row_id})" data-value="{str(item).lower()}" data-path="{nested_path}"></button>'
+                        else:
+                            actions_cell = f'<button class="edit-button" onclick="editNestedValue({nested_row_id})" data-path="{nested_path}">Edit</button>'
 
-                    # Store the nested value info for later processing
-                    if not hasattr(self, "_nested_values"):
-                        self._nested_values = {}
-                    self._nested_values[nested_row_id] = {"path": nested_path, "value": item}
+                        # Store the nested value info for later processing
+                        if not hasattr(self, "_nested_values"):
+                            self._nested_values = {}
+                        self._nested_values[nested_row_id] = {"path": nested_path, "value": item}
+
+                    # Every list item can be removed, whether or not its value itself is editable
+                    actions_cell += self.render_delete_button(nested_row_id)
 
                 raw_value = self.resolve_value_raw(arg, item)
 
-                if actions_cell:
-                    text += f"<tr id='nested_row_{row_counter[0] if can_edit else 'static'}' data-nested-path='{nested_path}' data-nested-original='{html_module.escape(str(raw_value))}'><td>- </td><td id='nested_value_{row_counter[0] if can_edit else 'static'}'>{self.render_type(arg, item, nested_path, row_counter)}</td><td>{actions_cell}</td></tr>\n"
+                if nested_row_id is not None:
+                    text += f"<tr id='nested_row_{nested_row_id}' data-nested-path='{nested_path}' data-nested-original='{html_module.escape(str(raw_value))}'><td>- </td><td id='nested_value_{nested_row_id}'>{self.render_type(arg, item, nested_path, row_counter)}</td><td>{actions_cell}</td></tr>\n"
                 else:
                     text += "<tr><td>- {}</td></tr>\n".format(self.render_type(arg, item, nested_path, row_counter))
+            text += self.render_add_row("addListItem", [list_path, arg], "Add item", row_counter)
             text += "</table>"
         elif isinstance(value, dict):
+            dict_path = parent_path if parent_path else arg
             text += "<table>"
             for key in value:
-                nested_path = f"{parent_path}.{key}" if parent_path else f"{arg}.{key}"
+                nested_path = f"{dict_path}.{key}"
                 nested_value = value[key]
 
                 # Check if this nested value is editable
                 can_edit = self.is_editable_value(nested_value)
                 actions_cell = ""
+                nested_row_id = None
 
-                if can_edit and row_counter is not None:
+                if row_counter is not None:
                     row_counter[0] += 1
                     nested_row_id = row_counter[0]
 
-                    if isinstance(nested_value, bool):
-                        toggle_class = "toggle-button active" if nested_value else "toggle-button"
-                        actions_cell = f'<button class="{toggle_class}" onclick="toggleNestedValue({nested_row_id})" data-value="{str(nested_value).lower()}" data-path="{nested_path}"></button>'
-                    else:
-                        actions_cell = f'<button class="edit-button" onclick="editNestedValue({nested_row_id})" data-path="{nested_path}">Edit</button>'
+                    if can_edit:
+                        if isinstance(nested_value, bool):
+                            toggle_class = "toggle-button active" if nested_value else "toggle-button"
+                            actions_cell = f'<button class="{toggle_class}" onclick="toggleNestedValue({nested_row_id})" data-value="{str(nested_value).lower()}" data-path="{nested_path}"></button>'
+                        else:
+                            actions_cell = f'<button class="edit-button" onclick="editNestedValue({nested_row_id})" data-path="{nested_path}">Edit</button>'
 
-                    # Store the nested value info for later processing
-                    if not hasattr(self, "_nested_values"):
-                        self._nested_values = {}
-                    self._nested_values[nested_row_id] = {"path": nested_path, "value": nested_value}
+                        # Store the nested value info for later processing
+                        if not hasattr(self, "_nested_values"):
+                            self._nested_values = {}
+                        self._nested_values[nested_row_id] = {"path": nested_path, "value": nested_value}
+
+                    # Every setting can be removed, whether or not its value itself is editable
+                    actions_cell += self.render_delete_button(nested_row_id)
 
                 raw_value = self.resolve_value_raw(key, nested_value)
 
-                if actions_cell:
-                    text += f"<tr id='nested_row_{row_counter[0] if can_edit else 'static'}' data-nested-path='{nested_path}' data-nested-original='{html_module.escape(str(raw_value))}'><td><b>{key}: </b></td><td id='nested_value_{row_counter[0] if can_edit else 'static'}'>{self.render_type(key, nested_value, nested_path, row_counter)}</td><td>{actions_cell}</td></tr>\n"
+                if nested_row_id is not None:
+                    text += f"<tr id='nested_row_{nested_row_id}' data-nested-path='{nested_path}' data-nested-original='{html_module.escape(str(raw_value))}'><td><b>{key}: </b></td><td id='nested_value_{nested_row_id}'>{self.render_type(key, nested_value, nested_path, row_counter)}</td><td>{actions_cell}</td></tr>\n"
                 else:
                     text += "<tr><td><b>{}: </b></td><td colspan='2'>{}</td></tr>\n".format(key, self.render_type(key, nested_value, nested_path, row_counter))
+            text += self.render_add_row("addDictKey", [dict_path], "Add setting", row_counter)
             text += "</table>"
         elif isinstance(value, str):
             pat = re.match(r"^[a-zA-Z_]+\.\S+", value)
+            # Only try entity resolution if the schema type for this arg can be a sensor.
+            # Pure string fields (e.g. gateway_mqtt_host = "mqtt.predbat.com") must not
+            # be treated as HA entity IDs even though they contain a dot.
+            schema_type = APPS_SCHEMA.get(arg, {}).get("type", "")
+            is_pure_string = schema_type and not any(t.startswith("sensor") for t in schema_type.split("|"))
             if "{" in value:
                 text = self.base.resolve_arg(arg, value, indirect=False, quiet=True)
                 if text is None:
                     text = '<span style="background-color:#FFAAAA"> {} </p>'.format(value)
                 else:
                     text = self.render_type(arg, text, parent_path, row_counter)
-            elif pat and (arg != "service"):
+            elif pat and (arg != "service") and not is_pure_string:
                 entity_id = value
                 unit_of_measurement = ""
                 if "$" in entity_id:
@@ -1814,23 +2994,144 @@ var options = {
         Return the Predbat debug yaml data
         """
         yaml_debug = self.base.create_debug_yaml(write_file=False)
-        return await self.html_file("predbat_debug.yaml", yaml_debug)
+        return await self.html_file("predbat_debug.yaml.txt", yaml_debug)
 
-    async def html_file_load(self, filename):
+    def _storage(self):
+        """Return the Storage component, or None when it is unavailable."""
+        components = getattr(self.base, "components", None)
+        return components.get_component("storage") if components else None
+
+    async def html_debug_history_list(self, request):
+        """
+        Return the rolling debug-history snapshot index as JSON, newest-first with
+        steps_back annotated - consumed by the plan table's History/Yesterday view.
+        """
+        snapshots = await debug_history.list_snapshots(self._storage())
+        return web.json_response(debug_history.annotate_steps_back(snapshots))
+
+    async def html_debug_history_download(self, request):
+        """
+        Download one retained debug-history snapshot by id (?id=<snapshot_id>, or
+        ?id=latest / omitted for the newest one), for #4417.
+        """
+        storage = self._storage()
+        requested_id = request.query.get("id") or "latest"
+        # Resolve "latest" and load its data in one call - resolving it via load_snapshot()
+        # and then separately re-listing to find the id for the filename risks a capture
+        # landing in between, serving one snapshot's bytes under a different one's filename.
+        resolved_id, data = await debug_history.resolve_and_load_snapshot(storage, requested_id)
+        if data is None:
+            # requested_id is reflected back unescaped into an HTML response - a raw query
+            # param, so must be escaped rather than trusted.
+            return web.Response(content_type="text/html", text="Snapshot {} not found".format(html_module.escape(requested_id)), status=404)
+
+        filename = debug_history.snapshot_filename(resolved_id)
+        return await self.html_file(filename, data)
+
+    async def html_debug_history_download_recent(self, request):
+        """
+        Download the most recent DEBUG_HISTORY_DOWNLOAD_MAX retained debug-history snapshots as a
+        single gzip tarball, so a bug report can be gathered with one link instead of chasing a
+        user through the per-snapshot picker for the right moment, for #4417.
+
+        Capped rather than "all": debug_history_count reaches 500 since #5070, and the archive is
+        built by loading every snapshot into memory at once, so an unbounded bundle of whole debug
+        dumps is neither downloadable nor attachable to an issue. Older snapshots are still
+        available individually from the plan's History view, or straight off disk in debug/.
+        """
+        storage = self._storage()
+        named_snapshots = await debug_history.load_all_snapshots(storage, DEBUG_HISTORY_DOWNLOAD_MAX)
+        if not named_snapshots:
+            return web.Response(content_type="text/html", text="No debug-history snapshots found", status=404)
+
+        archive_bytes = debug_history.build_archive(named_snapshots)
+        # The trailing .dmp is load-bearing, not decoration. Browsers that unarchive downloads
+        # whose extension they recognise - on by default in more than one - turn a .tgz into a
+        # bare .tar on the way down, and that is fatal here twice over: .tar is not a file type
+        # GitHub accepts as an attachment, and a real 15-snapshot history is ~32MB expanded
+        # against a 25MB attachment limit, where the archive itself is under 5MB. Compression is
+        # doing essential work, so the download has to reach the user still compressed.
+        #
+        # There is no server-side way to decline the unarchiving - it keys on the extension, not
+        # on the content type or Content-Disposition, both of which are set correctly below and
+        # were not enough on their own. So the file is named with an extension those browsers
+        # leave alone and GitHub still accepts. The body is an ordinary gzip tarball and
+        # "tar xzf" reads it whatever it is called, so nothing needs renaming to open it.
+        return web.Response(
+            content_type="application/octet-stream",
+            body=archive_bytes,
+            headers={
+                "Content-Disposition": 'attachment; filename="predbat_debug_history.tgz.dmp"',
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    async def html_file_load(self, filename, also_file=None, as_file=None):
         """
         Load a file and serve it up
         """
         data = None
-        if os.path.exists(filename):
+        if filename and os.path.exists(filename):
             with open(filename, "r") as f:
                 data = f.read()
-        return await self.html_file(filename, data)
+        if also_file and os.path.exists(also_file):
+            with open(also_file, "r") as f:
+                data2 = f.read()
+                if data2 and data:
+                    data = data + "\n" + data2
+                elif data2:
+                    data = data2
+        return await self.html_file(as_file or filename, data)
 
     async def html_debug_log(self, request):
-        return await self.html_file_load("predbat.log")
+        # The previous log is whichever name is present - two-digit, or the single-digit one an
+        # older Predbat wrote (#5076). Hard-coding predbat.1.log here served nothing once
+        # rotation moved to the padded form.
+        return await self.html_file_load(predbat_log_file_prev(), also_file="predbat.log", as_file="predbat.log")
 
     async def html_debug_apps(self, request):
-        return await self.html_file_load("apps.yaml")
+        """
+        Return the apps.yaml file as written, with credential values redacted by default.
+
+        Masks unless ?masked=0 is passed, matching /debug_apps_live: this link sits next to that
+        one and is the file a user grabs to attach to a bug report, so a bare request - or any
+        of the plain './debug_apps' links elsewhere in the UI - must not hand over credentials.
+        Redaction is applied to the file text rather than the parsed args, so the download still
+        reads like the user's own apps.yaml, comments and '!secret' references included.
+        """
+        masked = request.query.get("masked", "1") != "0"
+        if not masked:
+            return await self.html_file_load("apps.yaml", as_file="apps.yaml.txt")
+
+        data = None
+        if os.path.exists("apps.yaml"):
+            with open("apps.yaml", "r") as f:
+                data = f.read()
+        if data:
+            try:
+                data = mask_secret_yaml_text(data)
+            except Exception as e:
+                # Fail closed - serving the raw file because the parse failed is the leak this
+                # route exists to avoid. The unmasked download is still one click away.
+                self.log("Warn: Unable to redact apps.yaml for download: {}".format(e))
+                data = "# Predbat could not parse apps.yaml to redact it, so it has not been served.\n" "# Fix the YAML error, or use the unmasked download if you intend to share credentials.\n" "# Error: {}\n".format(e)
+        return await self.html_file("apps_masked.yaml.txt", data)
+
+    async def html_debug_apps_live(self, request):
+        """
+        Return an apps.yaml reconstructed from the live in-memory settings (self.args).
+
+        Defaults to masking credential-like keys (see mask_secret_args) so a direct or
+        copied request never leaks secrets without an explicit opt-in; pass ?masked=0
+        to download the full unmasked file.
+        """
+        masked = request.query.get("masked", "1") != "0"
+        args_copy = mask_secret_args(self.args) if masked else copy.deepcopy(self.args)
+        yaml = YAML()
+        buf = StringIO()
+        yaml.dump({ROOT_YAML_KEY: args_copy}, buf)
+        filename = "apps_live_masked.yaml.txt" if masked else "apps_live.yaml.txt"
+        return await self.html_file(filename, buf.getvalue())
 
     async def html_debug_plan(self, request):
         html_plan = self.get_state_wrapper(entity_id=self.prefix + ".plan_html", attribute="html", default="<p>No plan available</p>")
@@ -1838,14 +3139,61 @@ var options = {
             html_plan = None
         return await self.html_file("predbat_plan.html", html_plan)
 
+    async def html_dash_content(self, request):
+        """
+        Return just the dashboard body content for AJAX refresh (preserves scroll position)
+        """
+        text = self.get_status_html(THIS_VERSION_DISPLAY)
+        return web.Response(content_type="text/html", text=text)
+
     async def html_dash(self, request):
         """
         Render apps.yaml as an HTML page
         """
+
         self.default_page = "./dash"
-        text = self.get_header("Predbat Dashboard", refresh=60)
+        text = self.get_header("Predbat Dashboard", refresh=0)
+        text += get_dashboard_css()
+        text += get_dashboard_collapsible_js()
+        text += """
+<script>
+(function() {
+    var DASH_REFRESH_INTERVAL = 60000; // 60 seconds
+    var dashRefreshTimer = null;
+
+    function refreshDashContent() {
+        fetch('./dash_content')
+            .then(function(response) { return response.text(); })
+            .then(function(html) {
+                var scrollX = window.scrollX;
+                var scrollY = window.scrollY;
+                var container = document.getElementById('dash-content-container');
+                if (container) {
+                    container.innerHTML = html;
+                }
+                window.scrollTo(scrollX, scrollY);
+                scheduleRefresh();
+            })
+            .catch(function() {
+                scheduleRefresh();
+            });
+    }
+
+    function scheduleRefresh() {
+        if (dashRefreshTimer) { clearTimeout(dashRefreshTimer); }
+        dashRefreshTimer = setTimeout(refreshDashContent, DASH_REFRESH_INTERVAL);
+    }
+
+    document.addEventListener('DOMContentLoaded', function() {
+        scheduleRefresh();
+    });
+})();
+</script>
+"""
         text += "<body>\n"
-        text += self.get_status_html(self.base.current_status, THIS_VERSION)
+        text += '<div id="dash-content-container">\n'
+        text += self.get_status_html(THIS_VERSION_DISPLAY)
+        text += "</div>\n"
         text += "</body></html>\n"
         return web.Response(content_type="text/html", text=text)
 
@@ -1862,12 +3210,12 @@ var options = {
                 if key == "mode":
                     # Update mode - it's a select type
                     entity_id = f"select.{self.prefix}_{key}"
-                    await self.base.ha_interface.set_state_external(entity_id, value)
-                elif key in ["debug_enable", "set_read_only"]:
+                    await self.set_state_external(entity_id, value)
+                elif key in ["debug_enable", "set_read_only", "active"]:
                     # Update switches - convert to boolean
                     entity_id = f"switch.{self.prefix}_{key}"
                     bool_value = value == "on"
-                    await self.base.ha_interface.set_state_external(entity_id, bool_value)
+                    await self.set_state_external(entity_id, bool_value)
 
             # Log the update
             self.log(f"Dashboard status updated: {dict(data)}")
@@ -1893,6 +3241,11 @@ var options = {
         soc_kw_h0[now_str] = self.base.soc_kw
         soc_kw = self.get_entity_results(self.prefix + ".soc_kw")
         soc_kw_best = self.get_entity_results(self.prefix + ".soc_kw_best")
+        # What earlier plans predicted for now, shifted forward by the horizon they were made at, so
+        # each lands on the moment it was forecasting and can be read straight against Actual.
+        soc_best_history = self.get_history_with_now_attrs(self.prefix + ".soc_kw_best", 7)
+        soc_kw_best_h1 = prune_today(history_attribute(soc_best_history, attributes=True, state_key="soc_h1"), self.now_utc, self.midnight_utc, prune=False, offset_minutes=60)
+        soc_kw_best_h8 = prune_today(history_attribute(soc_best_history, attributes=True, state_key="soc_h8"), self.now_utc, self.midnight_utc, prune=False, offset_minutes=60 * 8)
         soc_kw_best10 = self.get_entity_results(self.prefix + ".soc_kw_best10")
         soc_kw_base10 = self.get_entity_results(self.prefix + ".soc_kw_base10")
         charge_limit_kw = self.get_entity_results(self.prefix + ".charge_limit_kw")
@@ -1926,6 +3279,8 @@ var options = {
                 {"name": "Best", "data": soc_kw_best, "opacity": "1.0", "stroke_width": "4", "stroke_curve": "smooth", "color": "#eb2323"},
                 {"name": "Best10", "data": soc_kw_best10, "opacity": "1.0", "stroke_width": "2", "stroke_curve": "smooth", "color": "#cd23eb"},
                 {"name": "Actual", "data": soc_kw_h0, "opacity": "1.0", "stroke_width": "2", "stroke_curve": "smooth", "color": "#3291a8"},
+                {"name": "Predicted (+1h)", "data": soc_kw_best_h1, "opacity": "0.7", "stroke_width": "2", "stroke_curve": "smooth", "color": "#f5a442"},
+                {"name": "Predicted (+8h)", "data": soc_kw_best_h8, "opacity": "0.7", "stroke_width": "2", "stroke_curve": "smooth", "color": "#9b59b6"},
                 {"name": "Charge Limit Base", "data": charge_limit_kw, "opacity": "1.0", "stroke_width": "2", "stroke_curve": "stepline", "color": "#15eb8b"},
                 {
                     "name": "Charge Limit Best",
@@ -1970,8 +3325,8 @@ var options = {
                 {"name": "Import", "data": rates, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "stepline"},
                 {"name": "Export", "data": rates_export, "opacity": "0.2", "stroke_width": "2", "stroke_curve": "stepline", "chart_type": "area"},
                 {"name": "Gas", "data": rates_gas, "opacity": "0.2", "stroke_width": "2", "stroke_curve": "stepline", "chart_type": "area"},
-                {"name": "Hourly p/kWh", "data": cost_pkwh_hour, "opacity": "1.0", "stroke_width": "2", "stroke_curve": "stepline"},
-                {"name": "Today p/kWh", "data": cost_pkwh_today, "opacity": "1.0", "stroke_width": "2", "stroke_curve": "stepline"},
+                {"name": "Hourly {}/kWh".format(self.currency_symbols[1]), "data": cost_pkwh_hour, "opacity": "1.0", "stroke_width": "2", "stroke_curve": "stepline"},
+                {"name": "Today {}/kWh".format(self.currency_symbols[1]), "data": cost_pkwh_today, "opacity": "1.0", "stroke_width": "2", "stroke_curve": "stepline"},
             ]
             text += self.render_chart(series_data, self.currency_symbols[1], "Energy Rates", now_str)
         elif chart == "InDay":
@@ -2000,7 +3355,9 @@ var options = {
         elif chart == "PV" or chart == "PV7":
             pv_power_hist = history_attribute(self.get_history_wrapper(self.prefix + ".pv_power", 7, required=False))
             pv_power = prune_today(pv_power_hist, self.now_utc, self.midnight_utc, prune=chart == "PV")
-            pv_forecast_hist = history_attribute(self.get_history_wrapper("sensor." + self.prefix + "_pv_forecast_h0", 7, required=False))
+            # The uncalibrated forecast: h0's state is the calibrated one while calibration is on, which would
+            # draw the same line as Forecast History CL below
+            pv_forecast_hist = history_attribute(self.get_history_wrapper("sensor." + self.prefix + "_pv_forecast_h0_uncalibrated", 7, required=False))
             pv_forecast_histCL = history_attribute(self.get_history_wrapper("sensor." + self.prefix + "_pv_forecast_h0", 7, required=False), attributes=True, state_key="nowCL")
 
             pv_forecast = prune_today(pv_forecast_hist, self.now_utc, self.midnight_utc, prune=chart == "PV", intermediate=True)
@@ -2024,6 +3381,314 @@ var options = {
                 {"name": "Forecast CL", "data": pv_today_forecastCL, "opacity": "0.3", "stroke_width": "2", "stroke_curve": "smooth", "chart_type": "area", "color": "#e90a0a"},
             ]
             text += self.render_chart(series_data, "kW", "Solar Forecast", now_str)
+        elif chart == "PVAccuracy":
+            # Get pv_today history once and extract total and remaining attributes per timestamp
+            pv_today_hist = self.get_history_wrapper("sensor." + self.prefix + "_pv_today", 7, required=False)
+            pv_total_raw = history_attribute(pv_today_hist, attributes=True, state_key="totalCL")
+            pv_remaining_raw = history_attribute(pv_today_hist, attributes=True, state_key="remainingCL")
+            # Compute forecast so far = total - remaining per timestamp
+            pv_forecast_sofar_raw = {}
+            for ts, total_val in pv_total_raw.items():
+                remaining_val = pv_remaining_raw.get(ts, 0)
+                pv_forecast_sofar_raw[ts] = dp2(max(total_val - remaining_val, 0))
+            pv_forecast_sofar = prune_today(pv_forecast_sofar_raw, self.now_utc, self.midnight_utc, prune=False)
+            # Get actual PV energy over time
+            pv_actual_hist = history_attribute(self.get_history_wrapper(self.prefix + ".pv_energy_h0", 7, required=False))
+            pv_actual = prune_today(pv_actual_hist, self.now_utc, self.midnight_utc, prune=False)
+            series_data = [
+                {"name": "PV Forecast (so far)", "data": pv_forecast_sofar, "opacity": "1.0", "stroke_width": "2", "stroke_curve": "stepline", "color": "#a8a8a7"},
+                {"name": "PV Actual", "data": pv_actual, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "stepline", "color": "#f5c43d"},
+            ]
+            text += self.render_chart(series_data, "kWh", "PV Forecast vs Actual", now_str)
+        elif chart == "LoadML":
+            load_today_history = self.get_history_with_now_attrs("sensor." + self.prefix + "_load_ml_stats", 7)
+            # Get historical load data for last 24 hours
+            load_today = prune_today(history_attribute(load_today_history, attributes=True, state_key="load_today"), self.now_utc, self.midnight_utc, prune=False)
+            load_today_h1 = prune_today(history_attribute(load_today_history, attributes=True, state_key="load_today_h1"), self.now_utc, self.midnight_utc, prune=False, offset_minutes=60 * 1)
+            load_today_h8 = prune_today(history_attribute(load_today_history, attributes=True, state_key="load_today_h8"), self.now_utc, self.midnight_utc, prune=False, offset_minutes=60 * 8)
+
+            # Get ML forecast from load_forecast_ml entity results
+            load_ml_forecast = self.get_entity_results("sensor." + self.prefix + "_load_ml_forecast")
+
+            series_data = [
+                {"name": "Load (Actual)", "data": load_today, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "smooth", "color": "#3291a8"},
+                {"name": "Forecast (+1h)", "data": load_today_h1, "opacity": "0.7", "stroke_width": "2", "stroke_curve": "smooth", "color": "#f5a442"},
+                {"name": "Forecast (+8h)", "data": load_today_h8, "opacity": "0.7", "stroke_width": "2", "stroke_curve": "smooth", "color": "#9b59b6"},
+                {"name": "Load (ML Forecast)", "data": load_ml_forecast, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "smooth", "color": "#eb2323"},
+            ]
+            text += self.render_chart(series_data, "kWh", "ML Load Forecast", now_str)
+        elif chart == "LoadMLPower":
+            # Get historical load power
+            load_power_hist = history_attribute(self.get_history_wrapper(self.prefix + ".load_power", 7, required=False))
+            load_power = prune_today(load_power_hist, self.now_utc, self.midnight_utc, prune=True, prune_past_days=7)
+
+            # Car charging, and the house with it taken back out. load_power is whatever the inverter
+            # reports as house load, and on a charger inside the CT clamp that includes the car - while
+            # the ML forecast it is plotted against has the car subtracted out (car_charging_hold in
+            # load_ml_component). Comparing the two directly makes every charging session look like a
+            # forecast miss the model was never trying to make. Both series are shown rather than only
+            # the corrected one: the car draw is real and worth seeing, it just is not what the model
+            # is predicting. Absent when no charger is configured, in which case neither series is
+            # drawn and the chart is exactly as it was.
+            car_charging_power_hist = history_attribute(self.get_history_wrapper(self.prefix + ".car_charging_power", 7, required=False))
+            car_charging_power = prune_today(car_charging_power_hist, self.now_utc, self.midnight_utc, prune=True, prune_past_days=7)
+            load_power_no_car = subtract_series(load_power, car_charging_power)
+
+            # Get ML predicted load energy (cumulative) and convert to power (kW)
+            load_ml_forecast_energy = self.get_entity_results("sensor." + self.prefix + "_load_ml_forecast")
+            load_ml_forecast_power = {}
+
+            # Fetch stats history once and append current attributes at now_utc
+            power_today_history = self.get_history_with_now_attrs("sensor." + self.prefix + "_load_ml_stats", 7)
+            power_today = prune_today(history_attribute(power_today_history, attributes=True, state_key="power_today"), self.now_utc, self.midnight_utc, prune=False)
+            power_today_h1 = prune_today(history_attribute(power_today_history, attributes=True, state_key="power_today_h1"), self.now_utc, self.midnight_utc, prune=False, offset_minutes=60 * 1)
+            power_today_h8 = prune_today(history_attribute(power_today_history, attributes=True, state_key="power_today_h8"), self.now_utc, self.midnight_utc, prune=False, offset_minutes=60 * 8)
+
+            # Sort timestamps and calculate deltas to get energy per interval
+            if load_ml_forecast_energy:
+                from datetime import datetime
+
+                sorted_timestamps = sorted(load_ml_forecast_energy.keys())
+                prev_energy = 0
+                prev_timestamp = None
+                for timestamp in sorted_timestamps:
+                    energy = load_ml_forecast_energy[timestamp]
+                    energy_delta = max(energy - prev_energy, 0)
+
+                    # Calculate actual interval in hours between this and previous timestamp
+                    if prev_timestamp:
+                        # Parse timestamps and calculate difference in hours
+                        curr_dt = datetime.strptime(timestamp, TIME_FORMAT)
+                        prev_dt = datetime.strptime(prev_timestamp, TIME_FORMAT)
+                        interval_hours = (curr_dt - prev_dt).total_seconds() / 3600.0
+                        load_ml_forecast_power[timestamp] = dp4(energy_delta / interval_hours)
+
+                    prev_energy = energy
+                    prev_timestamp = timestamp
+
+            # Get historical PV power
+            pv_power_hist = history_attribute(self.get_history_wrapper(self.prefix + ".pv_power", 1, required=False))
+            pv_power = prune_today(pv_power_hist, self.now_utc, self.midnight_utc, prune=True, prune_past_days=7)
+
+            # Get temperature prediction data and limit to 48 hours forward
+            temperature_forecast = prune_today(self.get_entity_results("sensor." + self.prefix + "_temperature"), self.now_utc, self.midnight_utc, prune_future=True, prune_future_days=2, prune=True, prune_past_days=7)
+
+            series_data = [
+                {"name": "Load Power (Actual)", "data": load_power, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "smooth", "color": "#3291a8", "unit": "kW"},
+                {"name": "Load Power (Actual, less car)", "data": load_power_no_car, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "smooth", "color": "#2ca02c", "unit": "kW"},
+                {"name": "Car Charging Power", "data": car_charging_power, "opacity": "0.6", "stroke_width": "2", "stroke_curve": "smooth", "chart_type": "area", "color": "#e377c2", "unit": "kW"},
+                {"name": "Load Power (ML Predicted Future)", "data": load_ml_forecast_power, "opacity": "0.5", "stroke_width": "3", "chart_type": "area", "stroke_curve": "smooth", "color": "#eb2323", "unit": "kW"},
+                {"name": "Load Power ML History", "data": power_today, "opacity": "1.0", "stroke_width": "2", "stroke_curve": "smooth", "unit": "kW", "color": "#eb2323"},
+                {"name": "Load Power ML History +1h", "data": power_today_h1, "opacity": "1.0", "stroke_width": "2", "stroke_curve": "smooth", "unit": "kW", "color": "#716d63"},
+                {"name": "Load Power ML History +8h", "data": power_today_h8, "opacity": "1.0", "stroke_width": "2", "stroke_curve": "smooth", "unit": "kW", "color": "#a6a5a3"},
+                {"name": "PV Power (Actual)", "data": pv_power, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "smooth", "color": "#f5c43d", "unit": "kW"},
+                {"name": "PV Power (Predicted)", "data": pv_power_best, "opacity": "0.7", "stroke_width": "2", "stroke_curve": "smooth", "chart_type": "area", "color": "#ffa500", "unit": "kW"},
+                {"name": "Temperature", "data": temperature_forecast, "opacity": "1.0", "stroke_width": "2", "stroke_curve": "smooth", "color": "#75ff6b", "unit": "°C"},
+            ]
+
+            # Configure secondary axis for temperature
+            secondary_axis = [
+                {
+                    "title": "°C",
+                    "series_name": "Temperature",
+                    "decimals": 1,
+                    "opposite": True,
+                    "labels_formatter": "return val.toFixed(1) + '°C';",
+                }
+            ]
+
+            text += self.render_chart(series_data, "kW", "ML Load & PV Power with Temperature", now_str, extra_yaxis=secondary_axis)
+        elif chart == "Savings":
+            # Get daily savings data (historical)
+            # first=False ensures we use the last (most recent) update per day, not a stale midnight echo
+            savings_predbat_hist = history_attribute(self.get_history_wrapper(self.prefix + ".savings_yesterday_predbat", 28, required=False), daily=True, offset_days=-1, pounds=True, first=False)
+            savings_pvbat_hist = history_attribute(self.get_history_wrapper(self.prefix + ".savings_yesterday_pvbat", 28, required=False), daily=True, offset_days=-1, pounds=True, first=False)
+            cost_yesterday_hist = history_attribute(self.get_history_wrapper(self.prefix + ".cost_yesterday", 28, required=False), daily=True, offset_days=-1, pounds=True, first=False)
+
+            # Get cumulative/total savings over time (historical)
+            savings_total_predbat_hist = history_attribute(self.get_history_wrapper(self.prefix + ".savings_total_predbat", 28, required=False), daily=True, pounds=True, first=False)
+            savings_total_pvbat_hist = history_attribute(self.get_history_wrapper(self.prefix + ".savings_total_pvbat", 28, required=False), daily=True, pounds=True, first=False)
+
+            series_data = [
+                # Daily savings (bars) on primary axis
+                {"name": "Daily Predbat Saving", "data": savings_predbat_hist, "opacity": "1.0", "stroke_width": "2", "chart_type": "bar", "color": "#f5a442", "unit": self.currency_symbols[0]},
+                {"name": "Daily PV/Battery Saving", "data": savings_pvbat_hist, "opacity": "1.0", "stroke_width": "2", "chart_type": "bar", "color": "#3291a8", "unit": self.currency_symbols[0]},
+                {"name": "Daily Actual Cost", "data": cost_yesterday_hist, "opacity": "1.0", "stroke_width": "2", "chart_type": "bar", "color": "#eb2323", "unit": self.currency_symbols[0]},
+                # Cumulative savings (lines) on secondary axis
+                {"name": "Total Predbat Saving", "data": savings_total_predbat_hist, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "smooth", "color": "#f5c43d", "unit": self.currency_symbols[0]},
+                {"name": "Total PV/Battery Saving", "data": savings_total_pvbat_hist, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "smooth", "color": "#15eb8b", "unit": self.currency_symbols[0]},
+            ]
+
+            # Configure secondary axis for cumulative totals
+            secondary_axis = [
+                {
+                    "title": f"Total Savings ({self.currency_symbols[0]})",
+                    "series_names": ["Total Predbat Saving", "Total PV/Battery Saving"],
+                    "decimals": 0,
+                    "opposite": True,
+                    "labels_formatter": f"return val.toFixed(0);",
+                }
+            ]
+
+            text += self.render_chart(series_data, f"Daily Savings ({self.currency_symbols[0]})", "Cost Savings Analysis", now_str, daily_chart=False, extra_yaxis=secondary_axis)
+        elif chart == "BatteryDegradation":
+            num_inverters = int(self.base.get_arg("num_inverters", 1))
+            series_data = []
+            secondary_series_names = []
+            inv_colors = [
+                ("#3291a8", "#eb2323", "#f5a442"),
+                ("#9b59b6", "#15eb8b", "#f5c43d"),
+                ("#e8972c", "#cd23eb", "#15eb1c"),
+                ("#6b6b6b", "#cccccc", "#a8a8a7"),
+            ]
+            for inv_id in range(num_inverters):
+                suffix = "" if inv_id == 0 else "_{}".format(inv_id)
+                label_suffix = "" if num_inverters == 1 else " {}".format(inv_id)
+                sensor_id = "sensor." + self.prefix + "_soc_max_calculated" + suffix
+                raw_hist = self.get_history_wrapper(sensor_id, 28, required=False)
+                calculated_hist = history_attribute(raw_hist, daily=True, first=False)
+                nominal_hist = history_attribute(raw_hist, attributes=True, state_key="nominal_capacity", daily=True, first=False)
+                degradation_hist = history_attribute(raw_hist, attributes=True, state_key="degradation_percent", daily=True, first=False)
+                # Also inject the current sensor value so today's data point is always present
+                today_key = self.now_utc.strftime("%Y-%m-%d")
+                cur_state = self.base.dashboard_values.get(sensor_id, {}).get("state")
+                cur_attrs = self.base.dashboard_values.get(sensor_id, {}).get("attributes", {})
+                if cur_state is not None:
+                    try:
+                        calculated_hist[today_key] = float(cur_state)
+                    except (ValueError, TypeError):
+                        pass
+                if "nominal_capacity" in cur_attrs:
+                    try:
+                        nominal_hist[today_key] = float(cur_attrs["nominal_capacity"])
+                    except (ValueError, TypeError):
+                        pass
+                if "degradation_percent" in cur_attrs:
+                    try:
+                        degradation_hist[today_key] = float(cur_attrs["degradation_percent"])
+                    except (ValueError, TypeError):
+                        pass
+                colors = inv_colors[inv_id % len(inv_colors)]
+                nominal_name = "Nominal{}".format(label_suffix)
+                calculated_name = "Calculated{}".format(label_suffix)
+                degradation_name = "Degradation%{}".format(label_suffix)
+                series_data.append({"name": nominal_name, "data": nominal_hist, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "stepline", "color": colors[0], "unit": "kWh"})
+                series_data.append({"name": calculated_name, "data": calculated_hist, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "stepline", "color": colors[1], "unit": "kWh"})
+                series_data.append({"name": degradation_name, "data": degradation_hist, "opacity": "1.0", "stroke_width": "2", "stroke_curve": "stepline", "color": colors[2], "unit": "%"})
+                secondary_series_names.append(degradation_name)
+            secondary_axis = [
+                {
+                    "title": "%",
+                    "series_names": secondary_series_names,
+                    "decimals": 1,
+                    "opposite": True,
+                    "labels_formatter": "return val.toFixed(1) + '%';",
+                }
+            ]
+            text += self.render_chart(series_data, "kWh", "Battery Degradation", now_str, daily_chart=False, extra_yaxis=secondary_axis)
+            if self.base.battery_scaling_auto:
+                text += "<p style='color:#15eb8b;font-weight:bold;'>&#10003; battery_scaling_auto is enabled &mdash; Predbat is automatically adjusting the usable battery capacity to account for degradation.</p>\n"
+            else:
+                text += (
+                    "<p style='color:#f5a442;font-weight:bold;'>&#9888; battery_scaling_auto is disabled. "
+                    "Enable it in apps.yaml (<code>battery_scaling_auto: true</code>) so Predbat can automatically "
+                    "scale the usable battery capacity to reflect real-world degradation shown in this chart.</p>\n"
+                )
+        elif chart == "MarginalCosts":
+            sensor_attrs = self.base.dashboard_values.get("sensor." + self.prefix + "_marginal_energy_costs", {}).get("attributes", {})
+            matrix = sensor_attrs.get("matrix", {})
+            energy_labels = list(matrix.keys())
+            time_labels = list(next(iter(matrix.values()), {}).keys())
+            if not matrix:
+                text += "<br><h2>Marginal cost data not yet available &mdash; run a plan first</h2>"
+            else:
+                grid_import = sensor_attrs.get("grid_import", {})
+                grid_export = sensor_attrs.get("grid_export", {})
+                all_grid_vals = list(grid_import.values()) + list(grid_export.values())
+                range_min = min(getattr(self.base, "rate_min", 0), getattr(self.base, "marginal_costs_min", 0), min(all_grid_vals) if all_grid_vals else 0)
+                range_max = max(getattr(self.base, "rate_max", 100), getattr(self.base, "marginal_costs_max", 100), max(all_grid_vals) if all_grid_vals else 0)
+                # Status table — cheap/moderate for each level
+                curr = self.currency_symbols[1]
+                text += "<br><h2>Marginal Energy Costs</h2>\n"
+                text += "<p>Marginal costs for each additional kWh of load, based on current plan. Shows how much more expensive (or cheaper) it is to use more energy than forecasted.</p>\n"
+                text += "<table style='border-collapse:collapse;margin-bottom:16px;font-size:0.95em;'>\n"
+                text += "<tr><th style='padding:6px 12px;border:1px solid #555;text-align:left;'>Level</th>"
+                text += "<th style='padding:6px 12px;border:1px solid #555;'>kWh</th>"
+                text += "<th style='padding:6px 12px;border:1px solid #555;'>Cost now ({}/kWh)</th>".format(curr)
+                text += "<th style='padding:6px 12px;border:1px solid #555;'>Cheap?</th>"
+                text += "<th style='padding:6px 12px;border:1px solid #555;'>Moderate?</th></tr>\n"
+                for state_name, kwh in zip(MARGINAL_EXTRA_KWH_LEVEL_NAMES, MARGINAL_EXTRA_KWH_LEVELS):
+                    cost = sensor_attrs.get("rate_now_{}_consumption".format(state_name), "")
+                    cheap_key = "binary_sensor.{}_marginal_rate_now_{}_is_cheap".format(self.prefix, state_name)
+                    mod_key = "binary_sensor.{}_marginal_rate_now_{}_is_moderate".format(self.prefix, state_name)
+                    is_cheap = self.base.dashboard_values.get(cheap_key, {}).get("state") == "on"
+                    is_moderate = self.base.dashboard_values.get(mod_key, {}).get("state") == "on"
+                    cheap_cell = "<td style='padding:6px 12px;border:1px solid #555;text-align:center;background:#00B050;color:#fff;'>Yes</td>" if is_cheap else "<td style='padding:6px 12px;border:1px solid #555;text-align:center;'>No</td>"
+                    mod_cell = "<td style='padding:6px 12px;border:1px solid #555;text-align:center;background:#FFFF00;color:#333;'>Yes</td>" if is_moderate else "<td style='padding:6px 12px;border:1px solid #555;text-align:center;'>No</td>"
+                    text += "<tr><td style='padding:6px 12px;border:1px solid #555;'>{}</td>".format(state_name.capitalize())
+                    text += "<td style='padding:6px 12px;border:1px solid #555;text-align:center;'>{}</td>".format(kwh)
+                    text += "<td style='padding:6px 12px;border:1px solid #555;text-align:center;'>{}</td>".format(cost)
+                    text += cheap_cell + mod_cell + "</tr>\n"
+                text += "</table>\n"
+                # Grid rates chart (compact, separate div)
+                if grid_import or grid_export:
+                    grid_series = []
+                    if grid_export:
+                        grid_series.append({"name": "Export", "data": [{"x": t, "y": grid_export.get(t, 0)} for t in time_labels]})
+                    if grid_import:
+                        grid_series.append({"name": "Import", "data": [{"x": t, "y": grid_import.get(t, 0)} for t in time_labels]})
+                    text += "<div id='chart_grid'></div>\n"
+                    text += self.render_heatmap_chart(grid_series, "Grid Rates ({}/kWh)".format(self.currency_symbols[1]), range_min, range_max, chart_id="chart_grid")
+                # Marginal costs chart
+                title = "Marginal Energy Cost ({}/kWh)".format(self.currency_symbols[1])
+                marginal_series = []
+                for label in energy_labels:
+                    row = matrix.get(label, {})
+                    data_points = [{"x": t, "y": row.get(t, 0)} for t in time_labels]
+                    marginal_series.append({"name": "{}kWh".format(label), "data": data_points})
+                text += "<div id='chart'></div>\n"
+                text += self.render_heatmap_chart(marginal_series, title, range_min, range_max, chart_id="chart")
+                # Historical + forecast line chart
+                marginal_hist = self.get_history_with_now_attrs("sensor." + self.prefix + "_marginal_energy_costs", 7)
+
+                def _marginal_history(key):
+                    return prune_today(history_attribute(marginal_hist, attributes=True, state_key=key), self.now_utc, self.midnight_utc, prune=False, prune_past_days=7, prune_future=True)
+
+                hist_low = _marginal_history("rate_now_low_consumption")
+                hist_med = _marginal_history("rate_now_med_consumption")
+                hist_high = _marginal_history("rate_now_high_consumption")
+                hist_ev = _marginal_history("rate_now_ev_consumption")
+                hist_import = _marginal_history("grid_import_now")
+                hist_export = _marginal_history("grid_export_now")
+
+                # Build forward-looking series from matrix — use actual datetime from offset, not just HH:MM
+                fwd_low, fwd_med, fwd_high, fwd_ev, fwd_import_fwd, fwd_export_fwd = {}, {}, {}, {}, {}, {}
+                for idx, offset in enumerate(MARGINAL_TIME_OFFSETS):
+                    t_label = time_labels[idx]
+                    ts = (self.now_utc + timedelta(minutes=offset)).isoformat()
+                    fwd_low[ts] = matrix.get(MARGINAL_EXTRA_KWH_LEVELS[0], {}).get(t_label, 0)
+                    fwd_med[ts] = matrix.get(MARGINAL_EXTRA_KWH_LEVELS[1], {}).get(t_label, 0)
+                    fwd_high[ts] = matrix.get(MARGINAL_EXTRA_KWH_LEVELS[2], {}).get(t_label, 0)
+                    fwd_ev[ts] = matrix.get(MARGINAL_EXTRA_KWH_LEVELS[3], {}).get(t_label, 0)
+                    fwd_import_fwd[ts] = grid_import.get(t_label, 0)
+                    fwd_export_fwd[ts] = grid_export.get(t_label, 0)
+
+                line_series = [
+                    {"name": "Low 1kWh", "data": hist_low, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "stepline", "color": "#3291a8"},
+                    {"name": "Low 1kWh (future)", "data": fwd_low, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "stepline", "color": "#3291a8"},
+                    {"name": "Med 2kWh", "data": hist_med, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "stepline", "color": "#f5a442"},
+                    {"name": "Med 2kWh (future)", "data": fwd_med, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "stepline", "color": "#f5a442"},
+                    {"name": "High 4kWh", "data": hist_high, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "stepline", "color": "#eb2323"},
+                    {"name": "High 4kWh (future)", "data": fwd_high, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "stepline", "color": "#eb2323"},
+                    {"name": "EV 8kWh (future)", "data": fwd_ev, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "stepline", "color": "#9b59b6"},
+                    {"name": "EV 8kWh", "data": hist_ev, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "stepline", "color": "#9b59b6"},
+                    {"name": "Import rate", "data": hist_import, "opacity": "1.0", "stroke_width": "4", "stroke_curve": "stepline", "color": "#15eb8b"},
+                    {"name": "Export rate", "data": hist_export, "opacity": "1.0", "stroke_width": "4", "stroke_curve": "stepline", "color": "#15eb1c"},
+                    {"name": "Import rate (future)", "data": fwd_import_fwd, "opacity": "1.0", "stroke_width": "4", "stroke_curve": "stepline", "color": "#15eb8b"},
+                    {"name": "Export rate (future)", "data": fwd_export_fwd, "opacity": "1.0", "stroke_width": "4", "stroke_curve": "stepline", "color": "#15eb1c"},
+                ]
+                text += "<div id='chart_marginal_hist'></div>\n"
+                text += self.render_chart(line_series, curr, "Marginal Energy Rates \u2014 History & Forecast", now_str, tagname="chart_marginal_hist", daily_chart=False)
         else:
             text += "<br><h2>Unknown chart type</h2>"
 
@@ -2040,42 +3705,27 @@ var options = {
         text += "<body>\n"
         text += get_charts_css()
 
-        # Define which chart is active
-        active_battery = ""
-        active_power = ""
-        active_cost = ""
-        active_rates = ""
-        active_inday = ""
-        active_pv = ""
-        active_pv7 = ""
-
-        if chart == "Battery":
-            active_battery = "active"
-        elif chart == "Power":
-            active_power = "active"
-        elif chart == "Cost":
-            active_cost = "active"
-        elif chart == "Rates":
-            active_rates = "active"
-        elif chart == "InDay":
-            active_inday = "active"
-        elif chart == "PV":
-            active_pv = "active"
-        elif chart == "PV7":
-            active_pv7 = "active"
-
         text += '<div class="charts-menu">'
         text += "<h3>Charts</h3> "
-        text += f'<a href="./charts?chart=Battery" class="{active_battery}">Battery</a>'
-        text += f'<a href="./charts?chart=Power" class="{active_power}">Power</a>'
-        text += f'<a href="./charts?chart=Cost" class="{active_cost}">Cost</a>'
-        text += f'<a href="./charts?chart=Rates" class="{active_rates}">Rates</a>'
-        text += f'<a href="./charts?chart=InDay" class="{active_inday}">InDay</a>'
-        text += f'<a href="./charts?chart=PV" class="{active_pv}">PV</a>'
-        text += f'<a href="./charts?chart=PV7" class="{active_pv7}">PV7</a>'
+        text += f'<a href="./charts?chart=Battery" class="{"active" if chart == "Battery" else ""}">Battery</a>'
+        text += f'<a href="./charts?chart=Power" class="{"active" if chart == "Power" else ""}">Power</a>'
+        text += f'<a href="./charts?chart=Cost" class="{"active" if chart == "Cost" else ""}">Cost</a>'
+        text += f'<a href="./charts?chart=Rates" class="{"active" if chart == "Rates" else ""}">Rates</a>'
+        text += f'<a href="./charts?chart=InDay" class="{"active" if chart == "InDay" else ""}">InDay</a>'
+        text += f'<a href="./charts?chart=PV" class="{"active" if chart == "PV" else ""}">PV</a>'
+        text += f'<a href="./charts?chart=PV7" class="{"active" if chart == "PV7" else ""}">PV7</a>'
+        text += f'<a href="./charts?chart=PVAccuracy" class="{"active" if chart == "PVAccuracy" else ""}">PVAccuracy</a>'
+        text += f'<a href="./charts?chart=Savings" class="{"active" if chart == "Savings" else ""}">Savings</a>'
+        text += f'<a href="./charts?chart=BatteryDegradation" class="{"active" if chart == "BatteryDegradation" else ""}">BatteryDegradation</a>'
+        text += f'<a href="./charts?chart=MarginalCosts" class="{"active" if chart == "MarginalCosts" else ""}">MarginalCosts</a>'
+        # Only show LoadML chart if ML is enabled
+        if self.base.get_arg("load_ml_enable", False):
+            text += f'<a href="./charts?chart=LoadML" class="{"active" if chart == "LoadML" else ""}">LoadML</a>'
+            text += f'<a href="./charts?chart=LoadMLPower" class="{"active" if chart == "LoadMLPower" else ""}">LoadMLPower</a>'
         text += "</div>"
 
-        text += '<div id="chart"></div>'
+        if chart != "MarginalCosts":
+            text += '<div id="chart"></div>'
         text += self.get_chart(chart=chart)
         text += "</body></html>\n"
         return web.Response(content_type="text/html", text=text)
@@ -2153,20 +3803,29 @@ var options = {
         if self.base.arg_errors:
             warning = "&#9888;"
         text += "{}<a href='./debug_apps'>apps.yaml</a> - has {} errors<br>\n".format(warning, len(self.base.arg_errors))
+        if self.base.arg_warnings:
+            text += "&#9888; apps.yaml has {} credential-like value(s) stored in plain text - consider using '!secret' to reference secrets.yaml: {}<br>\n".format(len(self.base.arg_warnings), html_module.escape(", ".join(sorted(self.base.arg_warnings))))
         text += "<table>\n"
         text += "<tr><th>Name</th><th>Value</th><th>Actions</th></tr>\n"
 
-        args = self.args
+        # Mask once, here, through the same recursive traversal every other surface uses
+        # (mask_secret_args - see utils.py). A top-level `is_secret_key(arg)` test on the loop
+        # below only covers credentials whose own apps.yaml key names them: a nested one such as
+        # chat.providers.openrouter.api_key or forecast_solar[0].api_key sits under a top-level
+        # key that matches nothing, and render_type() recurses into it - so the value, and the
+        # data-nested-original attribute built from it, both reached the browser in the clear
+        # (#5053 review). Masking the structure instead of the row keeps this route honest as
+        # new nested credentials appear, and deep-copies, so self.args (the live object shared
+        # with self.base.args) is untouched.
+        args = mask_secret_args(self.args)
         row_id = 0
-        # Initialize nested values tracking and row counter
+        # Initialise nested values tracking and row counter
         self._nested_values = {}
         row_counter = [1000]  # Start nested rows at 1000 to avoid conflicts
 
         for arg in args:
             value = args[arg]
             raw_value = self.resolve_value_raw(arg, value)
-            if ("_key" in arg) or ("_password" in arg):
-                value = '<span title = "{}"> (hidden)</span>'.format(value)
             arg_errors = self.base.arg_errors.get(arg, "")
 
             # Determine if this value can be edited
@@ -2207,30 +3866,38 @@ var options = {
         text += "</body></html>\n"
         return web.Response(content_type="text/html", text=text)
 
-    def _update_nested_yaml_value(self, data, path, value):
+    def _split_yaml_path(self, path):
         """
-        Update a nested value in YAML data using a dot-notation path
+        Split a dot-notation path into keys, with each list index as its own '[n]' key
         """
-        pre_keys = path.split(".")
         keys = []
-        # Split out set of square brackets into a different key
-        for key in pre_keys:
-            if "[" in key and "]" in key:
-                # Handle keys with square brackets, e.g., "battery_charge_low[0]"
-                base_key, index = key.split("[")
-                index = index.rstrip("]")
-                keys.append(base_key)
-                keys.append(f"[{index}]")
-            else:
-                keys.append(key)
+        # Split out every set of square brackets into its own key, e.g. "battery_charge_low[0]"
+        # into "battery_charge_low", "[0]", and a directly nested list's "foo[0][1]" into
+        # "foo", "[0]", "[1]"
+        for component in path.split("."):
+            for token in re.split(r"(\[[^\[\]]*\])", component):
+                if token:
+                    keys.append(token)
+        return keys
 
+    def _yaml_path_index(self, key, path):
+        """
+        Return the integer index held by a '[n]' path key, raising KeyError if it is not one
+        """
+        index = key[1:-1]
+        if not index.isdigit():
+            raise KeyError(f"Invalid list index '{key}' in path '{path}'")
+        return int(index)
+
+    def _navigate_yaml_path(self, data, keys, path):
+        """
+        Walk YAML data along all but the last key and return the container holding the final key
+        """
         current = data
-
-        # Navigate to the parent of the target value
         for key in keys[:-1]:
             if key.startswith("[") and key.endswith("]"):
                 # Handle numerical index in square brackets
-                index = int(key[1:-1])
+                index = self._yaml_path_index(key, path)
                 if not isinstance(current, list) or index >= len(current):
                     raise KeyError(f"Index '{index}' out of range in path '{path}'")
                 current = current[index]
@@ -2238,12 +3905,83 @@ var options = {
                 current = current[key]
             else:
                 raise KeyError(f"Key '{key}' not found in path '{path}'")
+        return current
+
+    def _yaml_path_sort_key(self, path):
+        """
+        Return a sort key for a path so that deeper paths and higher list indices sort last
+        """
+        sort_key = []
+        for key in self._split_yaml_path(path):
+            if key.startswith("[") and key.endswith("]") and key[1:-1].isdigit():
+                sort_key.append((0, int(key[1:-1]), ""))
+            else:
+                sort_key.append((1, 0, str(key)))
+        return sort_key
+
+    def _parse_yaml_fragment(self, text):
+        """
+        Parse a user supplied YAML fragment (a scalar, or a block of key: value lines) into a value
+        """
+        yaml = YAML()
+        yaml.preserve_quotes = True
+        value = yaml.load(text)
+        if value is None:
+            raise ValueError("value is empty")
+        return value
+
+    def _delete_nested_yaml_value(self, data, path):
+        """
+        Delete a nested list item or dictionary key from YAML data using a dot-notation path
+        """
+        keys = self._split_yaml_path(path)
+        current = self._navigate_yaml_path(data, keys, path)
+
+        key = keys[-1]
+        if key.startswith("[") and key.endswith("]"):
+            # Handle numerical index in square brackets
+            index = self._yaml_path_index(key, path)
+            if not isinstance(current, list) or index >= len(current):
+                raise KeyError(f"Index '{index}' out of range in path '{path}'")
+            del current[index]
+        elif isinstance(current, dict) and key in current:
+            del current[key]
+        else:
+            raise KeyError(f"Final key '{key}' not found in path '{path}'")
+
+    def _add_nested_yaml_value(self, data, path, value):
+        """
+        Add a new list item (path ending in '[]') or dictionary key to YAML data using a dot-notation path
+        """
+        keys = self._split_yaml_path(path)
+        current = self._navigate_yaml_path(data, keys, path)
+
+        key = keys[-1]
+        if key == "[]":
+            if not isinstance(current, list):
+                raise KeyError(f"Path '{path}' does not refer to a list")
+            current.append(value)
+        elif key.startswith("[") and key.endswith("]"):
+            raise KeyError(f"Cannot add at an existing list index, use [] to append in path '{path}'")
+        elif not isinstance(current, dict):
+            raise KeyError(f"Path '{path}' does not refer to a dictionary")
+        elif key in current:
+            raise KeyError(f"Key '{key}' already exists in path '{path}'")
+        else:
+            current[key] = value
+
+    def _update_nested_yaml_value(self, data, path, value):
+        """
+        Update a nested value in YAML data using a dot-notation path
+        """
+        keys = self._split_yaml_path(path)
+        current = self._navigate_yaml_path(data, keys, path)
 
         # Set the final value
         key = keys[-1]
         if key.startswith("[") and key.endswith("]"):
             # Handle numerical index in square brackets
-            index = int(key[1:-1])
+            index = self._yaml_path_index(key, path)
             if not isinstance(current, list) or index >= len(current):
                 raise KeyError(f"Index '{index}' out of range in path '{path}'")
             current[index] = value
@@ -2260,13 +3998,32 @@ var options = {
             else:
                 raise KeyError(f"Final key '{key}' not found in path '{path}'")
 
+    def _validate_compare_list(self, compare_list):
+        """
+        Check every compare_list profile still has the unique id and non-empty name that
+        compare.py indexes results by, raising ValueError if a batch has left one without
+        """
+        if not compare_list:
+            return
+
+        seen_ids = set()
+        for entry in compare_list:
+            if not isinstance(entry, dict):
+                raise ValueError("Each compare_list entry must be a dictionary with an id and a name")
+            entry_id = entry.get("id")
+            if not entry_id:
+                raise ValueError("Each compare_list entry requires a non-empty 'id'")
+            if entry_id in seen_ids:
+                raise ValueError(f"Duplicate compare_list id '{entry_id}'")
+            seen_ids.add(entry_id)
+            if not entry.get("name"):
+                raise ValueError(f"compare_list entry '{entry_id}' requires a non-empty 'name'")
+
     async def html_apps_post(self, request):
         """
         Handle POST request for apps page - batch edit values
         """
         try:
-            from ruamel.yaml import YAML
-
             postdata = await request.post()
             changes_json = postdata.get("changes", "")
 
@@ -2286,6 +4043,7 @@ var options = {
             apps_yaml_path = "apps.yaml"
             yaml = YAML()
             yaml.preserve_quotes = True
+            yaml.width = YAML_DUMP_WIDTH
 
             try:
                 with open(apps_yaml_path, "r") as f:
@@ -2297,12 +4055,47 @@ var options = {
             if ROOT_YAML_KEY not in data:
                 return web.json_response({"success": False, "message": "pred_bat section not found in apps.yaml"})
 
-            # Process each change
+            # Process each change - additions and updates are applied first, then deletions, as
+            # deleting a list item shifts the indices every other path was rendered against.
+            # Every mutation lands on live_args, a copy of self.args, rather than self.args
+            # itself - a batch that fails partway, or whose file write fails, must never leave
+            # self.args (which is the same object as self.base.args) reflecting only some of it
             updated_args = []
+            deleted_paths = []
+            live_args = copy.deepcopy(self.args)
             for path_or_arg, change_info in changes.items():
-                new_value = change_info["newValue"]
                 change_type = change_info.get("type", "numerical")
                 is_nested = change_info.get("isNested", False)
+                # Adds are keyed uniquely by the browser so several can target one list, so the
+                # path is taken from the change itself rather than from the key
+                path_or_arg = change_info.get("path", path_or_arg) if is_nested else path_or_arg
+
+                if change_type in ("add", "delete"):
+                    # Determine nesting from the parsed path itself, not the client-supplied
+                    # isNested flag, so a delete posted with isNested spoofed true still cannot
+                    # reach a bare top-level key
+                    if len(self._split_yaml_path(path_or_arg)) < 2:
+                        return web.json_response({"success": False, "message": f"Only nested values can be added or deleted, not {path_or_arg}"})
+
+                if change_type == "delete":
+                    deleted_paths.append(path_or_arg)
+                    continue
+
+                new_value = change_info["newValue"]
+
+                if change_type == "add":
+                    # Added values are entered as YAML so a whole new list entry can be created at once
+                    try:
+                        added_value = self._parse_yaml_fragment(new_value)
+                    except Exception as e:
+                        return web.json_response({"success": False, "message": f"Invalid value format for {path_or_arg}: {str(e)}"})
+                    try:
+                        self._add_nested_yaml_value(data[ROOT_YAML_KEY], path_or_arg, added_value)
+                        self._add_nested_yaml_value(live_args, path_or_arg, copy.deepcopy(added_value))
+                    except (KeyError, TypeError) as e:
+                        return web.json_response({"success": False, "message": f"Could not add {path_or_arg}: {str(e)}"})
+                    updated_args.append(f"added {path_or_arg}")
+                    continue
 
                 # Convert the new value to appropriate type
                 try:
@@ -2320,12 +4113,23 @@ var options = {
                 except ValueError:
                     return web.json_response({"success": False, "message": f"Invalid value format for {path_or_arg}: {new_value}"})
 
+                # The /apps page serves credentials masked as SECRET_MASK (see html_apps), so the
+                # browser's data-original-value for a secret row is the mask, not the credential.
+                # Saving such a row unchanged would write "xxx" over a live key and destroy it -
+                # the same read-modify-write trap find_redacted_secret_overwrite() already refuses
+                # on the model's write path (chat_tools.py). Refuse it here too rather than trusting
+                # the page not to offer the edit, so the guard holds for any future surface (#5053
+                # review). A deliberate change to a real new value is unaffected.
+                secret_path = any(is_secret_key(segment) for segment in parse_yaml_path(path_or_arg) if not segment.startswith("["))
+                if converted_value == SECRET_MASK and secret_path:
+                    return web.json_response({"success": False, "message": f"Refusing to overwrite the credential {path_or_arg} with the redaction placeholder '{SECRET_MASK}' - edit it in apps.yaml or secrets.yaml directly"})
+
                 # Update the value in the YAML data
                 if is_nested:
                     # Handle nested paths like "battery_charge_low.normal"
                     try:
                         self._update_nested_yaml_value(data[ROOT_YAML_KEY], path_or_arg, converted_value)
-                        self._update_nested_yaml_value(self.args, path_or_arg, converted_value)
+                        self._update_nested_yaml_value(live_args, path_or_arg, converted_value)
                         updated_args.append(f"{path_or_arg}={converted_value}")
                     except (KeyError, TypeError) as e:
                         return web.json_response({"success": False, "message": f"Path {path_or_arg} not found or invalid: {str(e)}"})
@@ -2333,15 +4137,44 @@ var options = {
                     # Handle top-level arguments
                     if path_or_arg in data[ROOT_YAML_KEY]:
                         data[ROOT_YAML_KEY][path_or_arg] = converted_value
-                        self.args[path_or_arg] = converted_value  # Update the base args as well
+                        live_args[path_or_arg] = converted_value
                         updated_args.append(f"{path_or_arg}={converted_value}")
                     else:
                         return web.json_response({"success": False, "message": f"Argument {path_or_arg} not found in apps.yaml"})
+
+            # Deletions run last, deepest path and highest list index first, so that one deletion
+            # never shifts the index another one still refers to
+            for path in sorted(deleted_paths, key=self._yaml_path_sort_key, reverse=True):
+                try:
+                    self._delete_nested_yaml_value(data[ROOT_YAML_KEY], path)
+                    self._delete_nested_yaml_value(live_args, path)
+                except (KeyError, TypeError) as e:
+                    return web.json_response({"success": False, "message": f"Could not delete {path}: {str(e)}"})
+                updated_args.append(f"deleted {path}")
+
+            # Compare profiles are indexed by id elsewhere (e.g. compare.py), so a batch that
+            # leaves one without an id or name, or with a duplicate id, must be refused
+            try:
+                self._validate_compare_list(data[ROOT_YAML_KEY].get("compare_list"))
+            except ValueError as e:
+                return web.json_response({"success": False, "message": str(e)})
 
             # Write back to the file, preserving comments and formatting
             try:
                 with open(apps_yaml_path, "w") as f:
                     yaml.dump(data, f)
+
+                # Only now that the whole batch has validated and the file write has succeeded is
+                # the live config published - in place, so self.args (the same object as
+                # self.base.args) never reflects a partially applied batch
+                self.args.clear()
+                self.args.update(live_args)
+                # A credential value or the redact_strings/redact_strings_labelled denylists
+                # themselves can change in this batch, so log()'s cached redaction pattern
+                # (hass.py, held on self.base - the PredBat instance, not this web component)
+                # must be rebuilt on next use, or a newly added/changed secret keeps leaking into
+                # the log under the stale pattern until the restart below completes (GH#4770 review).
+                self.base._invalidate_log_secret_pattern()
 
                 change_count = len(updated_args)
                 self.log(f"Batch updated {change_count} arguments in apps.yaml: {', '.join(updated_args)}")
@@ -2352,7 +4185,7 @@ var options = {
                 return web.json_response({"success": False, "message": f"Error writing to apps.yaml: {str(e)}"})
 
         except ImportError:
-            return web.json_response({"success": False, "message": "ruamel.yaml library not available, update Predbat add-on first."})
+            return web.json_response({"success": False, "message": "ruamel.yaml library not available, update Predbat app first."})
         except Exception as e:
             return web.json_response({"success": False, "message": f"Unexpected error: {str(e)}"})
 
@@ -2370,7 +4203,7 @@ var options = {
                 itemtype = item.get("type", "")
                 default = item.get("default", "")
                 icon = self.icon2html(item.get("icon", ""))
-                unit = item.get("unit", "")
+                unit = self.base.convert_currency_unit(item.get("unit", ""))
                 text += "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td>".format(icon, friendly, entity, itemtype)
                 if value == default:
                     text += '<td class="cfg_default">{} {}</td><td>{} {}</td>\n'.format(value, unit, default, unit)
@@ -2421,7 +4254,7 @@ var options = {
                 itemtype = item.get("type", "")
                 default = item.get("default", "")
                 useid = entity.replace(".", "__")
-                unit = item.get("unit", "")
+                unit = self.base.convert_currency_unit(item.get("unit", ""))
                 icon = self.icon2html(item.get("icon", ""))
 
                 if itemtype in ["input_number", "number"] and item.get("step", 1) == 1:
@@ -2522,7 +4355,7 @@ var options = {
         text += "</form>"
 
         text += "<table class='comparison-table'>\n"
-        text += "<tr><th>ID</th><th>Name</th><th>Date</th><th>True cost</th><th>Cost</th><th>Cost 10%</th><th>Export</th><th>Import</th><th>Final SoC</th>"
+        text += "<tr><th>ID</th><th>Name</th><th>Date</th><th>True cost</th><th>Cost</th><th>Cost 10%</th><th>7d avg</th><th>Export</th><th>Import</th><th>Final SoC</th>"
         if self.base.iboost_enable:
             text += "<th>Iboost</th>"
         if self.base.carbon_enable:
@@ -2547,8 +4380,10 @@ var options = {
                 compare_hist[id] = {}
                 result = self.base.comparison.get_comparison(id)
                 if result:
-                    compare_hist[id]["cost"] = history_attribute(self.get_history_wrapper(result["entity_id"], 28), daily=True, pounds=True)
-                    compare_hist[id]["metric"] = history_attribute(self.get_history_wrapper(result["entity_id"], 28), state_key="metric", attributes=True, daily=True, pounds=True)
+                    entity_hist = self.get_history_wrapper(result["entity_id"], 28, required=False)
+                    compare_hist[id]["cost"] = history_attribute(entity_hist, daily=True, pounds=True)
+                    compare_hist[id]["metric"] = history_attribute(entity_hist, state_key="metric", attributes=True, daily=True, pounds=True)
+                    compare_hist[id]["cost_1am"] = self.history_daily_at_hour(entity_hist)
 
         compare_list = self.get_arg("compare_list", [])
 
@@ -2594,8 +4429,15 @@ var options = {
             metric_str = self.to_pounds(metric)
             cost_str = self.to_pounds(cost)
             cost10_str = self.to_pounds(cost10)
+            cost_1am = compare_hist.get(id, {}).get("cost_1am", {})
+            avg7, avg7_count = self.average_cost_window(cost_1am, 7)
+            if avg7 is not None:
+                avg7_pounds = self.currency_symbols[0] + "{:.2f}".format(avg7 / 100.0)
+                avg7_str = "{}&nbsp;({}d)".format(avg7_pounds, avg7_count)
+            else:
+                avg7_str = ""
 
-            text += "<tr><td><a href='#heading-{}'>{}</a></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>".format(id, id, name, date, metric_str, cost_str, cost10_str, export, imported, soc)
+            text += "<tr><td><a href='#heading-{}'>{}</a></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>".format(id, id, name, date, metric_str, cost_str, cost10_str, avg7_str, export, imported, soc)
             if self.base.iboost_enable:
                 text += "<td>{}</td>".format(final_iboost)
             if self.base.carbon_enable:
@@ -2612,15 +4454,35 @@ var options = {
             id = compare.get("id", "")
             series_data.append({"name": name, "data": compare_hist.get(id, {}).get("metric", {}), "chart_type": "bar"})
         series_data.append({"name": "Actual", "data": cost_yesterday_hist, "chart_type": "line", "stroke_width": "2"})
-        if self.base.car_charging_hold:
+        if self.base.num_cars > 0:
             series_data.append({"name": "Actual (no car)", "data": cost_yesterday_no_car, "chart_type": "line", "stroke_width": "2"})
 
         now_str = self.now_utc.strftime(TIME_FORMAT)
 
         if compare_hist:
             text += self.render_chart(series_data, self.currency_symbols[0], "Tariff Comparison - True cost", now_str, daily_chart=False)
+        elif not compare_list:
+            text += '<br><h2>No tariffs configured yet - see <a href="https://springfall2008.github.io/batpred/compare/" target="_blank" rel="noopener noreferrer">Comparing Energy Tariffs</a> for how to add some to apps.yaml</h2><br>'
         else:
             text += "<br><h2>Loading chart (please wait)...</h2><br>"
+
+        # 7-day rolling average chart
+        text += '<div id="chart7d"></div>'
+        series_7d = []
+        for compare in compare_list:
+            name = compare.get("name", "")
+            id = compare.get("id", "")
+            rolling_pence = self.rolling_7d_average(compare_hist.get(id, {}).get("cost_1am", {}))
+            # cost_1am is stored in pence; convert to pounds to match the chart axis
+            rolling = {k: dp2(v / 100) for k, v in rolling_pence.items()}
+            if rolling:
+                series_7d.append({"name": name, "data": rolling, "chart_type": "line", "stroke_width": "2"})
+        if series_7d:
+            text += self.render_chart(series_7d, self.currency_symbols[0], "Tariff Comparison - 7 day rolling average", now_str, tagname="chart7d", daily_chart=False)
+        elif not compare_list:
+            pass  # Already explained by the "No tariffs configured" message above
+        else:
+            text += "<br><h2>7 day rolling average chart loading (please wait)...</h2><br>"
 
         # HTML Plans
         for compare in compare_list:
@@ -2672,6 +4534,9 @@ var options = {
         except Exception as e:
             file_error = f"Error reading apps.yaml: {str(e)}"
 
+        # Calculate MD5 checksum of the content for external change detection
+        file_checksum = hashlib.md5(apps_yaml_content.encode("utf-8")).hexdigest() if apps_yaml_content else ""
+
         text += get_editor_css()
         text += """
 
@@ -2681,10 +4546,10 @@ var options = {
         <div id="lintStatus" style="margin-top: 8px;"></div>
 """
 
-        text += """
+        text += f"""
     </div>
 
-    <form id="editorForm" class="editor-form" method="post" action="./apps_editor">
+    <form id="editorForm" class="editor-form" method="post" action="./apps_editor" data-file-checksum="{file_checksum}">
         <!-- We use a regular textarea that CodeMirror will replace -->
         <textarea class="editor-textarea" name="apps_content" id="appsContent" placeholder="Loading apps.yaml content...">"""
 
@@ -2721,13 +4586,28 @@ var options = {
 
         return web.Response(content_type="text/html", text=text)
 
+    async def html_apps_editor_checksum(self, request):
+        """
+        Return the current checksum and content of apps.yaml for external change detection
+        """
+        try:
+            apps_yaml_path = "apps.yaml"
+            with open(apps_yaml_path, "r") as f:
+                content = f.read()
+            checksum = hashlib.md5(content.encode("utf-8")).hexdigest()
+            return web.json_response({"checksum": checksum, "content": content})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
     async def html_apps_editor_post(self, request):
         """
         Handle POST request for apps.yaml editor - save the file
         """
         try:
             postdata = await request.post()
-            apps_content = postdata.get("apps_content", "")
+            apps_content = postdata.get("apps_content", None)
+            if apps_content is None:
+                raise web.HTTPFound("./apps_editor?error=" + urllib.parse.quote("No content provided to save"))
 
             # Remove dos line endings
             apps_content = apps_content.replace("\r\n", "\n").replace("\r", "\n")
@@ -2747,8 +4627,6 @@ var options = {
                 self.log(f"Backup created at {backup_path}")
 
             # Redirect back to editor with success message
-            import urllib.parse
-
             success_message = f"Apps.yaml saved successfully. Backup created at {backup_path}."
             encoded_message = urllib.parse.quote(success_message)
             raise web.HTTPFound(f"./apps_editor?success={encoded_message}")
@@ -2758,8 +4636,6 @@ var options = {
         except Exception as e:
             error_msg = f"Failed to save apps.yaml: {str(e)}"
             self.log(f"ERROR: {error_msg}")
-            import urllib.parse
-
             encoded_error = urllib.parse.quote(error_msg)
             raise web.HTTPFound(f"./apps_editor?error={encoded_error}")
 
@@ -2834,9 +4710,16 @@ var options = {
         if not self.base.dashboard_index:
             return '<span class="mdi mdi-battery-sync"></span>'
 
-        percent = calc_percent_limit(self.base.soc_kw, self.base.soc_max)
+        soc_now = self.get_state_wrapper(self.prefix + ".soc_kw", attribute="soc_now", default=None)
+        soc_max = self.get_state_wrapper(self.prefix + ".soc_kw", attribute="soc_max", default=None)
+        if soc_now is None or not soc_max:
+            return '<span class="mdi mdi-battery-sync"></span>'
+
+        percent = calc_percent_limit(soc_now, soc_max)
         percent_rounded_to_nearest_10 = round(float(percent) / 10) * 10
-        if self.base.isCharging:
+        is_charging = self.get_state_wrapper("binary_sensor." + self.prefix + "_charging", default="off") == "on"
+        is_exporting = self.get_state_wrapper("binary_sensor." + self.prefix + "_exporting", default="off") == "on"
+        if is_charging:
             if percent_rounded_to_nearest_10 == 0:
                 icon_text = "battery-charging-outline"
             else:
@@ -2852,7 +4735,7 @@ var options = {
         text = '<span class="mdi mdi-{}"></span>'.format(icon_text)
         text += str(dp2(percent)) + "%"
 
-        if self.base.isExporting:
+        if is_exporting:
             text += '<span class="mdi mdi-transmission-tower-export"></span>'
         return text
 
@@ -2908,35 +4791,61 @@ var options = {
             override_time = get_override_time_from_string(now_utc, time_str, self.plan_interval_minutes)
 
             minutes_from_now = (override_time - now_utc).total_seconds() / 60
-            if minutes_from_now >= 48 * 60:
-                return web.json_response({"success": False, "message": "Override time must be within 48 hours from now."}, status=400)
+            if minutes_from_now >= MANUAL_RATE_MAX_MINUTES:
+                max_hours = MANUAL_RATE_MAX_MINUTES // 60
+                return web.json_response({"success": False, "message": f"Override time must be within {max_hours} hours from now."}, status=400)
+
+            # Calculate minutes from midnight for looking up existing rates
+            minutes_from_midnight = int((override_time - self.midnight_utc).total_seconds() / 60)
 
             selection_option = "{}={}".format(override_time.strftime("%a %H:%M"), rate)
-            clear_option = "[{}={}]".format(override_time.strftime("%a %H:%M"), rate)
+
+            # For clear operations, we need to use the actual stored rate value, not the passed rate
             if action == "Clear Import":
+                manual_import_rates = self.base.manual_rates("manual_import_rates", update=False)
+                actual_rate = manual_import_rates.get(minutes_from_midnight, rate)
+                clear_option = "[{}={}]".format(override_time.strftime("%a %H:%M"), actual_rate)
                 await self.base.async_manual_select("manual_import_rates", clear_option)
             elif action == "Set Import":
                 item = self.base.config_index.get("manual_import_value", {})
-                await self.base.ha_interface.set_state_external(item.get("entity", None), rate)
+                await self.set_state_external(item.get("entity", None), rate)
                 await self.base.async_manual_select("manual_import_rates", selection_option)
             elif action == "Clear Export":
+                manual_export_rates = self.base.manual_rates("manual_export_rates", update=False)
+                actual_rate = manual_export_rates.get(minutes_from_midnight, rate)
+                clear_option = "[{}={}]".format(override_time.strftime("%a %H:%M"), actual_rate)
                 await self.base.async_manual_select("manual_export_rates", clear_option)
             elif action == "Set Export":
                 item = self.base.config_index.get("manual_export_value", {})
-                await self.base.ha_interface.set_state_external(item.get("entity", None), rate)
+                await self.set_state_external(item.get("entity", None), rate)
                 await self.base.async_manual_select("manual_export_rates", selection_option)
             elif action == "Set Load":
                 item = self.base.config_index.get("manual_load_value", {})
-                await self.base.ha_interface.set_state_external(item.get("entity", None), rate)
+                await self.set_state_external(item.get("entity", None), rate)
                 await self.base.async_manual_select("manual_load_adjust", selection_option)
             elif action == "Clear Load":
+                manual_load_adjust = self.base.manual_rates("manual_load_adjust", update=False)
+                actual_rate = manual_load_adjust.get(minutes_from_midnight, rate)
+                clear_option = "[{}={}]".format(override_time.strftime("%a %H:%M"), actual_rate)
                 await self.base.async_manual_select("manual_load_adjust", clear_option)
             elif action == "Set SOC":
                 item = self.base.config_index.get("manual_soc_value", {})
-                await self.base.ha_interface.set_state_external(item.get("entity", None), rate)
+                await self.set_state_external(item.get("entity", None), rate)
                 await self.base.async_manual_select("manual_soc", selection_option)
             elif action == "Clear SOC":
+                manual_soc = self.base.manual_rates("manual_soc", update=False)
+                actual_rate = manual_soc.get(minutes_from_midnight, rate)
+                clear_option = "[{}={}]".format(override_time.strftime("%a %H:%M"), actual_rate)
                 await self.base.async_manual_select("manual_soc", clear_option)
+            elif action == "Set SOC Max":
+                item = self.base.config_index.get("manual_soc_max_value", {})
+                await self.set_state_external(item.get("entity", None), rate)
+                await self.base.async_manual_select("manual_soc_max", selection_option)
+            elif action == "Clear SOC Max":
+                manual_soc_max = self.base.manual_rates("manual_soc_max", update=False)
+                actual_rate = manual_soc_max.get(minutes_from_midnight, rate)
+                clear_option = "[{}={}]".format(override_time.strftime("%a %H:%M"), actual_rate)
+                await self.base.async_manual_select("manual_soc_max", clear_option)
             else:
                 self.log("ERROR: Unknown action for rate override")
                 return web.json_response({"success": False, "message": "Unknown action"}, status=400)
@@ -2976,8 +4885,9 @@ var options = {
                 return web.json_response({"success": False, "message": "Invalid time format"}, status=400)
 
             minutes_from_now = (override_time - now_utc).total_seconds() / 60
-            if minutes_from_now >= 48 * 60:
-                return web.json_response({"success": False, "message": "Override time must be within 48 hours from now."}, status=400)
+            if minutes_from_now >= MANUAL_TIME_MAX_MINUTES:
+                max_hours = MANUAL_TIME_MAX_MINUTES // 60
+                return web.json_response({"success": False, "message": f"Override time must be within {max_hours} hours from now."}, status=400)
 
             selection_option = "{}".format(override_time.strftime("%a %H:%M"))
             clear_option = "[{}]".format(override_time.strftime("%a %H:%M"))
@@ -3025,6 +4935,206 @@ var options = {
             self.log(f"Error counting entities for filter '{event_filter}': {e}")
         return count
 
+    def get_entities_matching_filter(self, event_filter):
+        """
+        Get a list of entities that match the given event filter pattern.
+        Returns a list of dicts with entity_id, state, unit_of_measurement, and friendly_name.
+        Sorted by entity_id.
+        """
+        entities = []
+        try:
+            # Get all entities from Home Assistant
+            all_entities = self.get_state_wrapper()
+            if all_entities:
+                for entity_id in all_entities.keys():
+                    if event_filter in entity_id:
+                        entity_data = all_entities[entity_id]
+                        state = entity_data.get("state", "")
+                        attributes = entity_data.get("attributes", {})
+                        unit_of_measurement = attributes.get("unit_of_measurement", "")
+                        friendly_name = attributes.get("friendly_name", entity_id)
+
+                        entities.append({"entity_id": entity_id, "state": str(state), "unit_of_measurement": str(unit_of_measurement) if unit_of_measurement else "", "friendly_name": friendly_name})
+
+                # Sort by entity_id
+                entities.sort(key=lambda x: x["entity_id"])
+        except Exception as e:
+            self.log(f"Error getting entities for filter '{event_filter}': {e}")
+
+        return entities
+
+    async def html_component_entities(self, request):
+        """
+        API endpoint to return entities matching a filter as JSON
+        """
+        try:
+            args = request.query
+            event_filter = args.get("filter", "")
+
+            if not event_filter:
+                return web.json_response({"entities": []}, status=200)
+
+            entities = self.get_entities_matching_filter(event_filter)
+            return web.json_response({"entities": entities}, status=200)
+
+        except Exception as e:
+            self.log(f"Error in html_component_entities: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    def _coordinator(self):
+        """Return the discovery coordinator, or None when there is no component registry."""
+        components = getattr(self.base, "components", None)
+        return getattr(components, "coordinator", None) if components else None
+
+    def _discovery_value_html(self, value):
+        """Render one catalogue value - a scalar, a list or a nested container - as HTML.
+
+        Deliberately generic: it renders whatever shape it is handed rather than knowing the
+        catalogue's fields. The catalogue is designed to grow, and a renderer written against a
+        fixed field list would silently omit anything added later - which is precisely the kind of
+        gap an observe-only release exists to catch. Every value is escaped: info strings come from
+        third-party vendor APIs, not from Predbat.
+        """
+        if isinstance(value, dict):
+            return self._discovery_fields_html(value)
+        if isinstance(value, list):
+            if not value:
+                return "<span class='discovery-token'>none</span>"
+            if all(not isinstance(item, (dict, list)) for item in value):
+                return " ".join("<span class='discovery-token'>{}</span>".format(html_module.escape(str(item))) for item in value)
+            return "".join("<div class='discovery-nested'>{}</div>".format(self._discovery_value_html(item)) for item in value)
+        return "<span class='discovery-token'>{}</span>".format(html_module.escape(str(value)))
+
+    def _discovery_fields_html(self, mapping, skip=()):
+        """Render a mapping as labelled rows, recursing into whatever it nests."""
+        text = ""
+        for key in mapping:
+            if key in skip:
+                continue
+            value = mapping[key]
+            label = html_module.escape(str(key))
+            nested = isinstance(value, dict) and value
+            nested = nested or (isinstance(value, list) and value and any(isinstance(item, (dict, list)) for item in value))
+            if nested:
+                text += "<div class='discovery-field'><span class='discovery-key'>{}</span>:</div>\n".format(label)
+                text += "<div class='discovery-nested'>{}</div>\n".format(self._discovery_value_html(value))
+            else:
+                text += "<div class='discovery-field'><span class='discovery-key'>{}</span>: {}</div>\n".format(label, self._discovery_value_html(value))
+        return text
+
+    def _discovery_record_html(self, record):
+        """Render one catalogue record as a card, titled by its device_id and reporting source."""
+        text = "<div class='discovery-card'>\n"
+        text += "<div class='discovery-card-title'>{}".format(html_module.escape(str(record.get("device_id", "(no device_id)"))))
+        source = record.get("source")
+        if source:
+            text += "<span class='discovery-source'>{}</span>".format(html_module.escape(str(source)))
+        text += "</div>\n"
+        # entities is much the largest container on a real inverter - collapsed so one record does
+        # not push every other section off the screen.
+        entities = record.get("entities")
+        text += self._discovery_fields_html(record, skip=("device_id", "source", "entities"))
+        if entities:
+            text += "<details><summary>{} entities</summary><div class='discovery-nested'>{}</div></details>\n".format(len(entities), self._discovery_fields_html(entities))
+        text += "</div>\n"
+        return text
+
+    def _discovery_document_html(self, catalogue):
+        """Render the whole catalogue as the YAML a bug report would carry, for copying out."""
+        try:
+            stream = StringIO()
+            YAML().dump(json.loads(json.dumps(catalogue, default=str)), stream)
+            body = stream.getvalue()
+        except Exception as e:
+            self.log("Warn: Web: could not render the discovery document as YAML: {}".format(e))
+            body = json.dumps(catalogue, indent=2, default=str)
+        return "<details><summary>Full document</summary><pre class='discovery-raw'>{}</pre></details>\n".format(html_module.escape(body))
+
+    async def html_discovery(self, request):
+        """
+        Return the discovery catalogue as an HTML page
+
+        Redacted by default - what a debug dump would carry - with ?raw=1 for the unredacted view.
+        Reads the coordinator directly rather than parsing sensor.predbat_discovery's attributes
+        back out: that entity deliberately carries only a summary, and the coordinator is the
+        better coupling anyway (see Coordinator.publish()).
+        """
+        raw = str(request.query.get("raw", "")).lower() in ("1", "true", "yes", "on")
+        self.default_page = "./discovery"
+        text = self.get_header("Predbat Discovery", refresh=60)
+        text += "<body>\n"
+        text += get_discovery_css()
+        text += "<h2>Discovery Catalogue</h2>\n"
+
+        coordinator = self._coordinator()
+        catalogue = None
+        if coordinator is not None:
+            try:
+                catalogue = coordinator.catalogue_raw() if raw else coordinator.catalogue()
+            except Exception as e:
+                self.log("Warn: Web: failed to read the discovery catalogue: {}".format(e))
+
+        if catalogue is None:
+            text += "<div class='discovery-empty'>The discovery catalogue is not available - no component coordinator is running yet.</div>\n"
+            text += "</body></html>\n"
+            return web.Response(content_type="text/html", text=text)
+
+        # Any list at the top level is a section of records, so a section added to the catalogue
+        # later appears here without this page being taught about it.
+        meta_keys = ("schema_version", "generated", "components", "observations")
+        sections = [key for key, value in catalogue.items() if key not in meta_keys and isinstance(value, list)]
+
+        text += "<div class='discovery-bar'>\n"
+        text += "<div class='discovery-counts'>\n"
+        text += "<span class='discovery-count'>schema {}</span>\n".format(html_module.escape(str(catalogue.get("schema_version", "?"))))
+        text += "<span class='discovery-count'>generated {}</span>\n".format(html_module.escape(str(catalogue.get("generated", "?"))))
+        for section in sections:
+            text += "<span class='discovery-count'>{} {}</span>\n".format(len(catalogue[section]), html_module.escape(section))
+        text += "</div>\n"
+        if raw:
+            text += "<a class='discovery-toggle' href='./discovery'>Show redacted</a>\n"
+        else:
+            text += "<a class='discovery-toggle' href='./discovery?raw=1'>Show raw values</a>\n"
+        text += "</div>\n"
+
+        if raw:
+            text += "<div class='discovery-warning'><strong>Raw view.</strong> Serial numbers, MPANs and account identifiers are shown unredacted - this view is <strong>not safe to share</strong>. Use the redacted view for anything you post in a bug report.</div>\n"
+
+        conflicts = catalogue.get("observations", {}).get("conflicts", [])
+        if conflicts:
+            text += "<div class='discovery-conflicts'>\n"
+            text += "<strong>{} conflict(s)</strong> - two components describing the same hardware, or competing for the same slot.\n".format(len(conflicts))
+            for conflict in conflicts:
+                text += "<div class='discovery-nested'>{}</div>\n".format(self._discovery_fields_html(conflict))
+            text += "</div>\n"
+        else:
+            text += "<div class='discovery-clear'>No conflicts - no two components are describing the same hardware.</div>\n"
+
+        components = catalogue.get("components", {})
+        if components:
+            text += "<h3>Components</h3>\n"
+            text += "<div class='discovery-grid'>\n"
+            for name in sorted(components):
+                text += "<div class='discovery-card'>\n"
+                text += "<div class='discovery-card-title'>{}</div>\n".format(html_module.escape(str(name)))
+                text += self._discovery_fields_html(components[name] if isinstance(components[name], dict) else {"status": components[name]})
+                text += "</div>\n"
+            text += "</div>\n"
+
+        for section in sections:
+            records = catalogue[section]
+            if not records:
+                continue
+            text += "<h3>{} <span class='discovery-count'>{}</span></h3>\n".format(html_module.escape(section.title()), len(records))
+            text += "<div class='discovery-grid'>\n"
+            for record in records:
+                text += self._discovery_record_html(record if isinstance(record, dict) else {"device_id": record})
+            text += "</div>\n"
+
+        text += self._discovery_document_html(catalogue)
+        text += "</body></html>\n"
+        return web.Response(content_type="text/html", text=text)
+
     async def html_components(self, request):
         """
         Return the Components view as an HTML page showing status of all components
@@ -3033,43 +5143,96 @@ var options = {
         text = self.get_header("Predbat Components", refresh=60)
         text += "<body>\n"
         text += get_components_css()
-
-        text += "<h2>Component Status</h2>\n"
-        text += "<div class='components-grid'>\n"
+        text += get_entity_modal_css()
+        text += get_component_edit_modal_css()
+        text += get_entity_modal_js()
+        text += get_component_edit_modal_js()
 
         # Get all component information
         all_components = self.base.components.get_all()
         active_components = self.base.components.get_active()
 
+        # Count components by status
+        error_components = []
+        active_healthy_components = []
+        disabled_components = []
+
         for component_name in all_components:
+            is_alive = self.base.components.is_alive(component_name)
+            is_active = component_name in active_components
+
+            if (is_active and not is_alive) or self.base.components.load_error(component_name):
+                error_components.append(component_name)
+            elif is_active and is_alive:
+                active_healthy_components.append(component_name)
+            else:
+                disabled_components.append(component_name)
+
+        # Add heading with checkbox and totals on the same line
+        text += "<div style='display: flex; align-items: center; margin-bottom: 15px;'>\n"
+        text += "<h2 style='margin: 0; margin-right: 20px;'>Component Status</h2>\n"
+        text += "<label style='cursor: pointer; margin-right: 20px; white-space: nowrap;'>\n"
+        text += "<input type='checkbox' id='showDisabledCheckbox' onclick='toggleDisabledComponents()' style='margin-right: 8px;'>\n"
+        text += "Show disabled components\n"
+        text += "</label>\n"
+        text += "<div style='white-space: nowrap;'>\n"
+        text += f"<span style='color: #d32f2f; font-weight: bold;'>{len(error_components)} Error</span> | \n"
+        text += f"<span style='color: #4CAF50; font-weight: bold;'>{len(active_healthy_components)} Active</span> | \n"
+        text += f"<span style='color: #666; font-weight: bold;'>{len(disabled_components)} Disabled</span>\n"
+        text += "</div>\n"
+        text += "</div>\n"
+
+        text += "<div class='components-grid'>\n"
+
+        # Sort components: errors first, then active, then disabled
+        sorted_components = error_components + active_healthy_components + disabled_components
+
+        for component_name in sorted_components:
             from components import COMPONENT_LIST
 
             component_info = COMPONENT_LIST.get(component_name, {})
-            component = self.base.components.get_component(component_name)
             is_alive = self.base.components.is_alive(component_name)
             can_restart = self.base.components.can_restart(component_name)
             is_active = component_name in active_components
+            # Configured but failed to import or construct: inactive, yet shown as an error
+            load_error = self.base.components.load_error(component_name)
 
             # Get last updated time
             last_updated_time = self.base.components.last_updated_time(component_name)
             time_ago_text = format_time_ago(last_updated_time)
 
             # Create component card
-            text += f'<div class="component-card {"active" if is_active else "inactive"}">\n'
+            if load_error:
+                # Not "inactive" as well: that rule would paint over the error border
+                card_class = "error"
+            elif is_active and not is_alive:
+                card_class = "active error"
+            elif is_active:
+                card_class = "active"
+            else:
+                card_class = "inactive"
+
+            # Add data-disabled attribute for filtering
+            disabled_attr = 'data-disabled="true"' if not (is_active or load_error) else 'data-disabled="false"'
+
+            text += f'<div class="component-card {card_class}" {disabled_attr}>\n'
             text += f'<div class="component-header">\n'
             text += f'<h3>{component_info.get("name", component_name)}</h3>\n'
 
             # Status indicator
             if is_active and is_alive:
                 text += '<span class="status-indicator status-healthy">●</span><span class="status-text">Active</span>\n'
-            elif is_active and not is_alive:
+            elif (is_active and not is_alive) or load_error:
                 text += '<span class="status-indicator status-error">●</span><span class="status-text">Error</span>\n'
             else:
                 text += '<span class="status-indicator status-inactive">●</span><span class="status-text">Disabled</span>\n'
 
-            # Add restart button for active components
-            if is_active and can_restart:
+            # Add restart button for active and failed components
+            if (is_active or load_error) and can_restart:
                 text += f'<button class="restart-button" onclick="restartComponent(\'{component_name}\')" title="Restart this component">Restart</button>\n'
+
+            # Add edit button for all components
+            text += f'<button class="edit-button" onclick="showComponentEditModal(\'{component_name}\')" title="Edit component configuration">&#9998;</button>\n'
 
             text += f"</div>\n"
 
@@ -3078,6 +5241,16 @@ var options = {
 
             # Add last updated time
             text += f'<p><strong>Last Updated:</strong> <span class="last-updated-time">{time_ago_text}</span></p>\n'
+
+            # Say why a component could not be initialised
+            if load_error:
+                text += f'<p><strong>Error:</strong> <span class="error-count-high">{html_module.escape(load_error)}</span></p>\n'
+
+            # Add error count
+            error_count = self.base.components.get_error_count(component_name)
+            if error_count is not None:
+                error_class = "error-count-high" if error_count > 0 else "error-count-none"
+                text += f'<p><strong>Error Count:</strong> <span class="{error_class}">{error_count}</span></p>\n'
 
             # Show args and their current values
             args_info = component_info.get("args", {})
@@ -3126,17 +5299,112 @@ var options = {
                 # Count entities that match the filter
                 entity_count = self.count_entities_matching_filter(event_filter)
                 count_class = "entity-count-zero" if entity_count == 0 else "entity-count-positive"
-                text += f'<p><strong>Entities:</strong> <span class="{count_class}">num_entities: {entity_count}</span></p>\n'
+
+                # Make entity count clickable only if count > 0
+                if entity_count > 0:
+                    onclick_attr = f"onclick=\"showEntityModal('{event_filter}')\""
+                    style_attr = 'style="cursor: pointer; text-decoration: underline;"'
+                    text += f'<p><strong>Entities:</strong> <span class="{count_class}" {style_attr} {onclick_attr}> num_entities: {entity_count}</span></p>\n'
+                else:
+                    text += f'<p><strong>Entities:</strong> <span class="{count_class}">num_entities: {entity_count}</span></p>\n'
 
             text += f"</div>\n"
             text += f"</div>\n"
 
         text += "</div>\n"
 
+        # Add entity modal container
+        text += """
+<!-- Entity Modal -->
+<div id="entityModal" class="entity-modal">
+    <div class="entity-modal-content">
+        <span class="entity-modal-close" onclick="closeEntityModal()">&times;</span>
+        <h2 id="entityModalTitle">Entities</h2>
+        <input type="text" id="entitySearchInput" class="entity-search-input" placeholder="Search entities..." oninput="filterEntityTable()">
+        <div class="entity-list-table-container">
+            <table class="entity-list-table" id="entityTable">
+                <thead>
+                    <tr>
+                        <th>Entity ID</th>
+                        <th>Friendly Name</th>
+                        <th>State</th>
+                    </tr>
+                </thead>
+                <tbody id="entityTableBody">
+                </tbody>
+            </table>
+        </div>
+        <div id="entityEmptyState" class="entity-empty-state" style="display: none;">No entities found</div>
+    </div>
+</div>
+
+<!-- Component Edit Modal -->
+<div id="componentEditModal" class="entity-modal">
+    <div class="entity-modal-content component-edit-modal-content">
+        <span class="entity-modal-close" onclick="closeComponentEditModal()">&times;</span>
+        <h2 id="componentEditModalTitle">Edit Component Configuration</h2>
+        <div id="componentEditForm" class="component-edit-form">
+            <!-- Form will be populated dynamically -->
+        </div>
+        <div id="componentEditError" class="component-edit-error"></div>
+        <div class="component-edit-buttons">
+            <button id="componentEditSaveBtn" class="save-button" onclick="saveComponentConfig()">Save</button>
+            <button class="cancel-button" onclick="closeComponentEditModal()">Cancel</button>
+        </div>
+    </div>
+</div>
+"""
+
         text += get_restart_button_js()
+
+        # Add JavaScript for toggling disabled components
+        text += """
+<script>
+function toggleDisabledComponents() {
+    const checkbox = document.getElementById('showDisabledCheckbox');
+    const showDisabled = checkbox.checked;
+
+    // Save preference to sessionStorage
+    sessionStorage.setItem('showDisabledComponents', showDisabled);
+
+    // Get all component cards
+    const cards = document.querySelectorAll('.component-card[data-disabled="true"]');
+
+    // Show or hide disabled components
+    cards.forEach(card => {
+        card.style.display = showDisabled ? '' : 'none';
+    });
+}
+
+// On page load, restore checkbox state from sessionStorage
+document.addEventListener('DOMContentLoaded', function() {
+    const checkbox = document.getElementById('showDisabledCheckbox');
+    const savedState = sessionStorage.getItem('showDisabledComponents');
+
+    // Default to false (unchecked) if no saved state
+    const showDisabled = savedState === 'true';
+    checkbox.checked = showDisabled;
+
+    // Apply the initial state
+    toggleDisabledComponents();
+});
+</script>
+"""
 
         text += "</body></html>\n"
         return web.Response(content_type="text/html", text=text)
+
+    async def html_inverter_refresh(self, request):
+        """
+        Handle inverter refresh request by resetting the last fetch time
+        """
+        try:
+            self.log("Inverter refresh requested from web interface")
+            self.base.inverter_data_last_fetch = None
+            return web.json_response({"success": True, "message": "Inverter refresh initiated"})
+        except Exception as e:
+            self.log(f"ERROR: Failed to initiate inverter refresh: {str(e)}")
+            return web.json_response({"success": False, "message": str(e)}, status=500)
 
     async def html_restart(self, request):
         """
@@ -3183,6 +5451,203 @@ var options = {
             self.log(f"ERROR: Failed to restart component: {str(e)}")
             return web.json_response({"success": False, "message": str(e)}, status=500)
 
+    async def html_component_config(self, request):
+        """
+        Get component configuration for editing
+        """
+        try:
+            from components import COMPONENT_LIST
+
+            args = request.query
+            component_name = args.get("component_name")
+
+            if not component_name:
+                return web.json_response({"success": False, "message": "Missing component_name parameter"}, status=400)
+
+            if component_name not in COMPONENT_LIST:
+                return web.json_response({"success": False, "message": f"Component '{component_name}' not found"}, status=404)
+
+            component_info = COMPONENT_LIST[component_name]
+            args_info = component_info.get("args", {})
+            required_or = component_info.get("required_or", [])
+            display_name = component_info.get("name", component_name)
+
+            result_args = []
+
+            for arg_name, arg_info in args_info.items():
+                config_key = arg_info.get("config", "")
+                if not config_key:
+                    continue
+
+                required = arg_info.get("required", False)
+                default = arg_info.get("default", None)
+
+                # Get current value from self.args
+                current_value = self.args.get(config_key, None)
+
+                # Determine type from APPS_SCHEMA
+                field_type = "text"
+                if config_key in APPS_SCHEMA:
+                    schema_entry = APPS_SCHEMA[config_key]
+                    if isinstance(schema_entry, dict):
+                        schema_type_str = schema_entry.get("type", "text")
+                        if "boolean" in schema_type_str:
+                            field_type = "boolean"
+                        elif "integer" in schema_type_str or "int" in schema_type_str:
+                            field_type = "integer"
+                        elif "float" in schema_type_str:
+                            field_type = "float"
+                        elif "string_list" in schema_type_str:
+                            field_type = "string_list"
+                        elif "dict_list" in schema_type_str or "dict" == schema_type_str:
+                            field_type = "dict"
+                        else:
+                            field_type = "text"
+                else:
+                    # Infer from default value
+                    if isinstance(default, bool):
+                        field_type = "boolean"
+                    elif isinstance(default, int):
+                        field_type = "integer"
+                    elif isinstance(default, float):
+                        field_type = "float"
+                    elif isinstance(default, list):
+                        field_type = "string_list"
+                    elif isinstance(default, dict):
+                        field_type = "dict"
+
+                # Check if in required_or list
+                is_required_or = config_key in required_or or arg_name in required_or
+
+                result_args.append({"config_key": config_key, "required": required, "required_or": is_required_or, "current_value": current_value, "default": default, "type": field_type})
+
+            return web.json_response({"success": True, "component_name": component_name, "display_name": display_name, "args": result_args})
+
+        except Exception as e:
+            self.log(f"ERROR: Failed to get component config: {str(e)}")
+            traceback.print_exc()
+            return web.json_response({"success": False, "message": str(e)}, status=500)
+
+    async def html_component_config_save(self, request):
+        """
+        Save component configuration using ruamel.yaml
+        """
+        try:
+            json_data = await request.json()
+            component_name = json_data.get("component_name")
+            changes = json_data.get("changes", {})
+            deletions = json_data.get("deletions", [])
+
+            if not component_name:
+                return web.json_response({"success": False, "message": "Missing component_name"}, status=400)
+
+            self.log(f"Component config save requested: {component_name}, changes={list(changes.keys())}, deletions={deletions}")
+
+            # Read and parse apps.yaml
+            apps_yaml_path = "apps.yaml"
+            yaml = YAML()
+            yaml.preserve_quotes = True
+            yaml.default_flow_style = False
+            yaml.width = YAML_DUMP_WIDTH
+
+            try:
+                with open(apps_yaml_path, "r") as f:
+                    data = yaml.load(f)
+            except Exception as e:
+                return web.json_response({"success": False, "message": f"Error reading apps.yaml: {str(e)}"}, status=500)
+
+            if not data:
+                data = {}
+
+            if ROOT_YAML_KEY not in data:
+                return web.json_response({"success": False, "message": f"{ROOT_YAML_KEY} section not found in apps.yaml"}, status=500)
+
+            # Process changes
+            for config_key, new_value in changes.items():
+                # Look up type in APPS_SCHEMA
+                field_type = "text"
+                if config_key in APPS_SCHEMA:
+                    schema_entry = APPS_SCHEMA[config_key]
+                    if isinstance(schema_entry, dict):
+                        schema_type_str = schema_entry.get("type", "text")
+                        if "boolean" in schema_type_str:
+                            field_type = "boolean"
+                        elif "integer" in schema_type_str or "int" in schema_type_str:
+                            field_type = "integer"
+                        elif "float" in schema_type_str:
+                            field_type = "float"
+                        elif "string_list" in schema_type_str:
+                            field_type = "string_list"
+                        elif "dict_list" in schema_type_str or "dict" == schema_type_str:
+                            field_type = "dict"
+
+                # Convert value based on type
+                try:
+                    if field_type == "boolean":
+                        if isinstance(new_value, bool):
+                            converted_value = new_value
+                        else:
+                            converted_value = str(new_value).lower() == "true"
+                    elif field_type == "integer":
+                        converted_value = int(new_value)
+                    elif field_type == "float":
+                        converted_value = float(new_value)
+                    elif field_type == "string_list":
+                        # Already should be a list from JSON
+                        converted_value = new_value if isinstance(new_value, list) else [new_value]
+                    elif field_type == "dict":
+                        # Parse JSON/YAML string from frontend
+                        if isinstance(new_value, dict):
+                            converted_value = new_value
+                        elif isinstance(new_value, list):
+                            converted_value = new_value
+                        else:
+                            # Try JSON first, then fall back to YAML
+                            try:
+                                converted_value = json.loads(str(new_value))
+                            except json.JSONDecodeError:
+                                # Fall back to YAML parser
+                                yaml_parser = YAML()
+                                stream = StringIO(str(new_value))
+                                converted_value = yaml_parser.load(stream)
+                    else:
+                        # String type - always quote strings for safety
+                        converted_value = DoubleQuotedScalarString(str(new_value))
+
+                    data[ROOT_YAML_KEY][config_key] = converted_value
+
+                    # Mask password values in log
+                    log_value = converted_value
+                    if any(sensitive in config_key.lower() for sensitive in ["password", "key", "secret", "token"]):
+                        log_value = "***"
+                    self.log(f"Setting {config_key} = {log_value}")
+
+                except ValueError as e:
+                    return web.json_response({"success": False, "message": f"Invalid {field_type} value for {config_key}: {str(e)}"}, status=400)
+
+            # Process deletions
+            for config_key in deletions:
+                if config_key in data[ROOT_YAML_KEY]:
+                    del data[ROOT_YAML_KEY][config_key]
+                    self.log(f"Deleted {config_key}")
+
+            # Write back to file
+            try:
+                with open(apps_yaml_path, "w") as f:
+                    yaml.dump(data, f)
+
+                self.log(f"Component {component_name} config updated successfully")
+
+                return web.json_response({"success": True, "message": "Configuration saved. Predbat will restart automatically."})
+
+            except Exception as e:
+                return web.json_response({"success": False, "message": f"Error writing to apps.yaml: {str(e)}"}, status=500)
+
+        except Exception as e:
+            self.log(f"ERROR: Failed to save component config: {str(e)}")
+            traceback.print_exc()
+            return web.json_response({"success": False, "message": str(e)}, status=500)
+
     async def html_browse(self, request):
         """
         Return the Browse page as an HTML page with file browsing functionality
@@ -3196,8 +5661,6 @@ var options = {
 
         # Security check - prevent directory traversal attacks
         # Normalize the path and ensure it's within the current working directory
-        import os.path
-
         base_dir = os.getcwd()
         safe_path = os.path.abspath(os.path.join(base_dir, current_path))
 
@@ -3256,7 +5719,10 @@ var options = {
                     text += f'<div class="file-viewer">\n'
                     text += f'<div class="file-header">\n'
                     text += f"<h3>Viewing: {view_file}</h3>\n"
+                    text += f'<div class="file-actions">\n'
+                    text += f'<a href="./download?path={current_path}&file={view_file}" class="download-button" download><span class="mdi mdi-download"></span> Download</a>\n'
                     text += f'<a href="./browse?path={current_path}" class="back-button">← Back to Directory</a>\n'
+                    text += f"</div>\n"
                     text += f"</div>\n"
 
                     # File content with basic syntax highlighting
@@ -3381,3 +5847,655 @@ var options = {
 
         text += "</body></html>\n"
         return web.Response(content_type="text/html", text=text)
+
+    async def html_download_file(self, request):
+        """
+        Download a file from the filesystem
+        """
+        args = request.query
+        current_path = args.get("path", ".")
+        download_file = args.get("file", None)
+
+        if not download_file:
+            return web.Response(text="File not specified", status=400)
+
+        # Security check - prevent directory traversal attacks
+        base_dir = os.getcwd()
+        safe_path = os.path.abspath(os.path.join(base_dir, current_path))
+
+        # Ensure the path is within the base directory
+        if not safe_path.startswith(base_dir):
+            return web.Response(text="Access denied", status=403)
+
+        file_path = os.path.join(safe_path, download_file)
+
+        try:
+            # Security check for file path
+            file_abs_path = os.path.abspath(file_path)
+            if not file_abs_path.startswith(base_dir):
+                return web.Response(text="Access denied", status=403)
+
+            if os.path.isfile(file_abs_path):
+                # Read file content
+                with open(file_abs_path, "rb") as f:
+                    content = f.read()
+
+                # Set appropriate content type based on file extension
+                file_ext = os.path.splitext(download_file)[1].lower()
+                content_type = "application/octet-stream"
+
+                if file_ext in [".yaml", ".yml"]:
+                    content_type = "text/yaml"
+                elif file_ext in [".py"]:
+                    content_type = "text/x-python"
+                elif file_ext in [".json"]:
+                    content_type = "application/json"
+                elif file_ext in [".log", ".txt"]:
+                    content_type = "text/plain"
+                elif file_ext in [".html"]:
+                    content_type = "text/html"
+                elif file_ext in [".md"]:
+                    content_type = "text/markdown"
+
+                # Create response with download headers
+                response = web.Response(body=content, content_type=content_type)
+                response.headers["Content-Disposition"] = f'attachment; filename="{download_file}"'
+                return response
+            else:
+                return web.Response(text="File not found", status=404)
+        except PermissionError:
+            return web.Response(text="Permission denied", status=403)
+        except Exception as e:
+            self.log(f"Error downloading file: {str(e)}")
+            return web.Response(text=f"Error downloading file: {str(e)}", status=500)
+
+    async def html_logo_image(self, request):
+        """
+        Serve the bundled Predbat logo images locally.
+
+        The logos used to be loaded from raw.githubusercontent.com, which left the
+        dashboard hanging for ~15s whenever GitHub was unreachable or rate-limiting
+        (issue #4562). They now ship alongside the other app files so the page never
+        depends on internet access to render.
+        """
+        content_types = {
+            "bat_logo.svg": "image/svg+xml",
+            "bat_logo_light.png": "image/png",
+            "bat_logo_dark.png": "image/png",
+        }
+        filename = request.match_info.get("filename")
+        content_type = content_types.get(filename)
+        if not content_type:
+            return web.Response(text="Not found", status=404)
+
+        file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+        try:
+            with open(file_path, "rb") as handle:
+                content = handle.read()
+        except OSError:
+            return web.Response(text="Not found", status=404)
+
+        return web.Response(body=content, content_type=content_type, headers={"Cache-Control": "public, max-age=604800"})
+
+    async def html_metrics_dashboard(self, request):
+        """
+        Return the Metrics Dashboard page rendered inside the standard PredBat web shell.
+        """
+        self.default_page = "./metrics_dashboard"
+
+        if not PROMETHEUS_AVAILABLE:
+            text = self.get_header("Predbat Metrics", refresh=0)
+            text += "<body>\n"
+            text += """<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:60vh;text-align:center;padding:2rem;">
+<h1>Metrics Dashboard Unavailable</h1>
+<p><code>prometheus_client</code> is not installed.</p>
+<p>Install it with: <code>pip install prometheus_client</code></p>
+<p style="margin-top:1.5rem;"><a href="./dash" style="padding:10px 20px;background:#4CAF50;color:white;text-decoration:none;border-radius:4px;font-size:16px;">&larr; Back to Dashboard</a></p>
+</div>
+"""
+            text += "</body></html>\n"
+            return web.Response(text=text, content_type="text/html")
+
+        import json as _json
+
+        data_json = _json.dumps(metrics().to_dict())
+
+        text = self.get_header("Predbat Metrics", refresh=0)
+        text += "<body>\n"
+        text += get_metrics_dashboard_css()
+        text += get_metrics_dashboard_body(data_json)
+        text += "</body></html>\n"
+        return web.Response(content_type="text/html", text=text)
+
+    async def html_internals(self, request):
+        """
+        Return the Internals page showing the class hierarchy and object inspection
+        """
+        self.default_page = "./internals"
+
+        text = self.get_header("Predbat Internals", refresh=0)
+        text += "<body>\n"
+        text += get_internals_css()
+        text += get_internals_js()
+
+        text += '<div class="internals-container">\n'
+        text += '<div class="breadcrumb-container">\n'
+        text += "<h2>Predbat Internals Browser</h2>\n"
+        text += '<div class="breadcrumb">Browse the internal object hierarchy starting from predbat</div>\n'
+        text += "</div>\n"
+
+        # Add thread stack frames section
+        text += '<div class="threads-section">\n'
+        text += "<h3>Thread Stack Frames</h3>\n"
+        text += '<div class="threads-container">\n'
+        text += self._get_thread_stacks_html()
+        text += "</div>\n"
+        text += "</div>\n"
+
+        # Object tree in a panel
+        text += '<div class="tree-section">\n'
+        text += "<h3>Object Hierarchy</h3>\n"
+        text += '<div class="tree-container">\n'
+        text += '<div class="tree-view">\n'
+
+        # Create a single root node for 'predbat' pointing to self.base
+        text += '<div class="tree-item" title="predbat" onclick="toggleNode(this, \'predbat\')">\n'
+        text += '<span class="expand-icon expandable">+</span>'
+        text += '<button class="refresh-icon" title="Refresh this node" onclick="event.stopPropagation(); refreshNode(this, \'predbat\')">🔄</button>'
+        text += '<a href="./api/internals/download?path=predbat" class="download-icon" title="Download as YAML" onclick="event.stopPropagation()">⬇</a>'
+        text += '<span class="key">predbat</span>'
+        text += f'<span class="type">&lt;{type(self.base).__name__}&gt;</span>'
+        text += "</div>\n"
+        text += '<div class="tree-children"></div>\n'
+
+        text += "</div>\n"  # tree-view
+        text += "</div>\n"  # tree-container
+        text += "</div>\n"  # tree-section
+        text += "</div>\n"  # internals-container
+
+        text += "</body></html>\n"
+        return web.Response(content_type="text/html", text=text)
+
+    def _get_thread_stacks_html(self):
+        """
+        Get HTML representation of all thread stack frames
+        """
+        text = ""
+
+        try:
+            # Get all thread frames
+            frames = sys._current_frames()
+            threads = {thread.ident: thread for thread in threading.enumerate()}
+
+            # Sort threads by name for consistent display
+            thread_list = []
+            for thread_id, frame in frames.items():
+                thread = threads.get(thread_id)
+                thread_name = thread.name if thread else f"Thread-{thread_id}"
+                thread_list.append((thread_name, thread_id, frame, thread))
+
+            thread_list.sort(key=lambda x: x[0])
+
+            if not thread_list:
+                text += '<div class="thread-item">No threads found</div>'
+                return text
+
+            for thread_name, thread_id, frame, thread in thread_list:
+                # Thread header
+                text += f'<div class="thread-item">'
+                text += f'<div class="thread-header" onclick="toggleThreadStack(this)">'
+                text += f'<span class="expand-icon expandable">+</span>'
+                text += f'<span class="thread-name">{thread_name}</span>'
+                text += f'<span class="thread-id">ID: {thread_id}</span>'
+                if thread:
+                    alive_status = "alive" if thread.is_alive() else "dead"
+                    daemon_status = "daemon" if thread.daemon else "normal"
+                    text += f'<span class="thread-status">{alive_status}, {daemon_status}</span>'
+                text += "</div>"
+
+                # Stack trace (collapsed by default)
+                text += f'<div class="thread-stack collapsed">'
+
+                # Extract all stack frames
+                stack = traceback.extract_stack(frame)
+
+                text += '<div class="stack-frames">'
+                for i, frame_info in enumerate(stack):
+                    frame_num = i
+                    text += f'<div class="stack-frame">'
+                    text += f'<span class="frame-number">#{frame_num}</span>'
+                    text += f'<span class="frame-file">{frame_info.filename}:{frame_info.lineno}</span>'
+                    text += f'<span class="frame-function">in {frame_info.name}()</span>'
+                    if frame_info.line:
+                        text += f'<div class="frame-code">{html_module.escape(frame_info.line.strip())}</div>'
+                    text += "</div>"
+                text += "</div>"
+
+                # Check if this thread has an asyncio event loop with tasks
+                asyncio_tasks = self._get_thread_asyncio_tasks(frame)
+                if asyncio_tasks:
+                    text += '<div class="asyncio-tasks">'
+                    text += "<h4>Asyncio Tasks in this thread:</h4>"
+                    for task_info in asyncio_tasks:
+                        text += '<div class="asyncio-task">'
+                        text += f'<div class="task-header">'
+                        text += f'<span class="task-name">{task_info["name"]}</span>'
+                        text += f'<span class="task-state">{task_info["state"]}</span>'
+                        text += "</div>"
+                        if task_info.get("stack"):
+                            text += '<div class="task-stack">'
+                            for frame_info in task_info["stack"]:
+                                text += f'<div class="stack-frame">'
+                                text += f'<span class="frame-file">{frame_info["file"]}:{frame_info["line"]}</span>'
+                                text += f'<span class="frame-function">in {frame_info["name"]}()</span>'
+                                if frame_info.get("code"):
+                                    text += f'<div class="frame-code">{html_module.escape(frame_info["code"])}</div>'
+                                text += "</div>"
+                            text += "</div>"
+                        text += "</div>"
+                    text += "</div>"
+
+                text += "</div>"  # thread-stack
+                text += "</div>"  # thread-item
+
+        except Exception as e:
+            self.log(f"Error getting thread stacks: {e}")
+            text += f'<div class="error">Error retrieving thread information: {html_module.escape(str(e))}</div>'
+
+        return text
+
+    def _get_thread_asyncio_tasks(self, frame):
+        """
+        Extract asyncio tasks from a thread's frame if it's running an event loop
+        """
+        tasks_info = []
+
+        try:
+            # Try to find the event loop in this thread's frame locals
+            current_frame = frame
+            event_loop = None
+
+            # Walk up the stack to find the event loop
+            while current_frame is not None:
+                if "self" in current_frame.f_locals:
+                    obj = current_frame.f_locals["self"]
+                    if isinstance(obj, asyncio.AbstractEventLoop):
+                        event_loop = obj
+                        break
+                current_frame = current_frame.f_back
+
+            if not event_loop:
+                return tasks_info
+
+            # Get all tasks for this event loop
+            all_tasks = asyncio.all_tasks(event_loop)
+
+            for task in all_tasks:
+                task_name = task.get_name()
+
+                # Get task state
+                if task.done():
+                    if task.cancelled():
+                        state = "cancelled"
+                    else:
+                        state = "done"
+                else:
+                    state = "running"
+
+                task_info = {"name": task_name, "state": state, "stack": []}
+
+                # Get the coroutine stack
+                try:
+                    coro = task.get_coro()
+                    if coro:
+                        # Get the stack frames for this coroutine
+                        stack = []
+                        cr_frame = getattr(coro, "cr_frame", None)
+                        if cr_frame:
+                            # Extract stack from coroutine frame
+                            frames_list = []
+                            current = cr_frame
+                            while current:
+                                frames_list.append(current)
+                                current = current.f_back
+
+                            # Reverse to show from oldest to newest
+                            frames_list.reverse()
+
+                            for fr in frames_list:
+                                code = fr.f_code
+                                line_no = fr.f_lineno
+
+                                # Try to get the actual line of code
+                                try:
+                                    import linecache
+
+                                    line_code = linecache.getline(code.co_filename, line_no).strip()
+                                except Exception:
+                                    line_code = ""
+
+                                stack.append({"file": code.co_filename, "line": line_no, "name": code.co_name, "code": line_code})
+
+                            task_info["stack"] = stack
+                except Exception:
+                    # If we can't get the coroutine stack, just skip it
+                    pass
+
+                tasks_info.append(task_info)
+
+        except Exception as e:
+            self.log(f"Error extracting asyncio tasks: {e}")
+
+        return tasks_info
+
+    async def html_api_internals(self, request):
+        """
+        API endpoint to get object members for a given path
+        """
+        args = request.query
+        path = args.get("path", "")
+
+        try:
+            # Navigate to the requested object
+            obj = self.base
+            if path and path != "predbat":
+                parts = path.split("::")
+                # Skip 'predbat' if it's the first part
+                if parts[0] == "predbat":
+                    parts = parts[1:]
+                for part in parts:
+                    # Check dict first before hasattr to avoid accessing dict methods
+                    if isinstance(obj, dict):
+                        if part in obj:
+                            obj = obj[part]
+                        else:
+                            return web.Response(content_type="application/json", text=json.dumps({"success": False, "error": f"Key not found: {part}"}))
+                    elif isinstance(obj, (list, tuple)):
+                        try:
+                            # Strip brackets if present (e.g., "[0]" -> "0")
+                            index_str = part.strip("[]")
+                            index = int(index_str)
+                            obj = obj[index]
+                        except (ValueError, IndexError):
+                            return web.Response(content_type="application/json", text=json.dumps({"success": False, "error": f"Invalid index: {part}"}))
+                    elif hasattr(obj, part):
+                        obj = getattr(obj, part)
+                    else:
+                        return web.Response(content_type="application/json", text=json.dumps({"success": False, "error": f"Path not found: {path}"}))
+
+            # Get members of the object
+            members = self._get_object_members(obj, path)
+
+            return web.Response(content_type="application/json", text=json.dumps({"success": True, "members": members}))
+        except Exception as e:
+            self.log(f"Error in internals API: {str(e)}")
+            return web.Response(content_type="application/json", text=json.dumps({"success": False, "error": str(e)}))
+
+    async def html_api_internals_download(self, request):
+        """
+        API endpoint to download object as YAML
+        """
+        args = request.query
+        path = args.get("path", "")
+
+        try:
+            # Navigate to the requested object
+            obj = self.base
+            if path and path != "predbat":
+                parts = path.split("::")
+                # Skip 'predbat' if it's the first part
+                if parts[0] == "predbat":
+                    parts = parts[1:]
+                for part in parts:
+                    # Check dict first before hasattr to avoid accessing dict methods
+                    if isinstance(obj, dict):
+                        if part in obj:
+                            obj = obj[part]
+                        else:
+                            return web.Response(content_type="text/plain", text=f"Error: Key not found: {part}")
+                    elif isinstance(obj, (list, tuple)):
+                        try:
+                            # Strip brackets if present (e.g., "[0]" -> "0")
+                            index_str = part.strip("[]")
+                            index = int(index_str)
+                            obj = obj[index]
+                        except (ValueError, IndexError):
+                            return web.Response(content_type="text/plain", text=f"Error: Invalid index: {part}")
+                    elif hasattr(obj, part):
+                        obj = getattr(obj, part)
+                    else:
+                        return web.Response(content_type="text/plain", text=f"Error: Attribute not found: {part}")
+
+            # Convert object to YAML-serializable format
+            try:
+                yaml_data = self._object_to_yaml_dict(obj, visited=set())
+            except Exception as e:
+                self.log(f"Error converting object to YAML dict: {e}")
+                return web.Response(content_type="text/plain", text=f"Error: Failed to convert object to YAML-serializable format: {str(e)}")
+
+            # Convert to YAML
+            try:
+                yaml = YAML()
+                yaml.default_flow_style = False
+                yaml.preserve_quotes = True
+
+                stream = io.StringIO()
+                yaml.dump(yaml_data, stream)
+                yaml_content = stream.getvalue()
+            except Exception as e:
+                self.log(f"Error dumping YAML: {e}")
+                return web.Response(content_type="text/plain", text=f"Error: Failed to serialize to YAML format: {str(e)}\n\nThis object may contain types that are not YAML-serializable.")
+
+            # Generate filename from path
+            if path:
+                filename = path.replace("::", "_") + ".yaml"
+            else:
+                filename = "predbat_root.yaml"
+
+            # Return as downloadable file
+            return web.Response(content_type="application/x-yaml", headers={"Content-Disposition": f'attachment; filename="{filename}"'}, text=yaml_content)
+
+        except Exception as e:
+            self.log(f"Error downloading internals as YAML: {e}")
+            return web.Response(content_type="text/plain", text=f"Error: {str(e)}")
+
+    def _object_to_yaml_dict(self, obj, max_depth=10, current_depth=0, visited=None):
+        """
+        Convert an object to a YAML-serializable dictionary
+        Handles nested objects, lists, dicts, etc.
+        Detects circular references to prevent infinite loops
+        """
+        if visited is None:
+            visited = set()
+
+        if current_depth >= max_depth:
+            return f"<max depth {max_depth} reached>"
+
+        # Handle None
+        if obj is None:
+            return None
+
+        # Handle primitives (no circular reference check needed)
+        if isinstance(obj, (str, int, float, bool)):
+            return obj
+
+        # Check for circular references for complex objects
+        obj_id = id(obj)
+        if obj_id in visited:
+            return f"<circular reference to {type(obj).__name__}>"
+
+        # Add to visited set
+        visited.add(obj_id)
+
+        # Handle lists and tuples
+        if isinstance(obj, (list, tuple)):
+            result = []
+            for i, item in enumerate(obj[:100]):  # Limit to 100 items
+                try:
+                    result.append(self._object_to_yaml_dict(item, max_depth, current_depth + 1, visited))
+                except Exception as e:
+                    result.append(f"<error at index {i}: {type(e).__name__}>")
+            # Remove from visited after processing to allow same object in different branches
+            visited.discard(obj_id)
+            return result
+
+        # Handle dictionaries
+        if isinstance(obj, dict):
+            result = {}
+            for key, value in list(obj.items())[:100]:  # Limit to 100 items
+                try:
+                    # Ensure key is YAML-serializable
+                    yaml_key = str(key) if not isinstance(key, (str, int, float, bool)) else key
+                    result[yaml_key] = self._object_to_yaml_dict(value, max_depth, current_depth + 1, visited)
+                except Exception as e:
+                    try:
+                        yaml_key = str(key)
+                    except Exception:
+                        yaml_key = f"<unprintable_key_{hash(key)}>"
+                    result[yaml_key] = f"<error: {type(e).__name__}>"
+            # Remove from visited after processing to allow same object in different branches
+            visited.discard(obj_id)
+            return result
+
+        # Handle objects with __dict__
+        if hasattr(obj, "__dict__"):
+            result = {}
+            try:
+                obj_dict = obj.__dict__
+                for key, value in list(obj_dict.items())[:100]:  # Limit to 100 items
+                    if not key.startswith("_"):
+                        try:
+                            result[key] = self._object_to_yaml_dict(value, max_depth, current_depth + 1, visited)
+                        except Exception as e:
+                            result[key] = f"<error: {type(e).__name__}>"
+            except Exception as e:
+                visited.discard(obj_id)
+                return f"<{type(obj).__name__} object - error accessing __dict__: {type(e).__name__}>"
+            # Remove from visited after processing to allow same object in different branches
+            visited.discard(obj_id)
+            return result if result else f"<{type(obj).__name__} object>"
+
+        # Fallback: try to convert to string
+        try:
+            str_value = str(obj)
+            if len(str_value) > 200:
+                return str_value[:200] + "..."
+            return str_value
+        except Exception:
+            return f"<{type(obj).__name__}>"
+
+    def _get_object_members(self, obj, path):
+        """
+        Get members of an object for display in the internals browser
+        Returns a list of dictionaries with key, type, value, and expandable flag
+        """
+        members = []
+
+        try:
+            # Handle dictionaries
+            if isinstance(obj, dict):
+                for key in sorted(obj.keys())[:100]:  # Limit to first 100 items
+                    try:
+                        value = obj[key]
+                        member_info = self._analyze_value(str(key), value, path)
+                        members.append(member_info)
+                    except Exception as e:
+                        members.append({"key": str(key), "type": "error", "value": f"Error: {str(e)}", "expandable": False})
+
+                if len(obj) > 100:
+                    members.append({"key": "...", "type": "info", "value": f"({len(obj) - 100} more items)", "expandable": False})
+
+            # Handle lists/tuples
+            elif isinstance(obj, (list, tuple)):
+                for i, value in enumerate(obj[:100]):  # Limit to first 100 items
+                    try:
+                        member_info = self._analyze_value(f"[{i}]", value, path)
+                        members.append(member_info)
+                    except Exception as e:
+                        members.append({"key": f"[{i}]", "type": "error", "value": f"Error: {str(e)}", "expandable": False})
+
+                if len(obj) > 100:
+                    members.append({"key": "...", "type": "info", "value": f"({len(obj) - 100} more items)", "expandable": False})
+
+            # Handle objects with attributes
+            else:
+                # Get all attributes
+                attrs = []
+                for attr in dir(obj):
+                    # Skip private attributes and methods
+                    if attr.startswith("_"):
+                        continue
+                    attrs.append(attr)
+
+                # Sort and limit
+                for attr in sorted(attrs)[:200]:  # Limit to 200 attributes
+                    try:
+                        value = getattr(obj, attr)
+                        # Skip methods for now (could make them expandable later)
+                        if callable(value):
+                            continue
+                        member_info = self._analyze_value(attr, value, path)
+                        members.append(member_info)
+                    except Exception as e:
+                        members.append({"key": attr, "type": "error", "value": f"Error: {str(e)}", "expandable": False})
+
+        except Exception as e:
+            self.log(f"Error getting object members: {str(e)}")
+            members.append({"key": "error", "type": "error", "value": str(e), "expandable": False})
+
+        return members
+
+    def _analyze_value(self, key, value, path):
+        """
+        Analyze a value and return information about it
+        """
+        value_type = type(value).__name__
+        expandable = False
+        display_value = None
+        type_size = None
+
+        # Check if expandable
+        if isinstance(value, dict):
+            expandable = len(value) > 0
+            display_value = f"{{{len(value)} items}}"
+            type_size = len(value)
+        elif isinstance(value, (list, tuple)):
+            expandable = len(value) > 0
+            display_value = f"[{len(value)} items]"
+            type_size = len(value)
+        elif hasattr(value, "__dict__") and not isinstance(value, (str, int, float, bool, type(None))):
+            # Object with attributes
+            expandable = True
+            display_value = f"<{value_type} object>"
+        elif isinstance(value, (str, int, float, bool, type(None))):
+            # Scalar types
+            expandable = False
+            if isinstance(value, str):
+                # Truncate long strings
+                if len(value) > 100:
+                    display_value = value[:100] + "..."
+                else:
+                    display_value = value
+            else:
+                display_value = value
+        else:
+            # Other types
+            try:
+                str_value = str(value)
+                if len(str_value) > 100:
+                    display_value = str_value[:100] + "..."
+                else:
+                    display_value = str_value
+            except Exception:
+                display_value = f"<{value_type}>"
+
+        # Build the full path for this item using :: as separator
+        full_path = f"{path}::{key}" if path else key
+
+        result = {"key": key, "type": value_type, "value": display_value, "expandable": expandable, "path": full_path}
+
+        # Add size for collections
+        if type_size is not None:
+            result["size"] = type_size
+
+        return result

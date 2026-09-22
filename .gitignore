@@ -9,12 +9,17 @@ batpred.code-workspace
 .Trashes
 ehthumbs.db
 Thumbs.db
+dev_code
+sigenergy_mqtt_key
 
 # Python cache files
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+# Cross-built prediction kernel binaries are checked in (per-platform, see
+# build_kernel_cross.sh); the local native build prediction_kernel_lib.so stays ignored
+!apps/predbat/prediction_kernel_lib_*.so
 .Python
 build/
 develop-eggs/
@@ -34,18 +39,26 @@ wheels/
 MANIFEST
 
 # Test and coverage files
+tools/shuffle_fuzz_known_pairs.txt
 coverage/*.yaml
 coverage/*.log
 coverage/*.json
 coverage/*.txt
 coverage/*.db
 coverage/*.html
+coverage/*.prof
+coverage/*.py
 coverage/cache/
 coverage/debug/
 coverage/predbat_standalone/
 coverage/predbat_standalone_ha/
 coverage/supabase/
-.coverage
+coverage/octopus/
+coverage/venv/
+apps/predbat/tests/.om_live_cache
+.venv/
+venv/
+coverage/temp_octopus/
 .pytest_cache/
 .tox/
 .nox/
@@ -54,6 +67,7 @@ htmlcov/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+temp_octopus
 
 # Generated test files
 *_test.html
@@ -66,6 +80,7 @@ dmypy.json
 *.bin
 profile.txt
 simulation_state.bin
+*.npz
 
 # Generated HTML files
 plan_*.html
@@ -73,6 +88,8 @@ plan_*.html
 
 # Generated PNG files
 *.png
+!apps/predbat/bat_logo_light.png
+!apps/predbat/bat_logo_dark.png
 
 # Build artifacts
 a.out
@@ -92,3 +109,18 @@ apps.mod.yaml
 apps.yaml.mark
 comparisons.yaml
 it
+
+# Written to the CLI's cwd by a headless PredBat instance before annual_cli.py's --work-dir
+# takes effect (create_headless_predbat() sets config_root only after load_user_config()/
+# fetch_config_options() have already run) - so running the documented annual_cli.py command
+# from the repo root leaves this behind.
+predbat_config.json
+
+# Runtime-generated manifest
+apps/predbat/manifest.yaml
+
+# Dev-deploy/standalone commit marker (see coverage/deploy, hass.py)
+apps/predbat/git_version.txt
+
+# Claude Code local worktrees
+.claude/worktrees/

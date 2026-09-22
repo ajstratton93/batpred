@@ -7,12 +7,19 @@ or daily/half-hourly/quarter-hour rates that track electricity market prices (e.
 
 Energy rates are all configured in the `apps.yaml` file that's stored in a directory name that depends on [what type of Predbat installation method you have used](apps-yaml.md#appsyaml-settings).
 
-You will need to use a file editor within Home Assistant (e.g. either the File editor or Studio Code Server add-ons)
+You will need to use a file editor within Home Assistant (e.g. either the File editor or Studio Code Server apps)
 to edit this file - see [editing configuration files within Home Assistant](install.md#editing-configuration-files-in-home-assistant) if you need to install an editor.
 
-There are four different ways of configuring your Energy rates in `apps.yaml`, using [Octopus Energy Direct](#octopus-energy-direct),
-using the [Octopus Energy Integration](#octopus-energy-home-assistant-integration), using [Octopus Rates URL's](#octopus-rates-url),
-or manually [defining your rates and time periods](#rate-bands-to-manually-configure-energy-rates).
+There are a number of different ways of configuring your Energy rates in `apps.yaml`:
+
+- [Octopus Energy Direct](#octopus-energy-direct), Predbat directly connecting to your Octopus account
+- [Octopus Energy Integration](#octopus-energy-home-assistant-integration), Predbat getting Octopus rates from the Octopus Energy integration
+- [Octopus Rates URL's](#octopus-rates-url), configuring Predbat to directly use the correct URL's for your Octopus tariff (not recommended as can stop working when you change tariff)
+- [Kraken component](#kraken-integration-for-edf-or-eonnext), Predbat getting rates directly from Kraken for EDF or Eon.Next customers
+- [Energidataservice Integration](#energidataservice-integration), Predbat getting rates from the Energidataservice integration
+- [Strømligning Integration](#strømligning-integration), Predbat getting rates from the Strømligning integration
+- [Spot rates](#other-energy-spot-rate-sensor-integrations), Predbat retrieves spot rates from correctly formatted import and export rate sensors
+- [Manually defining your rates and time periods](#rate-bands-to-manually-configure-energy-rates).
 
 At least one of these methods must be used to define your import and export rates. If you don't then Predbat will assume zero for your energy rates.
 
@@ -102,12 +109,12 @@ Repeat this for the other events.
 
 The gas rates are only required if you have a gas boiler, and an iBoost, and are [using Predbat to determine whether it's cheaper to heat your hot water with the iBoost or via gas](customisation.md#iboost-energy-rate-filtering)
 
-Verify that the integration is working correctly in Home Assistant by going to Developer Tools / States, and entering 'octopus' in the 'Filter entities' box.
+Verify that the integration is working correctly in Home Assistant by going to 'Settings' / 'Developer Tools' / 'States', and entering 'octopus' in the 'Filter entities' box.
 Confirm that the Octopus entities are being populated correctly.
 
 ### Configuring Predbat to use the Octopus Energy integration
 
-The following configuration items in apps.yaml are used to configure Predbat to use the Octopus Energy integration.
+The following configuration items in `apps.yaml` are used to configure Predbat to use the Octopus Energy integration.
 They are set to a regular expression and should be auto-discovered so that Predbat automatically uses the Octopus Energy integration,
 but you can comment out the regular expression lines to disable, or you set them manually.
 
@@ -118,44 +125,57 @@ but you can comment out the regular expression lines to disable, or you set them
 
 metric_octopus_gas is (as above) only required to be configured if you are using Predbat to determine whether to heat your hot water via your iBoost or gas.
 
-If you do not have an export rate or are not on the Octopus Go tariff, then the appropriate lines can be commented out in apps.yaml.
+If you do not have an export rate or are not on the Octopus Go tariff, then the appropriate lines can be commented out in `apps.yaml`.
 
-NOTE: Predbat using the Octopus integration rates relies upon the day rate events being enabled (see above) and the events and the sensor found by metric_octopus_xxx in `apps.yaml` being similarly named.<BR>
+Note: Predbat using the Octopus integration rates relies upon the day rate events being enabled (see above) and the events and the sensor found by metric_octopus_xxx in `apps.yaml` being similarly named.<BR>
 There have been occasions with some Octopus Integration installations where the event name is as above but the sensor name has a different prefix, e.g. sensor.electricity_METER_NUMBER_current_rate and not sensor.octopus_energy_electricity_METER_NUMBER_current_rate.<BR>
 If this is the case then the sensor must be renamed to the correct format so that Predbat can function correctly.
 
 ### Standing charge
 
 Predbat can also (optionally) include the daily standing charge in cost predictions.
-The following configuration item in apps.yaml defaults to obtaining the standing charge from the Octopus Energy integration:
+The following configuration item in `apps.yaml` defaults to obtaining the standing charge from the Octopus Energy integration:
 
 - **metric_standing_charge** - Standing charge in pounds. By default points to the Octopus Energy integration sensor sensor.octopus_energy_electricity_METER_NUMBER_current_standing_charge
 
-You can manually change this to a standing charge in pounds, e.g. 0.50 is 50p, or delete this line from apps.yaml, or set it to zero
+You can manually change this to a standing charge in pounds, e.g. 0.50 is 50p, or delete this line from `apps.yaml`, or set it to zero
 if you don't want the standing charge (and only have consumption usage) to be included in Predbat charts and output data.
 
 Note that this configuration option to suppress the standing charge only applies if you are using the Octopus Integration from Predbat.
 If you are using the Octopus Energy direct method of Predbat directly connecting to Octopus then the standing charge will always be included in the plan and charts.
 
-### Octopus Saving sessions
+### Octopus Saving sessions (Power Down events)
 
-Predbat can automatically join you to Octopus saving sessions and plan battery activity for the saving session period to maximise your income.
+Predbat can automatically join you to Octopus saving sessions - now called Power Down events - and plan battery activity for the session period to maximise your income.
 
-Note: **You must have signed up to both the Octopus Octoplus and then the Saving Session schemes to benefit from these events**
+Note: **You must have signed up to both the Octopus Octoplus and then the Saving Session/Power Down schemes to benefit from these events**
 
 For Predbat to automatically manage Octopus saving sessions the following additional configuration item in `apps.yaml` is used.
 Like the electricity rates, this is set in the `apps.yaml` template to a regular expression that should auto-discover the Octopus Energy integration.
 
-- **octopus_saving_session** - Indicates if a saving session is active, should point to the sensor binary_sensor.octopus_energy_ACCOUNT_ID_octoplus_saving_sessions.
+- **octopus_saving_session** - Indicates if a saving session/Power Down event is active, should point to the sensor 'event.octopus_energy_ACCOUNT_ID_octoplus_power_down_events'.
+
+```yaml
+  octopus_saving_session: 're:(event.octopus_energy([0-9a-z_]+|)_(saving_session_events?|power_down_events))'
+```
+
+Octopus Energy integration v19.0.0 renamed this sensor from `..._octoplus_saving_session_events` to `..._octoplus_power_down_events`. The above pattern matches either name, so existing configurations keep working unchanged.
+The old sensor is retained by the integration until **January 2027**, after which only the Power Down naming will exist. The new sensor ships disabled by default in Home Assistant
+(`entity_registry_enabled_default: False`) - if Predbat's Octopus entity list does not show a Power Down sensor, [enable it in the entity registry first](https://bottlecapdave.github.io/HomeAssistant-OctopusEnergy/faq/#there-are-entities-that-are-disabled-why-are-they-disabled-and-how-do-i-enable-them), otherwise Predbat will keep silently using the old sensor with no visible warning.
 
 When a saving session is available it will be automatically joined by Predbat and should then appear as a joined session within the next 30 minutes.
 
-NOTE: Predbat automatically joining the saving session relies upon the event being enabled and Predbat being able to find the saving session event as 'event.octopus_energy_ACCOUNT_ID_octoplus_saving_session_events' - there have been occasions
-with some Octopus Integration installations where the event name is different.  If this is the case then the event must be renamed to the correct format that Predbat can function correctly.
+Auto-joining is controlled by the **switch.predbat_octopus_saving_auto_join** switch (On by default). Turn it Off if you want to decide which saving sessions to join yourself
+(for example through the Octopus app). When auto-join is Off, Predbat still plans your battery activity for any sessions you have already joined - it just will not join
+available sessions on your behalf.
+
+If an available saving session overlaps an Axle VPP session (any overlap in time), Predbat will **not** auto-join the saving session, as the two events cannot both be honoured for the same period. The Axle session takes priority.
+
+Predbat will also **not** auto-join a session whose reward rate doesn't exceed the **octopus_saving_session_min_octopoints_per_kwh** configuration item in `apps.yaml` (default 0 octopoints/kWh - joins any session with a positive reward). Raise this if you want to also skip low-value sessions you don't consider worth the disruption. The default of 0 additionally works around the Octopus Energy integration currently reporting some non-joinable events (national Power Up/free electricity slots) inside the same data set at 0 p/kWh - see [#4593](https://github.com/springfall2008/batpred/issues/4593).
 
 In the Predbat plan, for joined saving sessions the energy rates for import and export will be overridden by adding the assumed saving rate to your normal rate.
 The assumed rate will be taken from the Octopus Energy integration and converted into pence
-using the **octopus_saving_session_octopoints_per_penny** configuration item in apps.yaml (default is 8).
+using the **octopus_saving_session_octopoints_per_penny** configuration item in `apps.yaml` (default is 8).
 
 If you normally cut back your house usage during a saving session then you can change **input_number.predbat_load_scaling_saving** to allow Predbat to assume an energy
 reduction in this period. E.g. setting to a value of 0.8 would indicate you will use 80% of the normal consumption in that period (a 20% reduction).
@@ -171,24 +191,28 @@ If you do not have an export tariff then forced export will not apply and Predba
 If you do not want Predbat to automatically join Octopus saving sessions and manage your battery activity for the session,
 simply delete or comment out the **octopus_saving_session** entry in `apps.yaml`.
 
-### Octopus free (power up) events
+### Octopus free (Power Up) events
 
-Predbat can automatically detect Octopus free events and adjust your battery plan according. Note that this is derived from external sources, which do not verify your eligibility for free sessions.
+Predbat can automatically detect Octopus free events - now called Power Up events - and adjust your battery plan accordingly. Note that this is derived from external sources, which do not verify your eligibility for free sessions.
 
-For Predbat to automatically manage Octopus free sessions the following additional configuration item in apps.yaml is used.
+For Predbat to automatically manage Octopus free sessions the following additional configuration item in `apps.yaml` is used.
 
 Note: **You must have signed up to the Octopus Octoplus scheme and eligible to benefit from these events**
 
-Like the electricity rates, this is set in the apps.yaml template to a regular expression that should auto-discover the Octopus Energy integration.
+Like the electricity rates, this is set in the `apps.yaml` template to a regular expression that should auto-discover the Octopus Energy integration.
 
 **octopus_free_session** - Will point to the free event sensor that is exposed by the Octopus Energy Integration. This event sensor contains the dates/times of
 all the free events.
 
 ```yaml
-  octopus_free_session: 're:(event.octopus_energy_([0-9a-z_]+|)_octoplus_free_electricity_session_events)'
+  octopus_free_session: 're:(event.octopus_energy_([0-9a-z_]+|)_octoplus_(free_electricity_session_events|power_up_events))'
 ```
 
-Note: **This event may need to be enabled in Home Assistant first** - see [How to Enable Octopus events](https://bottlecapdave.github.io/HomeAssistant-OctopusEnergy/faq/#there-are-entities-that-are-disabled-why-are-they-disabled-and-how-do-i-enable-them)
+Octopus Energy integration v19.0.0 renamed this sensor from `..._octoplus_free_electricity_session_events` to `..._octoplus_power_up_events`. The above pattern matches either name, so existing
+configurations keep working unchanged. The old sensor is retained by the integration until **January 2027**, after which only the Power Up naming will exist.
+
+Note: **This event may need to be enabled in Home Assistant first** - the new Power Up sensor ships disabled by default (`entity_registry_enabled_default: False`), so if it is not appearing in
+Predbat's entity list, enable it in the entity registry - see [How to Enable Octopus events](https://bottlecapdave.github.io/HomeAssistant-OctopusEnergy/faq/#there-are-entities-that-are-disabled-why-are-they-disabled-and-how-do-i-enable-them)
 
 If you normally increase your house usage during a free session then you can change **input_number.predbat_load_scaling_free** to allow Predbat to assume an energy
 increase in this period. E.g. setting to a value of 1.2 would indicate you will use 20% more energy than normal during this period. (Default is 1.2)
@@ -206,7 +230,7 @@ not work in future if Octopus ever change the website format. If you enable this
 
 As an alternative to the Octopus Direct or Octopus Energy integration methods, for Octopus Energy customers,  you can configure Predbat to get the electricity rates directly online from the Octopus website.
 
-In apps.yaml configure the following lines:
+In `apps.yaml` configure the following lines:
 
 - **rates_import_octopus_url** to point to the appropriate import tariff URL on the Octopus website
 - **rates_export_octopus_url** to point to the export tariff URL
@@ -238,6 +262,24 @@ Look through that page to find the right URL for usage charges in your DNO area
 
 Configuring the Octopus rates URL is an expert feature as Octopus change the available products from time to time, so for most users, the Octopus Direct or Octopus Energy integration are simpler solutions.
 
+## Kraken integration for EDF or Eon.Next
+
+If you are a customer or EDF or Eon.Next, you can use the [Kraken component](components.md#kraken-energy-kraken) to auto-discover your energy rates.
+
+The following entries are required for the Kraken component in `apps.yaml`:
+
+```yaml
+  kraken_provider: edf or eon
+  kraken_account_id: A-12345678
+  kraken_export_account_id: A-87654321
+  kraken_auth_method: api_key or email
+  kraken_key: !secret kraken_key
+  kraken_email: myemail@example.com
+  kraken_password: !secret kraken_password
+```
+
+Full details of what to configure are given in the [component documentation](components.md#kraken-energy-kraken)
+
 ## Energidataservice Integration
 
 <https://github.com/MTrab/energidataservice>
@@ -255,6 +297,42 @@ The following configuration items in `apps.yaml` are used to configure Predbat t
 
 - **metric_energidataservice_export** - Export rates from the Energidataservice integration. This should point to the sensor that provides hourly export rates (e.g., solar feed-in rates), such as sensor.energi_data_service_export.
 
+## Strømligning Integration
+
+Strømligning is a Danish electricity price comparison service that provides detailed 15-minute interval pricing data.
+Unlike Energi Data Service, where Predbat reads both today's and tomorrow's prices from a single sensor entity per rate type using the `raw_today` and `raw_tomorrow` attributes, Strømligning requires 4 separate sensors:
+two for import prices (today and tomorrow) and optionally two for export prices (today and tomorrow).
+
+Each Strømligning sensor should provide attributes with the following format:
+
+- **prices_today** or **prices_tomorrow** - List of price intervals with:
+    - `price` - Price value
+    - `start` - Start time in ISO format (e.g., '2025-11-08T00:00:00+01:00')
+    - `end` - End time in ISO format (e.g., '2025-11-08T00:15:00+01:00')
+
+### Configuring Predbat to Use the Strømligning Integration
+
+The following configuration items in `apps.yaml` are used to configure Predbat to use Strømligning sensors:
+
+**Import Rates (Required):**
+
+- **metric_stromligning_import_today** - Sensor for today's import prices (must have `prices_today` attribute)
+- **metric_stromligning_import_tomorrow** - Sensor for tomorrow's import prices (must have `prices_tomorrow` attribute)
+
+**Export Rates (Optional):**
+
+- **metric_stromligning_export_today** - Sensor for today's export prices (must have `prices_today` attribute)
+- **metric_stromligning_export_tomorrow** - Sensor for tomorrow's export prices (must have `prices_tomorrow` attribute)
+
+Example configuration in `apps.yaml`:
+
+```yaml
+  metric_stromligning_import_today: 'sensor.stromligning_import_today'
+  metric_stromligning_import_tomorrow: 'sensor.stromligning_import_tomorrow'
+  metric_stromligning_export_today: 'sensor.stromligning_export_today'
+  metric_stromligning_export_tomorrow: 'sensor.stromligning_export_tomorrow'
+```
+
 ## Other Energy Spot Rate sensor integrations
 
 Different spot rate integrations that include forecast prices may be used.
@@ -267,22 +345,28 @@ Because integrations format their attribute data differently, a template sensor 
 
 ### Czech Republic example
 
+Czech republic has moved to 15 minute spot pricing.
+
+To make sure Predbat calculates 15-minute pricing correctly, add `plan_interval_minutes: 15` to `apps.yaml`.
 <https://github.com/rnovacek/homeassistant_cz_energy_spot_prices>
 
 ```yaml
 {% set attributes = states.sensor.current_buy_electricity_price.attributes %}
-{% set datetime_dict = zip(attributes.keys() | map('as_datetime', default={}), attributes.values()) | selectattr(0, 'datetime') %}
-{% set ns = namespace(output=[]) %}
-{% for start_time, price in datetime_dict %}
- {% if start_time < today_at() + timedelta(days=1) %}
-   {% set ns.output = ns.output + [{'start': start_time.isoformat(), 'end': (start_time + timedelta(hours=1)).isoformat(), 'value': price | round(5)}] %}
- {% endif %}
-{% endfor %}
-{{ns.output | sort(attribute='start') }}
+            {% set attributes = states.sensor.current_buy_electricity_price_15min.attributes %}
+            {% set datetime_dict = zip(attributes.keys() | map('as_datetime', default={}), attributes.values()) | selectattr(0, 'datetime') %}
+            {% set ns = namespace(output=[]) %}
+            {% for start_time, price in datetime_dict %}
+              {% if start_time < today_at() + timedelta(days=1) %}
+                {% set ns.output = ns.output + [{'start': start_time.isoformat(), 'end': (start_time + timedelta(minutes=15)).isoformat(), 'value': price | round(5)}] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.output | sort(attribute='start') }}
 ```
 
 Full code for CZ energy spot rate template:
-<https://gist.github.com/ziat007/ae29e26ae257f069520b65f0168c3a6b>
+<https://gist.github.com/ziat007/9c33453d5fa24b037d764dc40786f977>
+
+(flat clamped sell price sensor is used to trick Predbat when invertor is set to block export during negative pricing)
 
 ### Frank Energie Export rates with export fee
 
@@ -326,9 +410,9 @@ A template sensor can be used to manipulate the rates provided by the integratio
 
 ## Rate Bands to manually configure Energy Rates
 
-If you are not an Octopus Energy customer, or you are but your energy rates repeat simply, you can configure your rate bands in apps.yaml using rates_import/rates_export/rates_gas.
+If you are not an Octopus Energy customer, or you are but your energy rates repeat simply, you can configure your rate bands in `apps.yaml` using rates_import/rates_export/rates_gas.
 
-Add the following entries to apps.yaml to define the pattern of rates over 24 hours:
+Add the following entries to `apps.yaml` to define the pattern of rates over 24 hours:
 
 ```yaml
   rates_import:
@@ -368,16 +452,69 @@ start and end can be omitted and Predbat will assume that you are on a single fl
 
 If there are any gaps in the 24-hour period then a zero rate will be assumed.
 
+**utc** can be set to `true` on a rate band to say that its start and end times are given in UTC
+rather than local time. Predbat then shifts the band by the local offset, so it stays aligned with
+your meter through British Summer Time instead of running an hour early. Use this when your meter's
+schedule is fixed to UTC - Octopus fixes the Economy 7 smart-meter off-peak period to 00:30-07:30 UTC,
+which falls at 01:30-08:30 local during BST.
+
+```yaml
+  rates_import:
+    - start: "00:30:00"
+      end: "07:30:00"
+      rate: 13.04
+      utc: true
+    - start: "07:30:00"
+      end: "00:30:00"
+      rate: 29.26
+      utc: true
+```
+
 The gas rates are only required if you have a gas boiler, or an iBoost, and are using Predbat to determine whether it's cheaper to heat your hot water with the iBoost or via gas.
+
+## Manually configuring Octopus off-peak times
+
+Predbat works out the off-peak period of a day/night (two-register) Octopus tariff from the meter's
+own time-of-use labels, and falls back to the standard window for the tariff type if those are not
+available. If neither matches the bands your meter actually switches on, set `octopus_night_times`
+in apps.yaml to state them by hand. The **times** come from this setting while the **rates**
+continue to come from the Octopus integration, so you do not have to maintain the prices yourself:
+
+```yaml
+  octopus_night_times:
+    - start: "01:00:00"
+      end: "05:00:00"
+    - start: "13:00:00"
+      end: "16:00:00"
+    - start: "20:00:00"
+      end: "22:00:00"
+```
+
+Entries use the same start/end format as the rate bands above, and any number of off-peak blocks a
+day can be given - useful for an Economy 10 style meter with several off-peak periods. Every period
+not covered by an entry is charged at the day rate.
+
+As with the rate bands, `utc: true` marks an entry as being given in UTC rather than local time:
+
+```yaml
+  octopus_night_times:
+    - start: "00:30:00"
+      end: "07:30:00"
+      utc: true
+```
+
+This setting takes precedence over both the meter's reported schedule and the built-in defaults, so
+only set it if you have confirmed the real switching times - your bills, rather than the cost
+estimates in the Octopus account area, are the thing to check against.
 
 ## Manually over-riding energy rates
 
-You can also override the import or export energy rates (regardless of whether they are set manually or via the Octopus Energy integration) by using the override feature in apps.yaml.
+You can also override the import or export energy rates (regardless of whether they are set manually or via the Octopus Energy integration) by using the override feature in `apps.yaml`.
 
 Rate override is used to set the specific date and time period where your rates are different, e.g. an Octopus Power Up session (zero rate for an hour or two),
 or the British Gas half-price electricity on Sundays.
 
-Unfortunately, there aren't any API's available to feed this information automatically into Predbat so you will have to define your own input controls and use the [Predbat manual API](manual-api.md#example-solution-to-over-ride-predicted-house-load),
+Unfortunately, there aren't any API's available to feed this information automatically into Predbat so you will have to define your own input controls and use the [Predbat Manual API](manual-api.md#example-solution-to-over-ride-predicted-house-load),
 or edit `apps.yaml` manually to set the appropriate rate over-ride dates and times:
 
 ```yaml
@@ -451,12 +588,17 @@ and **input_number.predbat_metric_future_rate_offset_export** (*expert mode*) in
 ## Future Agile energy rates
 
 In the energy market, it's possible to calculate the Octopus Agile rates from around 10am UK time using public data, you can
-enable this in apps.yaml for Import, Export or both. This will approximate the next day's rates based on the spot prices.
+enable this in `apps.yaml` for Import, Export or both. This will approximate the next day's rates based on the spot prices.
 The approximation is only used until the real Octopus Agile rates are released around 4pm.
 
 - **futurerate_url** - URL of future energy market prices; this should not normally need to be changed
 - **futurerate_adjust_import** and **futurerate_adjust_export** - Whether tomorrow's predicted import or export prices should be adjusted based on energy market prices or not.
-Set these depending on whether you have an agile tariff for import, export or both
+  Set these depending on whether you have an Agile tariff for import, export or both.
+- **futurerate_adjust_auto** - When set to `true`, Predbat will automatically detect whether you are on an Agile tariff using the sensor attributes from
+  the [Octopus Energy integration](https://github.com/BottlecapDave/HomeAssistant-OctopusEnergy) or Predbat's built-in Octopus Component
+  (configured via `metric_octopus_import` / `metric_octopus_export`). If neither import nor export is detected as Agile, future rate fetching is skipped entirely.
+  If at least one is Agile, Predbat fetches future rates and automatically calibrates only the Agile rates, overriding the manual `futurerate_adjust_import` and
+  `futurerate_adjust_export` settings.
 - **futurerate_peak_start** and **futurerate_peak_end** - during the peak period Octopus applies an additional peak-rate price adjustment.
 These configuration items enable the peak-rate hours to be adjusted
 
@@ -467,11 +609,48 @@ Predbat accepts no responsibility for any violations:
 
 ```yaml
   futurerate_url: 'https://dataportal-api.nordpoolgroup.com/api/DayAheadPrices?date=DATE&market=N2EX_DayAhead&deliveryArea=UK&currency=GBP'
-  futurerate_adjust_import: True
-  futurerate_adjust_export: False
+  futurerate_adjust_auto: true
   futurerate_peak_start: "16:00:00"
   futurerate_peak_end: "19:00:00"
 ```
+
+Or, if you prefer to set import/export calibration manually rather than auto-detecting:
+
+```yaml
+  futurerate_url: 'https://dataportal-api.nordpoolgroup.com/api/DayAheadPrices?date=DATE&market=N2EX_DayAhead&deliveryArea=UK&currency=GBP'
+  futurerate_adjust_import: true
+  futurerate_adjust_export: false
+  futurerate_peak_start: "16:00:00"
+  futurerate_peak_end: "19:00:00"
+```
+
+## Axle VPP
+
+[Axle in the UK](https://vpp.axle.energy/landing) provide a Virtual Power Plant (VPP) service to the National Grid. In times of strain in the energy grid, Axle will command inverters to export, and in return you get paid £1/kWh.
+
+If you sign up to the Axle VPP service (currently only available for Fox, GivEnergy and SigEnergy inverters), Predbat can automatically retrieve details of the Axle event and include the necessary export within the Predbat plan.
+
+You should sign up for the Axle 'Events Only' service, not 'Full Control' which provides a service similar to Predbat (except not as good of course !)
+
+Once signed up to Axle, Predbat's [Axle Energy VPP component](https://springfall2008.github.io/batpred/components/#axle-energy-vpp-axle) polls the Axle API to obtain details of future events and add Axle event details to **binary_sensor.predbat_axle_event**.
+
+During an Axle export event, **axle_pence_per_kwh** is added to both your export rate and your import rate for the event period. This reflects that importing (charging) instead of exporting during the event carries the same opportunity cost as missing out on the payment, so Predbat will not plan to charge cheaply through an event just because your normal import rate happens to be low at that time.
+
+The following configuration options for the Axle VPP can be set in `apps.yaml`:
+
+- **axle_api_key** - Sets your API key to communicate with the Axle Energy VPP (Virtual Power Plant) service
+- **axle_pence_per_kwh** - Sets the payment rate in pence per kWh for Axle Energy VPP events (optional, default: 100)
+- **axle_automatic** - When `true` (default) Predbat will automatically use **binary_sensor.predbat_axle_event** to record details of current and historic Axle events
+- **axle_session** - Optional, enables you to manually configure the Axle binary sensor name if you don't wish to use the Predbat default name
+- **axle_control** - Optional, when set to `true` will set Predbat into Read-Only mode for the duration of the Axle session so Axle can control your inverter. The Predbat status will show "Read-Only (Axle)" when this is active in an Axle session.
+Defaults to `false` so Predbat will control export of your inverter according to the Axle event details.
+
+To use the Axle VPP service only **axle_api_key** is required to be configured in `apps.yaml`, the other configuration options are optional.
+
+Energy usage during an event:
+
+- **input_number.predbat_load_scaling_saving** is applied to scale your predicted load for Axle export events.
+- **input_number.predbat_load_scaling_free** is applied to scale your predicted load for Axle import events.
 
 ## Grid Carbon intensity
 
@@ -479,17 +658,19 @@ Predbat can also track Carbon intensity by linking it to an integration which pr
 
 ### UK Grid Carbon intensity
 
-The National Grid provides this data, you can have Predbat fetch it directly by entering your postcode:
+The National Grid provides an API to access this; you can have Predbat fetch it directly by entering your postcode in `apps.yaml`:
 
 ```yaml
   # Carbon Intensity data from National grid
   carbon_postcode: 'SW1 5NA'
-  carbon_automatic: True
+  carbon_automatic: true
 ```
+
+NB: The postcode must be formatted as just the outward code (e.g. 'SW1') or a full postcode including a single space between the outward and inward codes (e.g. 'SW1 5NA'). The National Grid API that Predbat uses only requires the outward code part, and if it doesn't recognise your postcode, try another nearby postcode.
 
 This direct connection will also set **sensor.predbat_carbon** with the current carbon data.
 
-By enabling **switch.predbat_carbon_enable** you can view Carbon Intensity [in the predbat plan](predbat-plan-card.md).
+By enabling **switch.predbat_carbon_enable** you can view Carbon Intensity [in the Predbat plan](predbat-plan-card.md).
 
 Predbat can also [optimise your grid charging based on the Carbon footprint](customisation.md#battery-margins-and-metrics-options) by setting **input_number.predbat_carbon_metric**.
 
@@ -497,11 +678,11 @@ Predbat can also [optimise your grid charging based on the Carbon footprint](cus
 
 ### UK Grid Carbon intensity (HA Integration)
 
-If you prefer you can instead install this integration: <https://github.com/jfparis/sensor.carbon_intensity_uk>
+If you prefer you can instead install the Carbon Intensity integration <https://github.com/jscruz/sensor.carbon_intensity_uk>.
 
-Once it is active update apps.yaml to link Predbat to the Sensor (if it's not already in your template):
+Once the integration is active, update `apps.yaml` to link Predbat to the Carbon intensity sensor:
 
 ```yaml
   # Carbon Intensity data from National grid
-  carbon_intensity: 're:(sensor.carbon_intensity_uk)'
+  carbon_intensity: 're:(sensor.carbon_intensity_uk_sensor)'
 ```

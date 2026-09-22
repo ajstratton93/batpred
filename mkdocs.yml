@@ -9,9 +9,11 @@ nav:
     - 'Install summary': installation-summary.md
     - 'Install details': install.md
     - inverter-setup.md
-    - energy-rates.md
     - apps-yaml.md
+    - energy-rates.md
     - components.md
+    - discovery-catalogue.md
+    - load-ml.md
     - car-charging.md
     - configuration-guide.md
     - customisation.md
@@ -25,9 +27,11 @@ nav:
     - predbat-plan-card.md
     - creating-charts.md
     - compare.md
+  - 'What If Annual Prediction': annual-prediction.md
   - 'Predbat development':
     - todo-list.md
     - developing.md
+    - random-scenarios.md
     - rest_api.md
     - plugins.md
   - 'Predheat':

@@ -1,14 +1,61 @@
-import io
+"""Standalone mode wrapper for running PredBat outside AppDaemon.
+
+Provides the Hass class that emulates the AppDaemon interface for standalone
+execution, including YAML configuration loading, secret management, log
+rotation, scheduled callback execution, and file change detection for
+development hot-reload.
+
+Despite the "outside AppDaemon" framing (legacy naming, kept for history), this
+IS the class predbat.PredBat actually inherits from in every currently
+supported install path - the Predbat app/addon and Docker both run this
+standalone-style loader, not a real appdaemon package. The genuinely
+AppDaemon-hosted install method has been retired (docs/install.md); there is
+no appdaemon dependency anywhere in this repo, and no conditional import
+branches to a different hass module. So Hass.log() below - and the write-time
+secret redaction in it (GH#4770) - is not a partial mitigation that misses an
+AppDaemon-hosted population still running elsewhere: there is no such
+population left to miss. Flagging this explicitly because the class/module
+docstrings alone would lead a reviewer to (reasonably) suspect the opposite.
+"""
+
 import yaml
 import sys
 import asyncio
+import os
+import subprocess
+
+from utils import collect_log_secret_values, compile_log_secret_pattern, redact_log_line
+
+
+def write_git_version_marker():
+    """
+    Best-effort: when running from a git checkout - directly, or via the symlinked
+    .py files that coverage/standalone_ha sets up for a live-HA dev run - record the
+    commit as git_version.txt next to this file (predbat.py resolves its own __file__
+    to the same directory) so predbat.py can show it instead of just the release tag.
+    Runs before predbat is imported, since that's when predbat.py reads the marker.
+    Silently does nothing if git isn't available or this isn't a checkout.
+    """
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_dir = os.path.dirname(os.path.realpath(__file__))
+    try:
+        commit = subprocess.check_output(["git", "-C", repo_dir, "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL).decode().strip()
+        dirty = bool(subprocess.check_output(["git", "-C", repo_dir, "status", "--porcelain"], stderr=subprocess.DEVNULL).decode().strip())
+        with open(os.path.join(this_dir, "git_version.txt"), "w") as f:
+            f.write(commit + ("-dirty" if dirty else ""))
+    except Exception:
+        pass
+
+
+write_git_version_marker()
+
 import predbat
+from utils import load_apps_yaml, predbat_log_count, predbat_log_name, rotate_predbat_logs
 import time
 from datetime import datetime, timedelta
 from multiprocessing import set_start_method
 import concurrent.futures
 import threading
-import os
 import traceback
 
 
@@ -31,6 +78,51 @@ def check_modified(py_files, start_time):
     return False
 
 
+def resolve_apps_yaml_path():
+    """
+    Resolve the one real apps.yaml path this instance is actually configured to use, using the
+    same PREDBAT_APPS_FILE resolution applied when the config itself is loaded.
+    """
+    return os.path.abspath(os.getenv("PREDBAT_APPS_FILE", "apps.yaml"))
+
+
+def collect_watch_files(roots, apps_file_path):
+    """
+    Build the list of files to watch for changes: every .py file under the given root
+    directories, plus the one real apps.yaml file this instance is actually configured to use.
+
+    Deliberately does NOT match a file just because it happens to be named "apps.yaml" -
+    tools that write their own scratch apps.yaml-shaped files elsewhere under the same tree
+    (e.g. the Annual prediction tool's isolated headless work directory, see annual.py's
+    write_minimal_apps_yaml()) would otherwise be indistinguishable from the real config file,
+    forcing an unwanted restart of the live instance whenever they run (#4397, #4396).
+    """
+    apps_file_path = os.path.abspath(apps_file_path)
+    py_files = []
+    seen_files = set()
+    for root_dir in roots:
+        for root, _dirs, files in os.walk(root_dir):
+            for file in files:
+                if file.startswith("."):
+                    continue
+                full_path = os.path.abspath(os.path.join(root, file))
+                if full_path in seen_files:
+                    continue
+                if file.endswith(".py") or full_path == apps_file_path:
+                    py_files.append(full_path)
+                    seen_files.add(full_path)
+
+    # The real configured apps.yaml might not live under any of the walked roots at all
+    # (e.g. PREDBAT_APPS_FILE pointing somewhere the roots don't reach) - always include it
+    # explicitly if it exists, rather than silently dropping config-change watching entirely
+    # just because the walk never happened to encounter it (Copilot review on #4401).
+    if apps_file_path not in seen_files and os.path.exists(apps_file_path):
+        py_files.append(apps_file_path)
+        seen_files.add(apps_file_path)
+
+    return py_files
+
+
 async def main():
     print("**** Starting Standalone Predbat ****")
     start_time = datetime.now()
@@ -45,24 +137,36 @@ async def main():
     try:
         p_han.initialize()
     except Exception as e:
-        print("Error: Failed to initialize predbat {}".format(e))
+        print("Error: Failed to initialise predbat {}".format(e))
         print(traceback.format_exc())
         await p_han.stop_all()
         return
 
-    # Find all .py files in the directory hierarchy
-    py_files = []
-    for root, dirs, files in os.walk("."):
-        for file in files:
-            if (file.endswith(".py") or file == "apps.yaml") and not file.startswith("."):
-                py_files.append(os.path.join(root, file))
+    #
+    #   Adding additional root to monitor
+    #
+
+    # List of root directories to search
+    # HA changed terminology from 'addons' to 'apps' in HA 2026.2 with 'addon_configs' becoming 'app_configs' but retained
+    # the old directory names for transition
+    #
+    # At present have not changed Predbat directory call in order to not break installations that are still using an older HA supervisor
+    # Propose in Feb 2027 that Predbat be changed to use the new directory call
+    roots = [".", "/addon"]
+
+    # Find all .py files in the directory hierarchy, plus the one real apps.yaml this
+    # instance is actually configured to use (not any file that merely happens to share
+    # that name elsewhere in the tree - see #4397/#4396)
+    py_files = collect_watch_files(roots, resolve_apps_yaml_path())
+
     print("Watching {} for changes".format(py_files))
 
     # Runtime loop
+    count = 0
     while True:
         time.sleep(1)
         await p_han.timer_tick()
-        if check_modified(py_files, start_time):
+        if (count % 5 == 0) and check_modified(py_files, start_time):
             print("Stopping Predbat due to file changes....")
             await p_han.stop_all()
             break
@@ -70,6 +174,7 @@ async def main():
             print("Stopping Predbat due to fatal error....")
             await p_han.stop_all()
             break
+        count += 1
 
 
 if __name__ == "__main__":
@@ -79,10 +184,90 @@ if __name__ == "__main__":
 
 
 class Hass:
+    """Standalone mode wrapper emulating the AppDaemon interface.
+
+    Enables PredBat to run outside Home Assistant/AppDaemon with YAML
+    config loading, secret management, log rotation, scheduled callbacks,
+    and file change detection for development hot-reload.
+    """
+
+    # Sentinel distinct from None: compile_log_secret_pattern() legitimately returns None when
+    # there are no secrets configured to redact, so None alone in the cache slot can't tell
+    # "not built yet" from "built, and there is nothing to redact" - the latter would otherwise
+    # rebuild (recompute the value set, recompile) on every single log() call instead of caching.
+    _LOG_SECRET_PATTERN_UNSET = object()
+
+    def _invalidate_log_secret_pattern(self):
+        """
+        Mark the cached redaction pattern stale so the next log() call rebuilds it from the
+        current args/secrets (GH#4770). Every call site that mutates self.args or self.secrets
+        after startup must call this - see _log_secret_pattern()'s docstring for why a missed
+        site is a real leak, not just a staleness bug.
+        """
+        with self._log_secret_pattern_lock:
+            self._log_secret_pattern_cache = self._LOG_SECRET_PATTERN_UNSET
+
+    def _log_secret_fingerprint(self):
+        """
+        A cheap value that changes whenever the set of credentials in args/secrets could have.
+
+        Deliberately not a hash of every value: this runs under the lock on the way to each
+        rebuild decision, so it stays O(number of top-level keys). Identity of the args and
+        secrets mappings plus their sizes catches the shapes a config mutation takes - a key
+        added or removed (size), and the whole mapping being replaced or rebound (identity), as
+        web.py's batch editor does via clear()/update() and web_chat.py does by assigning a new
+        block.
+
+        An in-place edit of an existing key that keeps the size the same is NOT caught here, so
+        the explicit _invalidate_log_secret_pattern() call sites remain load-bearing. This is a
+        safety net under them, not a replacement: with it, a missed or mis-ordered call site
+        degrades to "redacted from the next line" instead of "leaks until the next restart",
+        which is the failure mode successive reviews of this PR kept finding one call site at a
+        time. GH#5063 tracks removing the contract itself by routing every args mutation through
+        one setter (#5053 review).
+        """
+        args = getattr(self, "args", None)
+        secrets = getattr(self, "secrets", None)
+        return (id(args), len(args) if isinstance(args, dict) else -1, id(secrets), len(secrets) if isinstance(secrets, dict) else -1)
+
+    def _log_secret_pattern(self):
+        """
+        Return the cached compiled redaction pattern log() must apply, rebuilding it the first
+        time it is needed and whenever load_secrets()/apps.yaml load invalidate it (GH#4770).
+
+        Cached rather than recomputed on every log() call: log() runs on every log line, while
+        args/secrets only change on startup and on a config reload, so rebuilding the value set
+        and recompiling the pattern that rarely - rather than on every call - keeps the
+        redaction check to a single compiled-regex scan per line on the hot path.
+
+        Guarded by a lock, not just the sentinel check: log() runs from component threads as well
+        as the main thread (create_task()), so two threads can both observe the sentinel and race
+        to rebuild. Without the lock, a thread that started building from stale args right before
+        another thread invalidates the cache (a credential just added via set_arg()) can finish
+        second and overwrite the fresh invalidation with its stale, already-out-of-date pattern -
+        silently keeping the just-added credential unredacted until something invalidates the
+        cache again. The lock makes "read sentinel, build, store" one atomic step so a build that
+        started before an invalidation can never win a race against it.
+        """
+        with self._log_secret_pattern_lock:
+            fingerprint = self._log_secret_fingerprint()
+            if self._log_secret_pattern_cache is self._LOG_SECRET_PATTERN_UNSET or fingerprint != self._log_secret_pattern_fingerprint:
+                args = getattr(self, "args", None)
+                redact_strings = args.get("redact_strings") if args else None
+                redact_strings_labelled = args.get("redact_strings_labelled") if args else None
+                values = collect_log_secret_values(args, getattr(self, "secrets", None), redact_strings, redact_strings_labelled)
+                self._log_secret_pattern_cache = compile_log_secret_pattern(values)
+                self._log_secret_pattern_fingerprint = fingerprint
+            return self._log_secret_pattern_cache
+
     def log(self, msg, quiet=True):
         """
         Log a message to the logfile
         """
+        # Redacted here, at the point the line is written, not at serve/download time: some users
+        # copy predbat.log directly off a Samba share exposing the addon's config directory,
+        # bypassing every HTTP/MCP endpoint a download-time scrub could sit behind (GH#4770).
+        msg = redact_log_line(str(msg), self._log_secret_pattern())
         message = "{}: {}\n".format(datetime.now(), msg)
         self.logfile.write(message)
         self.logfile.flush()
@@ -90,20 +275,17 @@ class Hass:
         if not quiet or msg_lower.startswith("error") or msg_lower.startswith("warn") or msg_lower.startswith("info"):
             print(message, end="")
 
-        # maximum number of historic logfiles to retain
-        max_logs = 9
+        # Total logfiles to keep including the live one, so max_logs rotated copies.
+        max_logs = predbat_log_count(self.args) - 1
 
         log_size = self.logfile.tell()
-        if log_size > 10000000:
-            # check for existence of previous logfiles and rename each in turn
-            for num_logs in range(max_logs - 1, 0, -1):
-                filename = "predbat." + format(num_logs) + ".log"
-                if os.path.isfile(filename):
-                    newfile = "predbat." + format(num_logs + 1) + ".log"
-                    os.rename(filename, newfile)
+        if log_size > 10000000 and threading.current_thread() is threading.main_thread():
+            # Only rotate from the main thread to avoid race conditions with
+            # component threads that also call log().
+            rotate_predbat_logs(max_logs)
 
             self.logfile.close()
-            os.rename("predbat.log", "predbat.1.log")
+            os.rename("predbat.log", predbat_log_name(1))
             self.logfile = open("predbat.log", "w")
 
     async def run_in_executor(self, callback, *args):
@@ -126,12 +308,12 @@ class Hass:
         """
         asyncio.run(self.task_waiter_async(task))
 
-    def create_task(self, task):
+    def create_task(self, task, name="TaskCreate"):
         """
         Creates a new thread to run the task in
         """
         self.log("Creating task: {}".format(task), quiet=False)
-        t1 = threading.Thread(name="TaskCreate", target=self.task_waiter, args=[task])
+        t1 = threading.Thread(name=name, target=self.task_waiter, args=[task])
         t1.start()
         self.threads.append(t1)
         return t1
@@ -156,19 +338,22 @@ class Hass:
         self.threads = []
         self.fatal_error = False
         self.hass_api_version = 2
+        self._log_secret_pattern_lock = threading.Lock()
+        self._log_secret_pattern_cache = self._LOG_SECRET_PATTERN_UNSET
+        self._log_secret_pattern_fingerprint = None
 
         self.logfile = open("predbat.log", "a")
 
-        # Open YAML file apps.yaml and read it
-        apps_file = os.getenv("PREDBAT_APPS_FILE", "apps.yaml")
-        self.log(f"Loading {apps_file}", quiet=False)
-        with io.open(apps_file, "r") as stream:
-            try:
-                config = yaml.safe_load(stream)
-                self.args = config["pred_bat"]
-            except yaml.YAMLError as exc:
-                print(exc)
-                sys.exit(1)
+        # Load apps.yaml (resolving !secret) through the shared loader
+        try:
+            self.args, self.secrets = load_apps_yaml(log=self.log)
+        except yaml.YAMLError as exc:
+            print(exc)
+            sys.exit(1)
+
+        # Both args and secrets have just been populated, so the redaction pattern built from them
+        # (GH#4770) is stale - drop it so the next log() call rebuilds from the loaded config.
+        self._invalidate_log_secret_pattern()
 
     def run_every(self, callback, next_time, run_every, **kwargs):
         """
@@ -187,7 +372,7 @@ class Hass:
                 try:
                     item["callback"](None)
                 except Exception as e:
-                    self.log("Error: {}".format(e), quiet=False)
+                    self.log("Error: timer_tick caught exception: {}".format(e), quiet=False)
                     print(traceback.format_exc())
                 while now > item["next_time"]:
                     run_every = timedelta(seconds=item["run_every"])

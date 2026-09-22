@@ -1,0 +1,3772 @@
+# fmt: off
+# pylint: disable=line-too-long
+"""
+Solis Cloud API integration for Predbat
+Implements inverter control via Solis Cloud REST API using HMAC-SHA1 authentication
+"""
+
+import asyncio
+import aiohttp
+import argparse
+import base64
+import hashlib
+import hmac
+import json
+import time
+import copy
+from datetime import datetime, timedelta, UTC
+from predbat_metrics import record_api_call
+from component_base import ComponentBase
+from mock_base import MockBase
+from oauth_mixin import OAuthMixin
+
+
+# API Endpoints
+SOLIS_BASE_URL = "https://www.soliscloud.com:13333"
+# OAuth 2.0 host (Bearer auth). Used when auth_method == "oauth". Reads/control use the same
+# cid/value payload shapes as the HMAC path, but NOT the same routes — this host serves a
+# different namespace, so paths are translated via SOLIS_OAUTH_ENDPOINTS below. (Design #366
+# approach 1 assumed path parity here; that was verified false against the live gateway.)
+SOLIS_OAUTH_BASE_URL = "https://api-oauth2.soliscloud.com"
+SOLIS_READ_ENDPOINT = "/v2/api/atRead"
+SOLIS_READ_BATCH_ENDPOINT = "/v2/api/atReadBatch"
+SOLIS_CONTROL_ENDPOINT = "/v2/api/control"
+SOLIS_INVERTER_LIST_ENDPOINT = "/v1/api/inverterList"
+SOLIS_INVERTER_DETAIL_ENDPOINT = "/v1/api/inverterDetail"
+
+# The OAuth2 gateway serves a different route namespace to the HMAC host: discovery sits under
+# /api/access_data/, register reads and control under /api/control_device/. Verified against the
+# live gateway 2026-07-21. The HMAC paths return an XML <ForbiddenException> on the OAuth host,
+# which _execute_request mistook for an expired token, refreshing and retrying until it gave up.
+SOLIS_OAUTH_ENDPOINTS = {
+    SOLIS_READ_ENDPOINT: "/api/control_device/atRead",
+    SOLIS_READ_BATCH_ENDPOINT: "/api/control_device/atReadBatch",
+    SOLIS_CONTROL_ENDPOINT: "/api/control_device/control",
+    SOLIS_INVERTER_LIST_ENDPOINT: "/api/access_data/inverterList",
+    SOLIS_INVERTER_DETAIL_ENDPOINT: "/api/access_data/inverterDetail",
+}
+
+# Retry configuration
+SOLIS_MAX_RETRY_TIME = 30  # seconds
+SOLIS_INITIAL_RETRY_DELAY = 1  # seconds
+SOLIS_REQUEST_TIMEOUT = 30  # seconds
+
+# SolisCloud allows 200 OpenAPI requests per account per day. Once that is gone every further
+# request is refused with R0000, so requests are paused rather than retried - see
+# note_quota_exhausted(). One probe an hour is enough to notice the allowance coming back
+# without spending a meaningful part of the next day's budget on finding out (issue #5087).
+SOLIS_QUOTA_PAUSE_SECONDS = 3600
+
+# How long an inverter's reads are held back once SolisCloud reports its datalogger offline. The
+# datalogger coming back is the only thing that changes the answer, and that is a physical event on
+# a timescale of minutes at best, so probing it every minute only spends the daily allowance.
+SOLIS_DATALOGGER_OFFLINE_SECONDS = 900
+
+# CID Constants (Control IDs for inverter registers)
+SOLIS_CID_STORAGE_MODE = 636
+SOLIS_CID_BATTERY_RESERVE_SOC = 157
+SOLIS_CID_BATTERY_OVER_DISCHARGE_SOC = 158
+SOLIS_CID_BATTERY_FORCE_CHARGE_SOC = 160
+SOLIS_CID_BATTERY_RECOVERY_SOC = 7229
+SOLIS_CID_BATTERY_MAX_CHARGE_SOC = 7963
+SOLIS_CID_BATTERY_CAPACITY = 172
+
+# Power control CIDs
+SOLIS_CID_POWER_LIMIT = 15
+SOLIS_CID_MAX_OUTPUT_POWER = 376
+SOLIS_CID_MAX_EXPORT_POWER = 499
+
+# Allow export CID
+SOLIS_CID_ALLOW_EXPORT = 6962
+
+# Allow export values (inverted logic: "0" = allow, "1" = block)
+SOLIS_ALLOW_EXPORT_ON = "0"  # Allow export
+SOLIS_ALLOW_EXPORT_OFF = "1"  # Block export
+
+# Battery max current CIDs
+SOLIS_CID_BATTERY_MAX_CHARGE_CURRENT = 7224
+SOLIS_CID_BATTERY_MAX_DISCHARGE_CURRENT = 7226
+
+# Nominal pack voltage selection (issue #5090). Thresholds come from 30 days of battery_voltage
+# history across 30 LV systems plus a full inverterDetail from 14 of them:
+#  - no LV system exceeded 57.5V live, so a live reading above 60V is an HV pack;
+#  - the BMS-requested charge voltage separates the LV pack classes cleanly - 53.2V on every 15S
+#    pack that reported it, 56.5-58.4V on every 16S - so 55V sits in a 3.3V empty gap.
+# The live voltage itself cannot be used to tell 15S from 16S: the classes overlap (a full 15S
+# reaches 53.5V, a low 16S drops to 47.1V), which is why this is decided from the charge voltage.
+SOLIS_HV_BATTERY_VOLTAGE = 60.0
+SOLIS_LV_16S_CHARGE_VOLTAGE = 55.0
+SOLIS_LV_15S_NOMINAL_VOLTAGE = 48.0
+SOLIS_LV_16S_NOMINAL_VOLTAGE = 51.2
+
+# Charge slot CIDs (base + slot_index for slots 1-6)
+SOLIS_CID_CHARGE_ENABLE_BASE = 5916  # 5916-5921
+SOLIS_CID_CHARGE_SOC_BASE = 5928  # 5928-5933
+# Non-sequential time CIDs for charge slots 1-6
+SOLIS_CID_CHARGE_TIME = [5946, 5949, 5952, 5955, 5958, 5961]
+# Non-sequential current CIDs for charge slots 1-6
+SOLIS_CID_CHARGE_CURRENT = [5948, 5951, 5954, 5957, 5960, 5963]
+
+# Discharge slot CIDs (base + slot_index for slots 1-6)
+SOLIS_CID_DISCHARGE_ENABLE_BASE = 5922  # 5922-5927
+# Non-sequential time CIDs for discharge slots 1-6
+SOLIS_CID_DISCHARGE_TIME = [5964, 5968, 5972, 5976, 5980, 5987]
+# Non-sequential SOC CIDs for discharge slots 1-6
+SOLIS_CID_DISCHARGE_SOC = [5965, 5969, 5973, 5977, 5981, 5984]
+# Non-sequential current CIDs for discharge slots 1-6
+SOLIS_CID_DISCHARGE_CURRENT = [5967, 5971, 5975, 5979, 5983, 5986]
+
+# TOU mode CID
+SOLIS_CID_TOU_V2_MODE = 6798
+
+# Live data CIDs (frequent poll - every 5 minutes)
+SOLIS_CID_CHARGE_DISCHARGE_SETTINGS = 103
+
+SOLIS_CID_SINGLE = [
+    SOLIS_CID_CHARGE_DISCHARGE_SETTINGS,
+]
+
+# Infrequent poll CIDs (settings - every 60 minutes)
+SOLIS_CID_INFREQUENT = [
+    # Allow export
+    SOLIS_CID_ALLOW_EXPORT,
+    # Storage mode
+    SOLIS_CID_STORAGE_MODE,
+    # Battery limits
+    SOLIS_CID_BATTERY_RESERVE_SOC,
+    SOLIS_CID_BATTERY_OVER_DISCHARGE_SOC,
+    SOLIS_CID_BATTERY_FORCE_CHARGE_SOC,
+    SOLIS_CID_BATTERY_MAX_CHARGE_SOC,
+    # Battery max currents
+    SOLIS_CID_BATTERY_MAX_CHARGE_CURRENT,
+    SOLIS_CID_BATTERY_MAX_DISCHARGE_CURRENT,
+    # Power controls
+    SOLIS_CID_POWER_LIMIT,
+    SOLIS_CID_MAX_OUTPUT_POWER,
+    SOLIS_CID_MAX_EXPORT_POWER,
+    SOLIS_CID_BATTERY_CAPACITY,
+]
+
+# Infrequent poll CIDs that must be read one at a time. The atReadBatch endpoint returns a
+# wrong value for these - CID 7229 comes back as "1" rather than the real recovery SOC, which
+# a single atRead reports correctly - so batching them silently poisons the cache and the
+# published entity. Polled alongside SOLIS_CID_INFREQUENT with batch=False.
+SOLIS_CID_INFREQUENT_SINGLE = [
+    SOLIS_CID_BATTERY_RECOVERY_SOC,
+]
+
+SOLIS_CID_LIST_TOU_V2 = [
+    # Charge slot 1-6 enables
+    *range(SOLIS_CID_CHARGE_ENABLE_BASE, SOLIS_CID_CHARGE_ENABLE_BASE + 6),
+    # Discharge slot 1-6 enables
+    *range(SOLIS_CID_DISCHARGE_ENABLE_BASE, SOLIS_CID_DISCHARGE_ENABLE_BASE + 6),
+    # Charge slot 1-6 SOCs
+    *range(SOLIS_CID_CHARGE_SOC_BASE, SOLIS_CID_CHARGE_SOC_BASE + 6),
+    # Charge slot 1-6 times (non-sequential!)
+    *SOLIS_CID_CHARGE_TIME,
+    # Charge slot 1-6 currents (non-sequential!)
+    *SOLIS_CID_CHARGE_CURRENT,
+    # Discharge slot 1-6 times (non-sequential!)
+    *SOLIS_CID_DISCHARGE_TIME,
+    # Discharge slot 1-6 SOCs (non-sequential!)
+    *SOLIS_CID_DISCHARGE_SOC,
+    # Discharge slot 1-6 currents (non-sequential!)
+    *SOLIS_CID_DISCHARGE_CURRENT,
+]
+# Storage mode enum, these are just labels for the bitwise combinations of the bits defined below, used for easier handling in code and UI
+ENUM_OTHER = 0
+ENUM_SELF_USE_NO_GRID_CHARGING = 1
+ENUM_SELF_USE = 2
+ENUM_FEED_IN_PRIORITY = 3
+ENUM_FEED_IN_PRIORITY_NO_GRID_CHARGING = 4
+SOLIS_STORAGE_MODES = {
+    "Other": ENUM_OTHER,
+    "Self-Use": ENUM_SELF_USE,
+    "Self-Use - No Timed Charge/Discharge": ENUM_SELF_USE_NO_GRID_CHARGING,
+    "Feed-in priority": ENUM_FEED_IN_PRIORITY,
+    "Feed-in priority - No Timed Charge/Discharge": ENUM_FEED_IN_PRIORITY_NO_GRID_CHARGING
+}
+
+# Real solis mode bits
+"""
+BIT Tag Number | Fault Status | Status Code
+BIT00 | Self-Consumption Mode Switch | 0—Off | 1—On
+BIT01 | Optimised Revenue Mode Switch | 0—Off | 1—On
+BIT02 | Off-Grid Energy Storage Mode Switch | 0—Off | 1—On
+BIT03 | Battery Wake-up Switch (1—Wake-up Enabled | 0—Wake-up Disabled) | 0—Off | 1—On
+BIT04 | Backup Battery Mode Switch | 0—Off | 1—On
+BIT05 | Allow/Disallow Battery Charging from Grid | 0—Disallowed | 1—Allowed
+BIT06 | Grid Priority Mode Switch | 0—Off | 1—On
+BIT07 | Nighttime Battery Over-Discharge Retention Enable Switch | 0—Off | 1—On
+BIT08 | Battery Power Supply Dynamic Adjustment Enable Switch During Strong Charging | 0—Off | 1—On
+BIT09 | Battery Current Correction Enable Switch | 0—Off | 1—On
+BIT10 | Battery Treatment Mode | 0—Off 1—On
+BIT11 | Peak-shaving mode switch 0—Off 1—On
+"""
+
+# Storage mode bit positions for bitwise operations
+SOLIS_BIT_SELF_USE = 0  # Self-use mode
+SOLIS_BIT_TOU_MODE = 1  # Time of use mode
+SOLIS_BIT_OFF_GRID = 2  # Off-grid mode
+SOLIS_BIT_BACKUP_MODE = 4  # Battery reserve/backup mode
+SOLIS_BIT_GRID_CHARGING = 5  # Allow grid charging
+SOLIS_BIT_FEED_IN_PRIORITY = 6  # Feed-in priority mode
+SOLIS_BIT_PEAK_SHAVING = 11  # Peak-shaving mode
+
+# How long to wait before re-reading a register whose verify read disagreed with the write. The
+# verify read is taken within about half a second of the write and a disagreement is not proof the
+# write was refused - the same value verifies successfully minutes either side of one that does not
+# (issue #4774) - so the read is given a chance to settle before the write is called a failure.
+# Only a mismatched write pays this, so the cost is one pause per refused register per cycle.
+SOLIS_VERIFY_SETTLE_SECONDS = 5
+
+def parse_cid_int(value, default=None):
+    """Convert a CID register value to an int, returning default when it is missing or not numeric.
+
+    Register reads arrive as strings and are None when a poll has not populated the cache yet,
+    so callers that need to compare them numerically go through here rather than guessing a value.
+
+    Args:
+        value: Raw register value, usually a string
+        default: Value to return when the conversion is not possible
+
+    Returns: The value as an int, or default
+    """
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+def time_in_window(current_time, start_time, end_time):
+    """True when a "HH:MM" time falls inside a slot window, including one that wraps midnight.
+
+    A window whose start equals its end is not configured, so nothing is inside it.
+
+    Args:
+        current_time: Time to test, as "HH:MM"
+        start_time: Window start, as "HH:MM"
+        end_time: Window end, as "HH:MM"
+
+    Returns: True when current_time is inside the window
+    """
+    if start_time == end_time:
+        return False
+    if start_time <= end_time:
+        # Normal time range (e.g., 02:00 to 05:00)
+        return start_time <= current_time <= end_time
+    # Overnight time range (e.g., 23:00 to 02:00)
+    return current_time >= start_time or current_time <= end_time
+
+
+def cid_value_matches(read_back, value):
+    """True when a register read-back is the value that was written to it.
+
+    Reads arrive as strings, so a numeric write is compared numerically where it can be - "35.0"
+    and "35" are the same register value - and falls back to a string comparison otherwise.
+
+    Args:
+        read_back: Raw value read back from the register
+        value: Value that was written
+
+    Returns: True when the two are the same register value
+    """
+    if isinstance(value, (int, float)):
+        try:
+            return float(read_back) == float(value)
+        except (ValueError, TypeError):
+            pass  # Fall back to string comparison if float conversion fails
+    return str(read_back) == str(value)
+
+
+def get_solis_mode_enum(value):
+    """
+    Determine storage mode enum based on bit flags in the value.
+    """
+    mode = ENUM_OTHER
+    if value & (1 << SOLIS_BIT_FEED_IN_PRIORITY) and (value & (1 << SOLIS_BIT_GRID_CHARGING)):
+        mode = ENUM_FEED_IN_PRIORITY
+    elif value & (1 << SOLIS_BIT_SELF_USE) and (value & (1 << SOLIS_BIT_GRID_CHARGING)):
+        mode = ENUM_SELF_USE
+    elif value & (1 << SOLIS_BIT_FEED_IN_PRIORITY):
+        mode = ENUM_FEED_IN_PRIORITY_NO_GRID_CHARGING
+    elif value & (1 << SOLIS_BIT_SELF_USE):
+        mode = ENUM_SELF_USE_NO_GRID_CHARGING
+    mode_str = "Other"
+    for mode_name, mode_value in SOLIS_STORAGE_MODES.items():
+        if mode_value == mode:
+            mode_str = mode_name
+            break
+    return mode, mode_str
+
+def compute_solis_mode_value(mode_enum, old_value, drop_tou_bit=False):
+    """
+    Convert storage mode enum to bit flag value for CID 636
+
+    Args:
+        mode_enum: The storage mode to select
+        old_value: Current register value, so bits this function does not manage are preserved
+        drop_tou_bit: Leave the time-of-use bit clear even for the modes that normally set it.
+                      TOU V2 firmware has no use for it - the timed charge/discharge enable moved
+                      into the per-slot registers (CIDs 5916/5922) and every mode value carrying
+                      bit 1 was dropped from the table, so 35 becomes 33 and 98 becomes 96. Set by
+                      set_storage_mode_if_needed() from is_tou_v2_mode() (see issues #4707, #4774).
+
+    Returns: The value to write to CID 636
+    """
+    value = old_value  # Start with current value to preserve unrelated bits
+    if mode_enum == ENUM_SELF_USE_NO_GRID_CHARGING:
+        value |= (1 << SOLIS_BIT_SELF_USE)  # Set self-use bit
+        value &= ~(1 << SOLIS_BIT_GRID_CHARGING)  # Clear grid charging bit
+        value &= ~(1 << SOLIS_BIT_FEED_IN_PRIORITY)  # Clear feed-in priority bit
+        value &= ~(1 << SOLIS_BIT_OFF_GRID)  # Clear off-grid bit
+        value &= ~(1 << SOLIS_BIT_TOU_MODE)  # Clear TOU mode bit
+    elif mode_enum == ENUM_SELF_USE:
+        value |= (1 << SOLIS_BIT_SELF_USE)  # Set self-use bit
+        value |= (1 << SOLIS_BIT_GRID_CHARGING)  # Set grid charging bit
+        value &= ~(1 << SOLIS_BIT_FEED_IN_PRIORITY)  # Clear feed-in priority bit
+        value &= ~(1 << SOLIS_BIT_OFF_GRID)  # Clear off-grid bit
+        value |=  (1 << SOLIS_BIT_TOU_MODE)  # Set TOU mode bit
+    elif mode_enum == ENUM_FEED_IN_PRIORITY:
+        value &= ~(1 << SOLIS_BIT_SELF_USE)  # Clear self-use bit
+        value |= (1 << SOLIS_BIT_GRID_CHARGING)  # Set grid charging bit
+        value |= (1 << SOLIS_BIT_FEED_IN_PRIORITY)  # Set feed-in priority bit
+        value &= ~(1 << SOLIS_BIT_OFF_GRID)  # Clear off-grid bit
+        value |= (1 << SOLIS_BIT_TOU_MODE)  # Set TOU mode bit
+    elif mode_enum == ENUM_FEED_IN_PRIORITY_NO_GRID_CHARGING:
+        value &= ~(1 << SOLIS_BIT_SELF_USE)  # Clear self-use bit
+        value &= ~(1 << SOLIS_BIT_GRID_CHARGING)  # Clear grid charging bit
+        value |=  (1 << SOLIS_BIT_FEED_IN_PRIORITY)  # Set feed-in priority bit
+        value &= ~(1 << SOLIS_BIT_OFF_GRID)  # Clear off-grid bit
+        value &= ~(1 << SOLIS_BIT_TOU_MODE)  # Clear TOU mode bit
+
+    if drop_tou_bit:
+        value &= ~(1 << SOLIS_BIT_TOU_MODE)
+    return value
+
+
+# Inverter status codes
+SOLIS_INVERTER_STATUS = {
+    0: "Offline",
+    1: "Standby",
+    2: "Starting",
+    3: "Running",
+    4: "Fault",
+    5: "Permanent Fault",
+}
+
+# API response codes
+SOLIS_API_CODES = {
+    "0": "Success",
+    "10001": "Operation failed",
+    "10400": "Request not authenticated",
+    "10401": "Unauthorized",
+    "10403": "Forbidden",
+    "10404": "Not found",
+    "10500": "Internal server error",
+    "B0115": "Datalogger offline or disconnected",
+    "R0000": "Daily API request allowance exhausted",
+}
+
+# Response codes that are settled for this cycle: retrying cannot change the answer, and every
+# attempt still spends one of the 200 daily requests. B0115 means the datalogger is offline, not
+# that the request was throttled, and R0000 means the daily allowance is already gone (issue #5087).
+SOLIS_API_CODE_QUOTA_EXCEEDED = "R0000"
+SOLIS_API_CODE_DATALOGGER_OFFLINE = "B0115"
+SOLIS_API_CODES_NO_RETRY = {SOLIS_API_CODE_QUOTA_EXCEEDED, SOLIS_API_CODE_DATALOGGER_OFFLINE}
+
+# Time options for selectors (HH:MM:SS format)
+BASE_TIME = datetime(2000, 1, 1, 0, 0, 0)
+OPTIONS_TIME = [((BASE_TIME + timedelta(seconds=minute * 60)).strftime("%H:%M:%S")) for minute in range(0, 24 * 60, 1)]
+
+
+class SolisAPIError(Exception):
+    """Custom exception for Solis API errors"""
+    def __init__(self, message, status_code=None, response_code=None):
+        self.status_code = status_code
+        self.response_code = response_code
+        final_message = message
+        if status_code is not None:
+            final_message = f"{final_message} (HTTP status code: {status_code})"
+        if response_code is not None:
+            final_message = f"{final_message} (API response code: {response_code})"
+        super().__init__(final_message)
+
+
+class SolisAPI(ComponentBase, OAuthMixin):
+    """Solis Cloud API integration component"""
+
+    def initialize(self, api_key=None, api_secret=None, inverter_sn=None, automatic=False, base_url=SOLIS_BASE_URL, control_enable=True, auth_method=None, access_token=None, token_expires_at=None, token_hash=None, nominal_voltage=None):
+        """Initialise the Solis API component"""
+        self.api_key = api_key
+        self.api_secret = api_secret
+        # OAuth (Bearer) vs HMAC api-key auth. In OAuth mode the access_token is held by
+        # the mixin and refreshed via the oauth-refresh edge function (provider "solis").
+        self._init_oauth(auth_method, access_token, token_expires_at, "solis")
+        self.token_hash = token_hash or ""
+        # Require api_key+api_secret unless using OAuth — restores the startup guard lost
+        # when these became optional in components.py, so a misconfigured api-key instance
+        # fails clearly here instead of crashing later on None.encode() in _build_headers.
+        if self.auth_method != "oauth" and (not self.api_key or not self.api_secret):
+            raise SolisAPIError("Solis api_key and api_secret are required when not using OAuth")
+        # OAuth reads/control use the OAuth host; api-key uses the HMAC host (or override).
+        self.base_url = SOLIS_OAUTH_BASE_URL if self.auth_method == "oauth" else base_url
+        self.automatic = automatic
+        self.session = None
+        self.queued_events = []
+        # Last-resort fallback, used only for an LV pack that reports no BMS charge voltage to be
+        # classified by - matches the previous hard-coded assumption (issue #4493).
+        # get_nominal_voltage() below is the real source of truth for the full priority order.
+        self.nominal_voltage = 48.0
+        self.live_voltage_last_known = {}  # {inverter_sn: last measured battery voltage}
+        self.nominal_voltage_reported = {}  # {inverter_sn: conversion voltage already logged}
+        # Nominal *pack* voltage (e.g. cell count x nominal cell voltage) from apps.yaml. It is
+        # the preferred source for both the capacity calculation and the amp<->watt conversions,
+        # being the one figure available here that is an actual physical property rather than an
+        # inference from a measurement that moves with charge state.
+        try:
+            configured_pack_v = float(nominal_voltage) if nominal_voltage is not None else None
+        except (TypeError, ValueError):
+            configured_pack_v = None
+        if configured_pack_v is not None and configured_pack_v <= 0:
+            self.log(f"Warn: Solis API: solis_nominal_voltage must be > 0, got {configured_pack_v}; ignoring")
+            configured_pack_v = None
+        self.nominal_pack_voltage = configured_pack_v
+        self.control_enable = control_enable
+
+        # Handle inverter SN configuration - can be None, a single string, or a list of strings
+        if inverter_sn is None:
+            self.configured_inverter_sn = []
+        elif isinstance(inverter_sn, str):
+            self.configured_inverter_sn = [inverter_sn]
+        else:
+            self.configured_inverter_sn = list(inverter_sn)
+
+        # Cache structures
+        self.cached_values = {}  # {inverter_sn: {cid: str_value}}
+        self.cached_infos = {}  # {inverter_sn: {cid: info_dict}}
+        self.inverter_details = {}  # {inverter_sn: detail_dict}
+        self.parallel_battery_count = {}  # {inverter_sn: int}
+        self.max_charge_current = {}  # {inverter_sn: int}
+        self.max_discharge_current = {}  # {inverter_sn: int}
+        self.charge_discharge_time_windows = {}  # {inverter_sn: time_window_dict}
+        self.inverter_sn = []
+
+        # Tracking
+        self.slots_reset = set()  # Track which inverters had slots reset
+        self.quota_exhausted_until = None  # UTC time the daily API allowance pause lifts, None when not paused
+        self.datalogger_offline_until = {}  # {inverter_sn: UTC time that inverter's reads resume}
+        self.automatic_config_done = False  # Auto-config succeeded, so it does not need re-running
+        self.capacity_voltage_warned = set()  # Inverters already warned about an estimated capacity voltage
+        self.verify_settle_seconds = SOLIS_VERIFY_SETTLE_SECONDS  # Pause before a verify read is re-taken, 0 in tests
+        self.mode_asserted_for = {}  # Inverter -> the window whose start already had the storage mode asserted
+
+        self.log(f"Solis API: Initialised with inverter_sn={self.configured_inverter_sn}, automatic={automatic}")
+
+    # ==================== Helper Methods ====================
+
+    def find_inverter_by_sn(self, sn_from_entity_id):
+        """Return the original-case serial number that matches sn_from_entity_id case-insensitively.
+
+        HA normalises entity IDs to lowercase, so serial numbers containing uppercase hex digits
+        (A-F) would never match self.inverter_sn via a plain 'in' check.  This method does a
+        case-insensitive search and returns the canonical (API-casing) SN, or None if not found.
+        """
+        return next((sn for sn in self.inverter_sn if sn.lower() == sn_from_entity_id.lower()), None)
+
+    # ==================== Authentication Methods ====================
+
+    def _digest(self, body):
+        """Generate MD5 digest of request body, base64 encoded"""
+        return base64.b64encode(hashlib.md5(body.encode("utf-8")).digest()).decode("utf-8")
+
+    def _sign_authorization(self, message):
+        """Generate HMAC-SHA1 signature, base64 encoded"""
+        hmac_object = hmac.new(
+            self.api_secret.encode("utf-8"),
+            msg=message.encode("utf-8"),
+            digestmod=hashlib.sha1,
+        )
+        return base64.b64encode(hmac_object.digest()).decode("utf-8")
+
+    def _format_date(self, dt=None):
+        """Format datetime to GMT string"""
+        if dt is None:
+            dt = datetime.now(UTC)
+        return dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+    def _build_headers(self, endpoint, payload):
+        """Build HTTP headers — Bearer (OAuth) or HMAC-SHA1 (api-key)"""
+        if self.auth_method == "oauth":
+            return {
+                "Authorization": f"Bearer {self.access_token}",
+                "Content-Type": "application/json",
+            }
+        body = json.dumps(payload)
+        payload_digest = self._digest(body)
+        content_type = "application/json"
+        date_formatted = self._format_date()
+
+        # Authorization string to sign (newline-separated)
+        authorization_str = "\n".join([
+            "POST",
+            payload_digest,
+            content_type,
+            date_formatted,
+            endpoint
+        ])
+
+        authorization_sign = self._sign_authorization(authorization_str)
+        authorization = f"API {self.api_key}:{authorization_sign}"
+
+        return {
+            "Content-MD5": payload_digest,
+            "Content-Type": content_type,
+            "Date": date_formatted,
+            "Authorization": authorization,
+        }
+
+    # ==================== Core API Methods ====================
+
+    def _quota_pause_until(self):
+        """Return the UTC time at which Solis requests may resume after the daily allowance ran out.
+
+        The documented reset is the account's day boundary, but SolisCloud does not say which
+        timezone that is, so the pause is capped at SOLIS_QUOTA_PAUSE_SECONDS: whichever boundary
+        the allowance really uses, polling resumes within an hour of it, and a wrong guess at the
+        timezone cannot leave Predbat blind for a whole day.
+        """
+        now = self.now_utc_exact.astimezone(UTC)
+        next_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        return min(next_midnight, now + timedelta(seconds=SOLIS_QUOTA_PAUSE_SECONDS))
+
+    def note_quota_exhausted(self):
+        """Pause all Solis requests after SolisCloud reports the daily API allowance is used up"""
+        resume_at = self._quota_pause_until()
+        if self.quota_exhausted_until and self.quota_exhausted_until >= resume_at:
+            # Already paused for at least this long - don't re-log it on every refused call
+            return
+        self.quota_exhausted_until = resume_at
+        self.log("Error: Solis API: SolisCloud daily API request allowance exhausted (code {}), pausing all Solis requests until {}".format(SOLIS_API_CODE_QUOTA_EXCEEDED, resume_at.strftime("%Y-%m-%d %H:%M:%S UTC")))
+
+    def quota_paused(self):
+        """Whether Solis requests are currently held back because the daily API allowance ran out.
+
+        Only the window is tested - quota_exhausted_until itself is left set once it passes, so the
+        next request goes out as a probe while the diagnostic survives for health_message(). It is
+        note_quota_restored() that clears it, on the first request that actually succeeds.
+        """
+        return bool(self.quota_exhausted_until) and self.now_utc_exact.astimezone(UTC) < self.quota_exhausted_until
+
+    def note_quota_restored(self):
+        """Clear the daily allowance diagnostic after a request succeeds"""
+        if self.quota_exhausted_until:
+            self.quota_exhausted_until = None
+            self.log("Solis API: SolisCloud daily API request allowance has been restored, resuming normal polling")
+
+    def datalogger_offline(self, inverter_sn):
+        """Whether this inverter's datalogger is in its offline cooldown and should not be polled"""
+        offline_until = self.datalogger_offline_until.get(inverter_sn)
+        return bool(offline_until) and self.now_utc_exact.astimezone(UTC) < offline_until
+
+    def note_datalogger_offline(self, inverter_sn):
+        """Back off this inverter's reads after SolisCloud reports its datalogger is offline.
+
+        Not retrying a B0115 is only half the cure: run() polls every inverter every minute, so an
+        offline datalogger left in the rotation still spends a request a minute out of the 200 a day
+        and is how the account in issue #5087 reached R0000 in the first place.
+        """
+        if not inverter_sn or self.datalogger_offline(inverter_sn):
+            # Already backed off - don't extend the cooldown or re-log on each refused read
+            return
+        resume_at = self.now_utc_exact.astimezone(UTC) + timedelta(seconds=SOLIS_DATALOGGER_OFFLINE_SECONDS)
+        self.datalogger_offline_until[inverter_sn] = resume_at
+        self.log("Warn: Solis API: Datalogger for inverter {} is offline or disconnected, pausing its reads until {}".format(inverter_sn, resume_at.strftime("%H:%M:%S UTC")))
+
+    def note_datalogger_online(self, inverter_sn):
+        """Clear an inverter's offline cooldown after one of its reads succeeds"""
+        if inverter_sn and self.datalogger_offline_until.pop(inverter_sn, None):
+            self.log("Solis API: Datalogger for inverter {} is back online".format(inverter_sn))
+
+    def health_message(self):
+        """Name the reason Solis is unhealthy so the run status says more than 'component errors: Solis'"""
+        if self.quota_exhausted_until:
+            return "Solis Cloud daily API limit reached, paused until {}".format(self.quota_exhausted_until.strftime("%H:%M UTC"))
+        offline = sorted(sn for sn in self.datalogger_offline_until if self.datalogger_offline(sn))
+        if offline:
+            return "datalogger offline for inverter {}".format(", ".join(offline))
+        return None
+
+    async def _execute_request(self, endpoint, payload):
+        """Execute HTTP POST request to Solis API"""
+        # The daily allowance is gone - fail without sending. Requests made while it is exhausted
+        # are refused but still counted, so sending them is what keeps it exhausted (issue #5087).
+        if self.quota_paused():
+            raise SolisAPIError("SolisCloud daily API request allowance exhausted, requests paused until {}".format(self.quota_exhausted_until.strftime("%Y-%m-%d %H:%M:%S UTC")), response_code=SOLIS_API_CODE_QUOTA_EXCEEDED)
+        # Which inverter this request is for, so a B0115 backs off that one rather than the fleet.
+        # The read/control endpoints name it "inverterSn", the detail endpoint "sn"; the account-wide
+        # inverter list names neither, and has no single inverter to blame.
+        request_inverter_sn = payload.get("inverterSn") or payload.get("sn")
+        # OAuth reads/control live in a different route namespace (see SOLIS_OAUTH_ENDPOINTS).
+        # Translate before building the URL; in api-key mode the paths are used unchanged.
+        if self.auth_method == "oauth":
+            endpoint = SOLIS_OAUTH_ENDPOINTS.get(endpoint, endpoint)
+        url = f"{self.base_url}{endpoint}"
+        # OAuth: proactively refresh the token before the call (no-op for api-key mode).
+        # If the token can't be obtained (refresh failed / needs reauth), fail fast — the
+        # oauth_failed flag below makes _with_retry abort instead of looping with a bad token.
+        if self.auth_method == "oauth":
+            if not await self.check_and_refresh_oauth_token():
+                raise SolisAPIError("Solis OAuth token unavailable — reconnect required", status_code=401)
+            # check_and_refresh can report success while leaving access_token unset (e.g. refresh
+            # skipped because SUPABASE_* env / instance_id missing). Fail fast rather than sending
+            # an "Authorization: Bearer None" header and burning the retry window.
+            if not self.access_token:
+                raise SolisAPIError("Solis OAuth access_token unavailable — reconnect required", status_code=401)
+        headers = self._build_headers(endpoint, payload)
+
+        try:
+            async with asyncio.timeout(SOLIS_REQUEST_TIMEOUT):
+                async with self.session.post(url, headers=headers, json=payload) as response:
+                    # Check HTTP status
+                    if response.status != 200:
+                        error_text = await response.text()
+                        if response.status in (401, 403) and self.auth_method == "oauth":
+                            # Force a token refresh; _with_retry re-issues the request with the new token.
+                            await self.handle_oauth_401()
+                        reason = "auth_error" if response.status in (401, 403) else "server_error"
+                        record_api_call("solis", False, reason)
+                        raise SolisAPIError(f"HTTP error: {error_text}", status_code=response.status)
+
+                    # Parse JSON response
+                    response_json = await response.json()
+
+                    #self.log("Request to Solis API endpoint {} with payload {} returned response: {}".format(endpoint, payload, response_json))
+
+                    # Check API response code
+                    code = response_json.get("code", "Unknown")
+                    if str(code) != "0":
+                        error_msg = response_json.get("msg", "Unknown error")
+                        error_detail = SOLIS_API_CODES.get(str(code), f"Unknown code: {code}")
+                        record_api_call("solis", False, "server_error")
+                        if str(code) == SOLIS_API_CODE_QUOTA_EXCEEDED:
+                            self.note_quota_exhausted()
+                        elif str(code) == SOLIS_API_CODE_DATALOGGER_OFFLINE:
+                            # Not throttling, whatever the old 10 second sleep assumed: the datalogger
+                            # is offline, so this inverter is backed off rather than retried.
+                            self.note_datalogger_offline(request_inverter_sn)
+                        raise SolisAPIError(f"API error: {error_msg} ({error_detail} - {response_json})", response_code=str(code))
+
+                    # Return data field
+                    record_api_call("solis")
+                    self.note_quota_restored()
+                    self.note_datalogger_online(request_inverter_sn)
+                    return response_json.get("data")
+
+        except asyncio.TimeoutError as err:
+            record_api_call("solis", False, "connection_error")
+            raise SolisAPIError(f"Timeout accessing {url}") from err
+        except aiohttp.ClientError as err:
+            record_api_call("solis", False, "connection_error")
+            raise SolisAPIError(f"Network error accessing {url}: {str(err)}") from err
+
+    async def _with_retry(self, operation, max_retry_time=SOLIS_MAX_RETRY_TIME):
+        """Execute operation with exponential backoff retry"""
+        start_time = time.monotonic()
+        attempt = 0
+        delay = SOLIS_INITIAL_RETRY_DELAY
+
+        while True:
+            try:
+                return await operation()
+            except SolisAPIError as err:
+                # OAuth permanently failed (needs reauth) — abort immediately rather than
+                # burning the full retry window hitting the API with a known-bad token.
+                if self.oauth_failed:
+                    raise err
+                # An exhausted allowance or an offline datalogger will answer every retry the same
+                # way, and each attempt still costs one of the 200 daily requests (issue #5087).
+                if err.response_code in SOLIS_API_CODES_NO_RETRY:
+                    raise err
+                elapsed_time = time.monotonic() - start_time
+                if elapsed_time >= max_retry_time:
+                    raise err
+
+                attempt += 1
+                self.log(f"Warn: Solis API retry {attempt} after {elapsed_time:.1f}s: {str(err)}")
+
+                await asyncio.sleep(delay)
+                delay = min(delay * 1.5, max_retry_time - elapsed_time)  # Exponential backoff
+
+    async def read_cid(self, inverter_sn, cid):
+        """Read single CID value"""
+        async def read_operation():
+            payload = {"inverterSn": inverter_sn, "cid": cid}
+            data = await self._execute_request(SOLIS_READ_ENDPOINT, payload)
+            if data is None:
+                raise SolisAPIError(f"Read CID {cid} failed: missing 'data' field")
+            if "msg" not in data:
+                raise SolisAPIError(f"Read CID {cid} failed: missing 'msg' field")
+
+            value = data["msg"]
+            info = copy.deepcopy(data)
+
+            if inverter_sn not in self.cached_values:
+                self.cached_values[inverter_sn] = {}
+                self.cached_infos[inverter_sn] = {}
+            self.cached_values[inverter_sn][cid] = str(value)
+            self.cached_infos[inverter_sn][cid] = info
+
+            return value, info
+
+        return await self._with_retry(read_operation)
+
+    async def read_batch(self, inverter_sn, cids):
+        """Read multiple CID values in batch"""
+        async def read_batch_operation():
+            # Convert CID list to comma-separated string
+            cids_str = ",".join(str(cid) for cid in cids)
+            payload = {"inverterSn": inverter_sn, "cids": cids_str}
+            data = await self._execute_request(SOLIS_READ_BATCH_ENDPOINT, payload)
+
+            if data is None:
+                raise SolisAPIError("Batch read failed: missing 'data' field")
+
+            # Parse nested response arrays: [[{"cid": "123", "msg": "value"}]]
+            result = {}
+            result_info = {}
+            if isinstance(data, list):
+                for outer_item in data:
+                    if isinstance(outer_item, list):
+                        for item in outer_item:
+                            if "cid" in item and "msg" in item:
+                                result[int(item["cid"])] = item["msg"]
+                                result_info[int(item["cid"])] = item
+
+            return result, result_info
+
+        return await self._with_retry(read_batch_operation)
+
+    async def encode_time_windows(self, inverter_sn, time_windows):
+        """
+        Encode charge/discharge time windows into CID 103 format
+
+        Accepts time_windows dict with structure {slot_num: {charge_current, discharge_current, charge_start_time, charge_end_time, discharge_start_time, discharge_end_time, field_length}}
+
+        Uses field_length to decide on how to encode (type 1 or type 2)
+        Returns: encoded string for CID 103
+        """
+        if not time_windows:
+            self.log(f"Warn: Solis API encode_time_windows: No time windows data provided for {inverter_sn}")
+            return None
+
+        # Determine format from first slot's field_length
+        first_slot = time_windows.get(1, time_windows.get(min(time_windows.keys())))
+        field_length = first_slot.get("field_length", 18)  # Default to variant 1
+
+        fields = []
+
+        if field_length == 18:
+            # Variant 1: 6 fields per slot (charge_current, discharge_current, charge_start, charge_end, discharge_start, discharge_end)
+            self.log(f"Solis API: Encoding time windows variant 1 (18 fields) for {inverter_sn}")
+            for slot_index in range(1, 4):  # Slots 1-3
+                slot_data = time_windows.get(slot_index, {})
+
+                # Extract fields with defaults
+                charge_current = str(int(slot_data.get("charge_current", 0)))
+                discharge_current = str(int(slot_data.get("discharge_current", 0)))
+                charge_start = slot_data.get("charge_start_time", "00:00")
+                charge_end = slot_data.get("charge_end_time", "00:00")
+                discharge_start = slot_data.get("discharge_start_time", "00:00")
+                discharge_end = slot_data.get("discharge_end_time", "00:00")
+
+                # Add 6 fields for this slot
+                fields.extend([charge_current, discharge_current, charge_start, charge_end, discharge_start, discharge_end])
+
+        elif field_length == 12:
+            # Variant 2: 4 fields per slot (charge_current, discharge_current, charge_time_slot, discharge_time_slot)
+            self.log(f"Solis API: Encoding time windows variant 2 (12 fields) for {inverter_sn}")
+            for slot_index in range(1, 4):  # Slots 1-3
+                slot_data = time_windows.get(slot_index, {})
+
+                # Extract fields with defaults
+                charge_current = str(int(slot_data.get("charge_current", 0)))
+                discharge_current = str(int(slot_data.get("discharge_current", 0)))
+                charge_start = slot_data.get("charge_start_time", "00:00")
+                charge_end = slot_data.get("charge_end_time", "00:00")
+                discharge_start = slot_data.get("discharge_start_time", "00:00")
+                discharge_end = slot_data.get("discharge_end_time", "00:00")
+
+                # Combine into time slot format
+                charge_time_slot = f"{charge_start}-{charge_end}"
+                discharge_time_slot = f"{discharge_start}-{discharge_end}"
+
+                # Add 4 fields for this slot
+                fields.extend([charge_current, discharge_current, charge_time_slot, discharge_time_slot])
+        else:
+            self.log(f"Warn: Solis API encode_time_windows: Unexpected field_length {field_length} for {inverter_sn}")
+            return None
+
+        # Join fields with commas
+        encoded = ",".join(fields)
+        self.log(f"Solis API: Encoded time windows for {inverter_sn}: {encoded}")
+
+        return encoded
+
+    async def decode_time_windows_v2(self, inverter_sn):
+        # Reads the new split registers and puts them into the same format as decode_time_windows
+        result = {}
+        for slot_index in range(1, 7):  # Slots 1-6
+            charge_current_cid = SOLIS_CID_CHARGE_CURRENT[slot_index - 1]
+            discharge_current_cid = SOLIS_CID_DISCHARGE_CURRENT[slot_index - 1]
+            charge_time_cid = SOLIS_CID_CHARGE_TIME[slot_index - 1]
+            discharge_time_cid = SOLIS_CID_DISCHARGE_TIME[slot_index - 1]
+            charge_soc_cid = SOLIS_CID_CHARGE_SOC_BASE + (slot_index - 1)
+            discharge_soc_cid = SOLIS_CID_DISCHARGE_SOC[slot_index - 1]
+            charge_enable_cid = SOLIS_CID_CHARGE_ENABLE_BASE + (slot_index - 1)
+            discharge_enable_cid = SOLIS_CID_DISCHARGE_ENABLE_BASE + (slot_index - 1)
+
+            charge_current = self.cached_values.get(inverter_sn, {}).get(charge_current_cid, "0")
+            discharge_current = self.cached_values.get(inverter_sn, {}).get(discharge_current_cid, "0")
+            charge_time = self.cached_values.get(inverter_sn, {}).get(charge_time_cid, "00:00-00:00")
+            discharge_time = self.cached_values.get(inverter_sn, {}).get(discharge_time_cid, "00:00-00:00")
+            charge_soc = self.cached_values.get(inverter_sn, {}).get(charge_soc_cid, "0")
+            discharge_soc = self.cached_values.get(inverter_sn, {}).get(discharge_soc_cid, "0")
+            charge_enable = self.cached_values.get(inverter_sn, {}).get(charge_enable_cid, "0")
+            discharge_enable = self.cached_values.get(inverter_sn, {}).get(discharge_enable_cid, "0")
+
+            # Split time slots into start and end times
+            charge_parts = charge_time.split("-") if "-" in charge_time else ["00:00", "00:00"]
+            discharge_parts = discharge_time.split("-") if "-" in discharge_time else ["00:00", "00:00"]
+
+            charge_start = charge_parts[0] if len(charge_parts) > 0 else "00:00"
+            charge_end = charge_parts[1] if len(charge_parts) > 1 else "00:00"
+            discharge_start = discharge_parts[0] if len(discharge_parts) > 0 else "00:00"
+            discharge_end = discharge_parts[1] if len(discharge_parts) > 1 else "00:00"
+
+            result[slot_index] = {
+                "charge_current": float(charge_current) if charge_current else 0.0,
+                "discharge_current": float(discharge_current) if discharge_current else 0.0,
+                "charge_start_time": charge_start,
+                "charge_end_time": charge_end,
+                "discharge_start_time": discharge_start,
+                "discharge_end_time": discharge_end,
+                "charge_soc": float(charge_soc) if charge_soc else 0.0,
+                "discharge_soc": float(discharge_soc) if discharge_soc else 0.0,
+                "charge_enable": int(charge_enable) if charge_enable else 0,
+                "discharge_enable": int(discharge_enable) if discharge_enable else 0,
+                "field_length": 0,  # Indicate v2 format
+            }
+        self.charge_discharge_time_windows[inverter_sn] = result
+        self.log("Solis API: Decoded time windows v2 for {}: {}".format(inverter_sn, result))  # Debug log
+        return result
+
+    async def reset_charge_windows_if_needed(self, inverter_sn):
+        """
+        Predbat only uses 1 slot so disable the others to avoid conflicts.
+        """
+        slots_to_check = range(2, 7)
+
+        for slot in slots_to_check:
+            slot_data = self.charge_discharge_time_windows.get(inverter_sn, {}).get(slot)
+            if not slot_data:
+                continue
+            slot_data["charge_start_time"] = "00:00"
+            slot_data["charge_end_time"] = "00:00"
+            slot_data["discharge_start_time"] = "00:00"
+            slot_data["discharge_end_time"] = "00:00"
+            slot_data["charge_enable"] = 0
+            slot_data["discharge_enable"] = 0
+
+    async def resolve_discharge_soc_floor(self, inverter_sn, target_soc):
+        """Return the lowest discharge slot cut-off SOC the inverter will actually accept.
+
+        The inverter refuses any discharge slot cut-off below the battery recovery SOC
+        (CID 7229), and refuses to take a recovery SOC below the over-discharge SOC
+        (CID 158) plus one. A refused write is silent - the control API answers with
+        code 0 and the register keeps its previous value - so a slot can sit at a stale
+        cut-off far above the target and never force export at all.
+
+        Where the recovery SOC is higher than the inverter's own minimum it is lowered
+        towards the target first, so only the unavoidable one percent is given up. The
+        over-discharge SOC is never written here, leaving the battery protection floor
+        where the user set it.
+
+        Args:
+            inverter_sn: Inverter serial number
+            target_soc: Cut-off SOC Predbat wants for the discharge slot, as a percentage
+
+        Returns: The cut-off SOC to write, which is target_soc or the lowest value above it the inverter will take
+        """
+        values = self.cached_values.get(inverter_sn, {})
+
+        # Cache only - the infrequent poll runs before the first control write, so a missing
+        # value means we cannot tell where the floor is and the target is left alone
+        recovery_soc = parse_cid_int(values.get(SOLIS_CID_BATTERY_RECOVERY_SOC))
+        if recovery_soc is None or target_soc >= recovery_soc:
+            return target_soc
+
+        # The inverter will not accept a recovery SOC at or below the over-discharge SOC
+        over_discharge_soc = parse_cid_int(values.get(SOLIS_CID_BATTERY_OVER_DISCHARGE_SOC))
+        hard_floor = (over_discharge_soc + 1) if over_discharge_soc is not None else recovery_soc
+
+        wanted_recovery = max(target_soc, hard_floor)
+        if wanted_recovery < recovery_soc:
+            self.log(f"Solis API: Discharge target {target_soc}% is below recovery SOC {recovery_soc}% on {inverter_sn}, lowering recovery SOC to {wanted_recovery}%")
+            if await self.read_and_write_cid(inverter_sn, SOLIS_CID_BATTERY_RECOVERY_SOC, wanted_recovery, field_description="battery recovery SOC"):
+                recovery_soc = wanted_recovery
+            else:
+                # Re-read rather than trust the requested value, the write may have been refused
+                recovery_soc = parse_cid_int(self.cached_values.get(inverter_sn, {}).get(SOLIS_CID_BATTERY_RECOVERY_SOC), recovery_soc)
+
+        if target_soc < recovery_soc:
+            self.log(f"Solis API: Clamping discharge slot SOC from {target_soc}% to {recovery_soc}% on {inverter_sn}, the inverter will not discharge below its recovery SOC")
+            return recovery_soc
+        return target_soc
+
+    async def write_time_windows_if_changed(self, inverter_sn):
+        """Write charge/discharge time windows, SOC, and current to inverter, only if values changed from cache.
+        Automatically handles V1 vs V2 modes and only writes registers that have changed.
+
+        Args:
+            inverter_sn: Inverter serial number
+
+        Returns: True if write succeeded or no changes needed, False on error
+        """
+
+        try:
+            if inverter_sn not in self.charge_discharge_time_windows:
+                self.log(f"Warn: Solis API: No time windows cached for {inverter_sn}")
+                return True
+
+            #  Make a copy as we will locally modify the data before writing it
+            time_windows = copy.deepcopy(self.charge_discharge_time_windows[inverter_sn])
+
+            if self.is_tou_v2_mode(inverter_sn):
+                #  V2 mode: check and write individual registers for changed values only
+                slots_to_check = range(1, 7)
+                success = True
+                max_charge_current_amps = float(self.cached_values.get(inverter_sn, {}).get(SOLIS_CID_BATTERY_MAX_CHARGE_CURRENT, 60.0))
+                max_discharge_current_amps = float(self.cached_values.get(inverter_sn, {}).get(SOLIS_CID_BATTERY_MAX_DISCHARGE_CURRENT, 60.0))
+                charge_current = max_charge_current_amps
+                discharge_current = max_discharge_current_amps
+                slot1_active = False  # Whether slot 1 has any charge/discharge window configured
+
+                # There appears to be charge current limit on the slots which confused as slot 1 has a higher limit than the others,
+                # but the value isn't accepted, find the lowest slot limit
+                for slot in slots_to_check:
+                    current_cid = SOLIS_CID_CHARGE_CURRENT[slot - 1]
+                    max_charge_current_amps = min(self.cached_infos.get(inverter_sn, {}).get(current_cid, {}).get('sysCommand', {}).get('max', max_charge_current_amps), max_charge_current_amps)
+                    current_cid = SOLIS_CID_DISCHARGE_CURRENT[slot - 1]
+                    max_discharge_current_amps = min(self.cached_infos.get(inverter_sn, {}).get(current_cid, {}).get('sysCommand', {}).get('max', max_discharge_current_amps), max_discharge_current_amps)
+
+                # Prep: extract active currents from slot 1 and zero out times for disabled slots
+                # so that the two-pass write below has clean data to compare against.
+                for slot in slots_to_check:
+                    slot_data = time_windows.get(slot)
+                    if not slot_data:
+                        continue
+
+                    if slot == 1:
+                        # Predbat only uses slot 1, so it can indicate current here.
+                        charge_current = slot_data.get("charge_current", charge_current)
+                        slot1_active = bool(slot_data.get("charge_enable", 0)) or bool(slot_data.get("discharge_enable", 0))
+                        discharge_current = slot_data.get("discharge_current", discharge_current)
+
+                    # When a slot is disabled, zero out its times so the inverter shows a clean 00:00-00:00
+                    if not slot_data.get("charge_enable", 0):
+                        slot_data["charge_start_time"] = "00:00"
+                        slot_data["charge_end_time"] = "00:00"
+                    if not slot_data.get("discharge_enable", 0):
+                        slot_data["discharge_start_time"] = "00:00"
+                        slot_data["discharge_end_time"] = "00:00"
+
+                # Pass 1: Clear all disabled slots first.
+                # This prevents stale times on the inverter from blocking active-slot writes due to overlap conflicts.
+                for slot in slots_to_check:
+                    slot_data = time_windows.get(slot)
+                    if not slot_data:
+                        continue
+
+                    if not slot_data.get("charge_enable", 0):
+                        enable_cid = SOLIS_CID_CHARGE_ENABLE_BASE + (slot - 1)
+                        cached_enable = self.cached_values.get(inverter_sn, {}).get(enable_cid)
+                        if cached_enable != "0":
+                            result = await self.read_and_write_cid(inverter_sn, enable_cid, "0", field_description=f"charge slot {slot} enable")
+                            success &= result
+                        time_cid = SOLIS_CID_CHARGE_TIME[slot - 1]
+                        cached_time = self.cached_values.get(inverter_sn, {}).get(time_cid)
+                        if cached_time != "00:00-00:00":
+                            result = await self.read_and_write_cid(inverter_sn, time_cid, "00:00-00:00", field_description=f"charge slot {slot} time")
+                            success &= result
+
+                    if not slot_data.get("discharge_enable", 0):
+                        enable_cid = SOLIS_CID_DISCHARGE_ENABLE_BASE + (slot - 1)
+                        cached_enable = self.cached_values.get(inverter_sn, {}).get(enable_cid)
+                        if cached_enable != "0":
+                            result = await self.read_and_write_cid(inverter_sn, enable_cid, "0", field_description=f"discharge slot {slot} enable")
+                            success &= result
+                        time_cid = SOLIS_CID_DISCHARGE_TIME[slot - 1]
+                        cached_time = self.cached_values.get(inverter_sn, {}).get(time_cid)
+                        if cached_time != "00:00-00:00":
+                            result = await self.read_and_write_cid(inverter_sn, time_cid, "00:00-00:00", field_description=f"discharge slot {slot} time")
+                            success &= result
+
+                # Pass 2: Write active slot settings (enable, time, SOC, current).
+                # By this point all disabled slots should have been cleared on the inverter,
+                # so there is no risk of a time-overlap rejection from the API.
+                for slot in slots_to_check:
+                    slot_data = time_windows.get(slot)
+                    if not slot_data:
+                        continue
+
+                    if slot_data.get("charge_enable", 0):
+                        # Check and write charge enable if changed
+                        enable_cid = SOLIS_CID_CHARGE_ENABLE_BASE + (slot - 1)
+                        cached_enable = self.cached_values.get(inverter_sn, {}).get(enable_cid)
+                        if cached_enable != "1":
+                            result = await self.read_and_write_cid(inverter_sn, enable_cid, "1", field_description=f"charge slot {slot} enable")
+                            success &= result
+
+                        # Check and write charge time if changed
+                        if "charge_start_time" in slot_data and "charge_end_time" in slot_data:
+                            time_cid = SOLIS_CID_CHARGE_TIME[slot - 1]
+                            new_time_str = f"{slot_data['charge_start_time']}-{slot_data['charge_end_time']}"
+                            cached_time = self.cached_values.get(inverter_sn, {}).get(time_cid)
+                            if cached_time != new_time_str:
+                                result = await self.read_and_write_cid(inverter_sn, time_cid, new_time_str, field_description=f"charge slot {slot} time")
+                                success &= result
+
+                        # Check and write charge SOC if changed
+                        if "charge_soc" in slot_data:
+                            soc_cid = SOLIS_CID_CHARGE_SOC_BASE + (slot - 1)
+                            new_soc_str = str(int(slot_data['charge_soc']))
+                            cached_soc = self.cached_values.get(inverter_sn, {}).get(soc_cid)
+                            if cached_soc != new_soc_str:
+                                result = await self.read_and_write_cid(inverter_sn, soc_cid, new_soc_str, field_description=f"charge slot {slot} SOC")
+                                success &= result
+
+                        # Check and write charge current if changed
+                        if "charge_current" in slot_data:
+                            current_cid = SOLIS_CID_CHARGE_CURRENT[slot - 1]
+                            new_current = min(float(slot_data['charge_current']), max_charge_current_amps)
+                            cached_current = float(self.cached_values.get(inverter_sn, {}).get(current_cid, max_charge_current_amps))
+                            if round(cached_current, 1) != round(new_current, 1):
+                                result = await self.read_and_write_cid(inverter_sn, current_cid, new_current, field_description=f"charge slot {slot} current")
+                                success &= result
+
+                    if slot_data.get("discharge_enable", 0):
+                        # Check and write discharge enable if changed
+                        enable_cid = SOLIS_CID_DISCHARGE_ENABLE_BASE + (slot - 1)
+                        cached_enable = self.cached_values.get(inverter_sn, {}).get(enable_cid)
+                        if cached_enable != "1":
+                            result = await self.read_and_write_cid(inverter_sn, enable_cid, "1", field_description=f"discharge slot {slot} enable")
+                            success &= result
+
+                        # Check and write discharge time if changed
+                        if "discharge_start_time" in slot_data and "discharge_end_time" in slot_data:
+                            time_cid = SOLIS_CID_DISCHARGE_TIME[slot - 1]
+                            new_time_str = f"{slot_data['discharge_start_time']}-{slot_data['discharge_end_time']}"
+                            cached_time = self.cached_values.get(inverter_sn, {}).get(time_cid)
+                            if cached_time != new_time_str:
+                                result = await self.read_and_write_cid(inverter_sn, time_cid, new_time_str, field_description=f"discharge slot {slot} time")
+                                success &= result
+
+                        # Check and write discharge SOC if changed
+                        if "discharge_soc" in slot_data:
+                            soc_cid = SOLIS_CID_DISCHARGE_SOC[slot - 1]
+                            # The inverter silently discards a cut-off below its recovery SOC, leaving the
+                            # slot on a stale value that can stop it exporting at all (see issue #4702)
+                            new_soc = await self.resolve_discharge_soc_floor(inverter_sn, int(slot_data['discharge_soc']))
+                            new_soc_str = str(new_soc)
+                            cached_soc = self.cached_values.get(inverter_sn, {}).get(soc_cid)
+                            if cached_soc != new_soc_str:
+                                result = await self.read_and_write_cid(inverter_sn, soc_cid, new_soc_str, field_description=f"discharge slot {slot} SOC")
+                                success &= result
+
+                        # Check and write discharge current if changed
+                        if "discharge_current" in slot_data:
+                            current_cid = SOLIS_CID_DISCHARGE_CURRENT[slot - 1]
+                            new_current = min(float(slot_data['discharge_current']), max_discharge_current_amps)
+                            cached_current = float(self.cached_values.get(inverter_sn, {}).get(current_cid, max_discharge_current_amps))
+                            if round(cached_current, 1) != round(new_current, 1):
+                                result = await self.read_and_write_cid(inverter_sn, current_cid, new_current, field_description=f"discharge slot {slot} current")
+                                success &= result
+
+                # Decide if Solar charges the batter or exports
+                # Gate the mode choice on whether slot 1 has a window configured, the same way the V1
+                # branch does below (see the in_charge_slot/in_discharge_slot handling), so the
+                # inverter is not left in a timed mode with nothing scheduled.
+                if charge_current == 0:
+                    if slot1_active:
+                        self.log(f"Solis API: Charge current is 0A for {inverter_sn}, setting storage mode to 'Feed-in priority'")
+                        await self.set_storage_mode_if_needed(inverter_sn, "Feed-in priority")
+                    else:
+                        self.log(f"Solis API: Charge current is 0A and no active slot for {inverter_sn}, setting storage mode to 'Feed-in priority - No Timed Charge/Discharge'")
+                        await self.set_storage_mode_if_needed(inverter_sn, "Feed-in priority - No Timed Charge/Discharge")
+                else:
+                    if slot1_active:
+                        self.log(f"Solis API: Charge current is {charge_current}A for {inverter_sn}, setting storage mode to 'Self-Use'")
+                        await self.set_storage_mode_if_needed(inverter_sn, "Self-Use")
+                    else:
+                        self.log(f"Solis API: Charge current is {charge_current}A and no active slot for {inverter_sn}, setting storage mode to 'Self-Use - No Timed Charge/Discharge'")
+                        await self.set_storage_mode_if_needed(inverter_sn, "Self-Use - No Timed Charge/Discharge")
+
+                return success
+            else:
+                # V1 mode: Handle SOC values separately (global CIDs) and time/current via CID 103
+                success = True
+                slots_to_check = range(1, 7)
+
+                # V1 mode does not have a target SOC, so we need to figure out if we are in any of the slots or not
+                # if we are inside the slot then compare the current SOC to the target SOC and decide if we zero out the Amps or not
+
+                in_charge_slot = None
+                in_discharge_slot = None
+                current_time = self.now_utc_exact.strftime("%H:%M")  # Use local time to match time windows set by Predbat in local timezone
+                max_charge_current_amps = self.cached_values.get(inverter_sn, {}).get(SOLIS_CID_BATTERY_MAX_CHARGE_CURRENT, None)
+                charge_current = max_charge_current_amps
+                discharge_current = max_charge_current_amps
+
+                for slot in slots_to_check:
+                    slot_data = time_windows.get(slot)
+                    if slot_data:
+                        charge_start_time = slot_data.get("charge_start_time", "00:00")
+                        charge_end_time = slot_data.get("charge_end_time", "00:00")
+                        charge_enable = slot_data.get("charge_enable", 0)
+                        discharge_start_time = slot_data.get("discharge_start_time", "00:00")
+                        discharge_end_time = slot_data.get("discharge_end_time", "00:00")
+                        discharge_enable = slot_data.get("discharge_enable", 0)
+
+                        # Get the charge/discharge current set by Predbat
+                        if slot == 1:
+                            charge_current = slot_data.get("charge_current", charge_current)
+                            discharge_current = slot_data.get("discharge_current", discharge_current)
+
+                        # Check if we're in a charge slot
+                        if charge_enable and time_in_window(current_time, charge_start_time, charge_end_time):
+                            in_charge_slot = slot
+
+                        # Check if we're in a discharge slot
+                        if discharge_enable and time_in_window(current_time, discharge_start_time, discharge_end_time):
+                            in_discharge_slot = slot
+
+                        # Break on the first match, they can't overlap
+                        if in_charge_slot or in_discharge_slot:
+                            break
+
+                # Extract SOC values from the active slots
+                charge_soc_to_write = None
+                discharge_soc_to_write = None
+
+                # Get the current SOC value
+                detail = self.inverter_details.get(inverter_sn, {})
+                battery_soc = detail.get("batteryCapacitySoc", 0)
+
+                # Adjust currents based on SOC and active slots
+                if in_discharge_slot:
+                    slot_data = time_windows.get(in_discharge_slot)
+                    discharge_soc_to_write = slot_data.get("discharge_soc", 0)
+                    if battery_soc <= discharge_soc_to_write:
+                        # Zero out discharge current if below target SOC
+                        slot_data["discharge_current"] = 0
+                    self.log(f"Solis API: In discharge slot {in_discharge_slot}, target SOC: {discharge_soc_to_write}%")
+                    charge_current = slot_data.get("charge_current", charge_current)
+                elif in_charge_slot:
+                    slot_data = time_windows.get(in_charge_slot)
+                    charge_soc_to_write = slot_data.get("charge_soc", 100)
+                    if battery_soc >= charge_soc_to_write:
+                        # Zero out charge current if above target SOC
+                        slot_data["charge_current"] = 0
+                    self.log(f"Solis API: In charge slot {in_charge_slot}, target SOC: {charge_soc_to_write}%")
+                    discharge_current = slot_data.get("discharge_current", discharge_current)
+
+                # Update enable flags based on time equality for all slots
+                for slot in range(1, 7):
+                    if slot not in time_windows:
+                        continue
+                    slot_data = time_windows[slot]
+
+                    # Update charge enable based on time equality
+                    if "charge_start_time" in slot_data and "charge_end_time" in slot_data:
+                        if slot_data["charge_start_time"] == slot_data["charge_end_time"]:
+                            slot_data["charge_enable"] = 0
+
+                    charge_enable = slot_data.get("charge_enable", 0)
+                    if not charge_enable:
+                        slot_data["charge_start_time"] = "00:00"
+                        slot_data["charge_end_time"] = "00:00"
+
+                    # Update discharge enable based on time equality
+                    if "discharge_start_time" in slot_data and "discharge_end_time" in slot_data:
+                        if slot_data["discharge_start_time"] == slot_data["discharge_end_time"]:
+                            slot_data["discharge_enable"] = 0
+                    discharge_enable = slot_data.get("discharge_enable", 0)
+                    if not discharge_enable:
+                        slot_data["discharge_start_time"] = "00:00"
+                        slot_data["discharge_end_time"] = "00:00"
+
+                # Encode all slots and compare with cached value (for time/current/enable)
+                encoded = await self.encode_time_windows(inverter_sn, time_windows)
+                cached_encoded = self.cached_values.get(inverter_sn, {}).get(SOLIS_CID_CHARGE_DISCHARGE_SETTINGS)
+
+                if cached_encoded != encoded:
+                    result = await self.read_and_write_cid(inverter_sn, SOLIS_CID_CHARGE_DISCHARGE_SETTINGS, encoded, field_description="charge/discharge time windows")
+                    success &= result
+                else:
+                    self.log(f"Solis API: Time windows unchanged for {inverter_sn}, skipping SOLIS_CID_CHARGE_DISCHARGE_SETTINGS write")
+
+                # Decide if Solar charges the battery or exports
+                if charge_current == 0:
+                    if in_charge_slot or in_discharge_slot:
+                        self.log(f"Solis API: Charge current is 0A for {inverter_sn}, setting storage mode to 'Feed-in priority'")
+                        await self.set_storage_mode_if_needed(inverter_sn, "Feed-in priority")
+                    else:
+                        self.log(f"Solis API: Outside of charge/discharge slots for {inverter_sn}, setting storage mode to 'Feed-in priority - No Timed Charge/Discharge'")
+                        await self.set_storage_mode_if_needed(inverter_sn, "Feed-in priority - No Timed Charge/Discharge")
+                else:
+                    if in_charge_slot or in_discharge_slot:
+                        self.log(f"Solis API: Charge current is {charge_current}A for {inverter_sn}, setting storage mode to 'Self-Use'")
+                        await self.set_storage_mode_if_needed(inverter_sn, "Self-Use")
+                    else:
+                        self.log(f"Solis API: Outside of charge/discharge slots for {inverter_sn}, setting storage mode to 'Self-Use - No Timed Charge/Discharge'")
+                        await self.set_storage_mode_if_needed(inverter_sn, "Self-Use - No Timed Charge/Discharge")
+
+                return success
+
+        except Exception as e:
+            self.log(f"Error: Solis API write_time_windows_if_changed failed for {inverter_sn}: {e}")
+            return False
+
+    async def decode_time_windows(self, inverter_sn):
+        """
+        Decode charge/discharge time windows from cached CID 103
+
+        Two variants exist:
+        - Variant 1 (18 fields): charge_current, discharge_current, charge_start, charge_end,
+                                 discharge_start, discharge_end (repeated for 3 slots)
+        - Variant 2 (12 fields): charge_current, discharge_current, charge_time_slot,
+                                 discharge_time_slot (repeated for 3 slots)
+
+        Example Variant 1: '62,62,00:00,05:30,00:00,00:00,0,0,00:00,00:00,00:00,00:00,0,0,00:00,00:00,00:00,00:00'
+        Example Variant 2: '62,62,00:00-05:30,00:00-00:00,0,0,00:00-00:00,00:00-00:00,0,0,00:00-00:00,00:00-00:00'
+
+        Returns: dict with structure {slot_num: {charge_current, discharge_current, charge_time, discharge_time}}
+        """
+        data = self.cached_values.get(inverter_sn, {}).get(SOLIS_CID_CHARGE_DISCHARGE_SETTINGS, None)
+        if data is None:
+            self.log(f"Warn: Solis API decode_time_windows: No data for inverter {inverter_sn}")
+            return None
+
+        # Split into fields
+        fields = data.split(",")
+        fields = [f.strip() for f in fields]  # Remove whitespace
+        fields_length = len(fields)
+
+        result = {}
+
+        global_charge_soc = self.cached_values.get(inverter_sn, {}).get(SOLIS_CID_BATTERY_FORCE_CHARGE_SOC)
+        global_discharge_soc = self.cached_values.get(inverter_sn, {}).get(SOLIS_CID_BATTERY_OVER_DISCHARGE_SOC)
+        self.log("Solis API: Decode time windows, global_charge_soc={}, global_discharge_soc={}".format(global_charge_soc, global_discharge_soc))  # Debug log
+        try:
+            global_charge_soc = float(global_charge_soc)
+        except (ValueError, TypeError):
+            global_charge_soc = 100.0
+        try:
+            global_discharge_soc = float(global_discharge_soc)
+        except (ValueError, TypeError):
+            global_discharge_soc = 10.0
+
+        self.log("Solis API: Decode time windows, global_charge_soc={}, global_discharge_soc={}".format(global_charge_soc, global_discharge_soc))  # Debug log
+
+        if fields_length == 18:
+            # Variant 1: 6 fields per slot (charge_current, discharge_current, charge_start, charge_end, discharge_start, discharge_end)
+            self.log(f"Solis API: Decoding time windows variant 1 (18 fields) for {inverter_sn}")
+            for slot_index in range(1, 4):  # Slots 1-3
+                base_idx = (slot_index - 1) * 6
+
+                # Extract fields
+                charge_current = fields[base_idx] if base_idx < len(fields) else "0"
+                discharge_current = fields[base_idx + 1] if base_idx + 1 < len(fields) else "0"
+                charge_start = fields[base_idx + 2] if base_idx + 2 < len(fields) else "00:00"
+                charge_end = fields[base_idx + 3] if base_idx + 3 < len(fields) else "00:00"
+                discharge_start = fields[base_idx + 4] if base_idx + 4 < len(fields) else "00:00"
+                discharge_end = fields[base_idx + 5] if base_idx + 5 < len(fields) else "00:00"
+
+                result[slot_index] = {
+                    "charge_current": float(charge_current) if charge_current else 0.0,
+                    "discharge_current": float(discharge_current) if discharge_current else 0.0,
+                    "charge_start_time": charge_start,
+                    "charge_end_time": charge_end,
+                    "discharge_start_time": discharge_start,
+                    "discharge_end_time": discharge_end,
+                    "charge_enable": 1 if charge_start != charge_end else 0,
+                    "discharge_enable": 1 if discharge_start != discharge_end else 0,
+                    "charge_soc": global_charge_soc,
+                    "discharge_soc": global_discharge_soc,
+                    "field_length": fields_length,
+                }
+
+        elif fields_length == 12:
+            # Variant 2: 4 fields per slot (charge_current, discharge_current, charge_time_slot, discharge_time_slot)
+            self.log(f"Solis API: Decoding time windows variant 2 (12 fields) for {inverter_sn}")
+            for slot_index in range(1, 4):  # Slots 1-3
+                base_idx = (slot_index - 1) * 4
+
+                # Extract fields
+                charge_current = fields[base_idx] if base_idx < len(fields) else "0"
+                discharge_current = fields[base_idx + 1] if base_idx + 1 < len(fields) else "0"
+                charge_time_slot = fields[base_idx + 2] if base_idx + 2 < len(fields) else "00:00-00:00"
+                discharge_time_slot = fields[base_idx + 3] if base_idx + 3 < len(fields) else "00:00-00:00"
+
+                # Split time slots into start and end times
+                charge_parts = charge_time_slot.split("-") if "-" in charge_time_slot else ["00:00", "00:00"]
+                discharge_parts = discharge_time_slot.split("-") if "-" in discharge_time_slot else ["00:00", "00:00"]
+
+                charge_start = charge_parts[0] if len(charge_parts) > 0 else "00:00"
+                charge_end = charge_parts[1] if len(charge_parts) > 1 else "00:00"
+                discharge_start = discharge_parts[0] if len(discharge_parts) > 0 else "00:00"
+                discharge_end = discharge_parts[1] if len(discharge_parts) > 1 else "00:00"
+
+                result[slot_index] = {
+                    "charge_current": float(charge_current) if charge_current else 0.0,
+                    "discharge_current": float(discharge_current) if discharge_current else 0.0,
+                    "charge_start_time": charge_start,
+                    "charge_end_time": charge_end,
+                    "discharge_start_time": discharge_start,
+                    "discharge_end_time": discharge_end,
+                    "charge_enable": 1 if charge_start != charge_end else 0,
+                    "discharge_enable": 1 if discharge_start != discharge_end else 0,
+                    "charge_soc": global_charge_soc,
+                    "discharge_soc": global_discharge_soc,
+                    "field_length": fields_length,
+                }
+        else:
+            self.log(f"Warn: Solis API decode_time_windows: Unexpected field count {fields_length} for {inverter_sn}")
+            return None
+
+        self.log(f"Solis API: Decoded time windows for {inverter_sn}: {result}")
+        self.charge_discharge_time_windows[inverter_sn] = result
+        return result
+
+    async def read_and_write_cid(self, inverter_sn, cid, value, field_description=None):
+        """Read CID value then write with verification (required by Solis API).
+        Automatically reads current value, writes with old_value verification,
+        Updates cache on success (via read_cid function), and logs appropriate messages.
+
+        Args:
+            inverter_sn: Inverter serial number
+            cid: CID to write
+            value: Value to write
+            field_description: Human-readable description for logging (e.g., "charge slot 1 SOC")
+
+        Returns: True on success, False on failure
+        """
+        try:
+            # Read current value first (required by Solis API)
+            # Write with old_value verification
+            old_value, info = await self.read_cid(inverter_sn, cid)
+            result = await self.write_cid(inverter_sn, cid, str(value), old_value=old_value, field_description=field_description)
+
+            # Validate what we wrote so the cache is correct.
+            old_value, info = await self.read_cid(inverter_sn, cid)
+            if not result:
+                self.log(f"Warn: Solis API: Failed to write CID {cid} {field_description} on {inverter_sn}")
+                return False
+
+            if cid_value_matches(old_value, value):
+                self.log(f"Solis API: CID {cid} {field_description} on {inverter_sn} is set to {value}")
+                return True
+
+            # A read taken this soon after the write can still be reporting the value from before
+            # it, so read once more after a pause rather than concluding the write was refused
+            # (issue #4774). The settled read also leaves the cache holding the better answer.
+            await asyncio.sleep(self.verify_settle_seconds)
+            settled_value, info = await self.read_cid(inverter_sn, cid)
+            if cid_value_matches(settled_value, value):
+                self.log(f"Solis API: CID {cid} {field_description} on {inverter_sn} is set to {value}, read back {old_value} until it settled {self.verify_settle_seconds}s later")
+                return True
+
+            self.log(f"Warn: Solis API: Failed to verify CID {cid} {field_description} on {inverter_sn}, wrote {value} but read back {old_value} and still {settled_value} after {self.verify_settle_seconds}s")
+            return False
+
+        except Exception as e:
+            # Log failure
+            if field_description:
+                self.log(f"Warn: Solis API: Failed to read and set {field_description} on {inverter_sn}: {e}")
+            else:
+                self.log(f"Warn: Solis API read_and_write_cid failed for CID {cid}: {e}")
+            return False
+
+    async def write_cid(self, inverter_sn, cid, value, old_value=None, field_description=None):
+        """Write CID value with optional old value verification.
+        Automatically updates cache on success and logs appropriate messages.
+
+        Note: Many Solis API commands require reading the current value first.
+        Use read_and_write_cid() wrapper for those cases.
+
+        Args:
+            inverter_sn: Inverter serial number
+            cid: CID to write
+            value: Value to write
+            old_value: Previous value for verification (optional, required for many CIDs)
+            field_description: Human-readable description for logging (e.g., "charge slot 1 SOC")
+
+        Returns: True on success, False on failure
+        """
+        async def write_operation():
+            payload = {
+                "inverterSn": inverter_sn,
+                "cid": cid,
+                "value": str(value)
+            }
+            if old_value is not None:
+                payload["yuanzhi"] = str(old_value)
+
+            data = await self._execute_request(SOLIS_CONTROL_ENDPOINT, payload)
+
+            if data is None:
+                raise SolisAPIError(f"Write CID {cid} failed: missing 'data' field")
+            if not isinstance(data, list):
+                raise SolisAPIError(f"Write CID {cid} failed: 'data' field is not an array")
+
+            # Validate response codes
+            for item in data:
+                code = item.get("code")
+                if code is not None and str(code) != "0":
+                    error_msg = item.get("msg", "Unknown error")
+                    raise SolisAPIError(f"Write CID {cid} failed: {error_msg}", response_code=str(code))
+
+        try:
+            await self._with_retry(write_operation)
+
+            # Update cache on success
+            if inverter_sn not in self.cached_values:
+                self.cached_values[inverter_sn] = {}
+                self.cached_infos[inverter_sn] = {}
+            self.cached_values[inverter_sn][cid] = str(value)
+
+            # Log success
+            if field_description:
+                self.log(f"Solis API: Set {field_description} on {inverter_sn}")
+            else:
+                self.log(f"Solis API: Set CID {cid} to {value} on {inverter_sn}")
+
+            return True
+        except Exception as e:
+            # Log failure
+            if field_description:
+                self.log(f"Warn: Solis API: Failed to set {field_description} on {inverter_sn}: {e}")
+            else:
+                self.log(f"Warn: Solis API write_cid failed for CID {cid}: {e}")
+            return False
+
+    async def get_inverter_list(self):
+        """Get list of all inverters in account"""
+        async def list_operation():
+            payload = {"pageSize": "100"}
+            data = await self._execute_request(SOLIS_INVERTER_LIST_ENDPOINT, payload)
+
+            if data is None or "page" not in data:
+                raise SolisAPIError("Inverter list failed: missing 'data.page' field")
+
+            records = data["page"].get("records", [])
+            return records
+
+        return await self._with_retry(list_operation)
+
+    async def get_inverter_detail(self, inverter_sn):
+        """Get detailed information for specific inverter"""
+        async def detail_operation():
+            payload = {"sn": inverter_sn}
+            data = await self._execute_request(SOLIS_INVERTER_DETAIL_ENDPOINT, payload)
+
+            if data is None:
+                raise SolisAPIError(f"Inverter detail failed for {inverter_sn}: missing 'data' field")
+
+            return data
+
+        return await self._with_retry(detail_operation)
+
+    # ==================== Configuration and Polling ====================
+
+    @staticmethod
+    def _reports_no_battery(detail):
+        """True only when Solis Cloud explicitly declares this inverter has no battery attached.
+
+        Deliberately narrow: absence of these fields (older firmware, other models) means "unknown",
+        which leaves the inverter enrolled exactly as before.
+
+        Match on the self-describing name, in both the places Solis reports it. The `noBattery`
+        boolean is checked too but cannot be relied on alone - one firmware sets it True, another
+        leaves it None on an inverter that says "No Battery" everywhere else.
+
+        The name is matched negatively rather than against a list of known batteries, because the
+        positive values vary by pack ('PYLON_LV', 'Lithium Battery LV', ...) and an unrecognised
+        battery must never be read as no battery.
+
+        Never infer from batteryHealthSoh - a real pack reporting SoH 0 is a documented, valid
+        response and still names its battery type. Never infer from the lifetime counters either:
+        batteryTotalChargeEnergy and friends survive the pack being physically removed, so an
+        inverter that once cycled MWh can still legitimately report no battery today.
+
+        (batteryTypeCode is '0000' in this state, against '0001'/'0063' for real packs, but it is
+        left out on purpose: a code that means "unknown" on some firmware would silently ignore a
+        working battery, and the names above already cover every case seen.)
+
+        A top-level batteryType that names a real pack settles it on its own: batteryList is only
+        consulted when batteryType is absent. Accounts exist whose batteryType is 'PYLON_LV' with a
+        live, healthy pack while batteryList still carries a "No Battery" entry, and letting the
+        list win there drops a working battery. Both no-battery accounts observed so far state it
+        in batteryType as well, so nothing that motivated checking the list is lost by this.
+        """
+        battery_type = str(detail.get("batteryType", "")).strip()
+        if battery_type.lower() == "no battery":
+            return True
+        if battery_type:
+            return False
+        for entry in detail.get("batteryList") or []:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("noBattery") is True:
+                return True
+            if str(entry.get("batteryTypeName", "")).strip().lower() == "no battery":
+                return True
+        return False
+
+    def is_battery_inverter(self, inverter_sn):
+        """False only when Solis Cloud explicitly declares this inverter has no battery attached.
+
+        Predbat has nothing to control on a PV-only inverter, and writing to one produces an
+        endless stream of refused control writes: it is never planned for, so its slot 1 keeps
+        whatever stale window it happened to hold and the storage mode is recomputed and
+        rewritten every cycle (see issue #4707). It is still polled and published, so its PV
+        sensors keep working - only the writes are withheld.
+        """
+        return not self._reports_no_battery(self.inverter_details.get(inverter_sn, {}))
+
+    async def save_discovery_cache(self):
+        """Remember the discovered inverters so a restart can auto-configure without reaching the API"""
+        if not self.storage or not self.inverter_sn:
+            return
+        try:
+            await self.storage.save("solis", "discovery", {"inverter_sn": self.inverter_sn, "inverter_details": self.inverter_details}, format="json", expiry=None)
+        except Exception as e:
+            self.log("Warn: Solis API: Could not save the discovered inverter list: {}".format(e))
+
+    async def restore_discovery_cache(self):
+        """Fall back to the last discovered inverter list when discovery itself could not run.
+
+        Every auto-configured arg is an entity name built from a serial number, so without one there
+        is nothing to bind. A restart while the daily API allowance is exhausted cannot discover, so
+        before this it left load_today and the rest unset and fetch_sensor_data raising ValueError
+        every cycle until the allowance came back (issue #5087). Only ever a fallback: a successful
+        discovery overwrites it, and the details are re-read as soon as the API answers again.
+        """
+        if not self.storage:
+            return False
+        try:
+            data = await self.storage.load("solis", "discovery")
+        except Exception as e:
+            self.log("Warn: Solis API: Could not load the cached inverter list: {}".format(e))
+            return False
+        if not data or not data.get("inverter_sn"):
+            return False
+        self.inverter_sn = list(data["inverter_sn"])
+        self.inverter_details = dict(data.get("inverter_details") or {})
+        self.log("Warn: Solis API: Discovery unavailable, falling back to the {} inverter(s) cached from the last successful discovery: {}".format(len(self.inverter_sn), ", ".join(self.inverter_sn)))
+        return True
+
+    async def automatic_config(self):
+        """Automatically configure Predbat base args based on discovered inverters.
+
+        Returns True when the outcome is final - either the args were bound, or every inverter's
+        details have been read and there is nothing to bind. False means the details are still
+        missing, which is the retryable case run() tries again on a later cycle (issue #5087).
+        """
+        if not self.inverter_sn:
+            self.log("Warn: Solis API automatic_config: No inverters to configure")
+            return False
+
+        # Count inverters with batteries
+        batteries = []
+        for inverter_sn in self.inverter_sn:
+            detail = self.inverter_details.get(inverter_sn, {})
+            if self._reports_no_battery(detail):
+                self.log("Solis API: Skipping inverter {} - Solis Cloud reports no battery attached (batteryType {!r}), so it will not be managed as a battery inverter".format(inverter_sn, detail.get("batteryType")))
+                continue
+            battery_soh = detail.get("batteryHealthSoh")
+            try:
+                battery_soh = float(battery_soh) / 100.0
+            except (ValueError, TypeError):
+                battery_soh = None
+            # A battery_soh of exactly 0 is a documented, valid Solis Cloud API response (not "no
+            # battery") - only a missing/unparseable field should exclude the inverter here.
+            if battery_soh is not None:
+                batteries.append(inverter_sn)
+
+        num_inverters = len(batteries)
+        self.log(f"Solis API: Configuring Predbat for {num_inverters} inverter(s) with batteries")
+        if num_inverters == 0:
+            # Settled only once every inverter's details have actually been read: a PV-only fleet is
+            # a final answer and must not be re-asked every cycle, but details missing because the
+            # API is unreachable are exactly what the retry exists for.
+            details_read = all(sn in self.inverter_details for sn in self.inverter_sn)
+            self.log("Warn: Solis API automatic_config: No inverters with batteries found, skipping configuration{}".format("" if details_read else " - inverter details not read yet, will retry"))
+            return details_read
+
+        # Convert SNs to lowercase for entity naming
+        devices = [sn.lower() for sn in batteries]
+
+        # PV totals are summed across every entry in the arg list, so an inverter with no battery still
+        # belongs in them - its generation is part of the same array (issue #4922). Only the control and
+        # battery args are battery-filtered; a PV-only inverter is still never written to. load/import/
+        # export stay battery-only deliberately: on a shared-CT site those registers can overlap between
+        # inverters, so summing them risks double-counting the house load.
+        pv_devices = [sn.lower() for sn in self.inverter_sn]
+        pv_only_devices = [device for device in pv_devices if device not in devices]
+        if pv_only_devices:
+            self.log("Solis API: Including {} inverter(s) with no battery in the PV totals: {}".format(len(pv_only_devices), ", ".join(pv_only_devices)))
+
+        # Configure base Predbat settings
+        self.set_arg_auto("inverter_type", ["SolisCloud" for _ in range(num_inverters)])
+        self.set_arg_auto("num_inverters", num_inverters)
+
+        # Battery and inverter entities
+        self.set_arg_auto("soc_percent", [f"sensor.{self.prefix}_solis_{device}_battery_soc" for device in devices])
+        self.set_arg_auto("battery_scaling", [f"sensor.{self.prefix}_solis_{device}_battery_soh" for device in devices])
+        self.set_arg_auto("battery_power", [f"sensor.{self.prefix}_solis_{device}_battery_power" for device in devices])
+        self.set_arg_auto("battery_power_invert", [f"True" for device in devices])
+        self.set_arg_auto("grid_power", [f"sensor.{self.prefix}_solis_{device}_grid_power" for device in devices])
+        self.set_arg_auto("battery_voltage", [f"sensor.{self.prefix}_solis_{device}_battery_voltage" for device in devices])
+        # self.set_arg("battery_temperature", [f"sensor.{self.prefix}_solis_{device}_battery_temperature" for device in devices])
+
+        # if solis_cloud_pv_load_ignore is set to true, override Solis cloud sensors and use load/pv_today/power entries defined in apps.yaml
+        if not self.get_arg("solis_cloud_pv_load_ignore", default=False):
+            self.set_arg_auto("load_today", [f"sensor.{self.prefix}_solis_{device}_total_load_energy" for device in devices])
+            self.set_arg_auto("pv_today", [f"sensor.{self.prefix}_solis_{device}_pv_energy_total" for device in pv_devices])
+            self.set_arg_auto("load_power", [f"sensor.{self.prefix}_solis_{device}_load_power" for device in devices])
+            self.set_arg_auto("pv_power", [f"sensor.{self.prefix}_solis_{device}_pv_power" for device in pv_devices])
+        self.set_arg_auto("import_today", [f"sensor.{self.prefix}_solis_{device}_today_import_energy" for device in devices])
+        self.set_arg_auto("export_today", [f"sensor.{self.prefix}_solis_{device}_today_export_energy" for device in devices])
+
+        # Battery capacity and limits from cached details
+        # The arithmetic bug that made this sensor wrong by ~11x on HV batteries is fixed (issue
+        # #4493), and since #5090 the sensor no longer wobbles cycle to cycle either - so the
+        # original reason this was commented out is gone. It stays off for a second one: without
+        # solis_nominal_voltage configured the capacity is still an *estimate* - the pack class is
+        # inferred from its BMS charge voltage, not stated - and
+        # set_arg_auto() defaults to overwrite=True, so enabling it would replace a correct
+        # hand-entered soc_max with an approximate one (noted in the log, but still replaced).
+        # User must still set soc_max manually in apps.yaml.
+        # self.set_arg("soc_max", [f"sensor.{self.prefix}_solis_{device}_battery_capacity" for device in devices])
+
+        # Reserve and limits
+        self.set_arg_auto("reserve", [f"number.{self.prefix}_solis_{device}_over_discharge_soc" for device in devices])
+        self.set_arg_auto("battery_min_soc", [f"number.{self.prefix}_solis_{device}_over_discharge_soc" for device in devices])
+
+        # Charge/discharge controls - using slot 1 for Predbat primary control
+        self.set_arg_auto("charge_start_time", [f"select.{self.prefix}_solis_{device}_charge_slot1_start_time" for device in devices])
+        self.set_arg_auto("charge_end_time", [f"select.{self.prefix}_solis_{device}_charge_slot1_end_time" for device in devices])  # Same selector, parsed
+        self.set_arg_auto("charge_limit", [f"number.{self.prefix}_solis_{device}_charge_slot1_soc" for device in devices])
+        self.set_arg_auto("charge_rate", [f"number.{self.prefix}_solis_{device}_charge_slot1_power" for device in devices])
+        self.set_arg_auto("scheduled_charge_enable", [f"switch.{self.prefix}_solis_{device}_charge_slot1_enable" for device in devices])
+
+        self.set_arg_auto("discharge_start_time", [f"select.{self.prefix}_solis_{device}_discharge_slot1_start_time" for device in devices])
+        self.set_arg_auto("discharge_end_time", [f"select.{self.prefix}_solis_{device}_discharge_slot1_end_time" for device in devices])
+        self.set_arg_auto("discharge_target_soc", [f"number.{self.prefix}_solis_{device}_discharge_slot1_soc" for device in devices])
+        self.set_arg_auto("discharge_rate", [f"number.{self.prefix}_solis_{device}_discharge_slot1_power" for device in devices])
+        self.set_arg_auto("scheduled_discharge_enable", [f"switch.{self.prefix}_solis_{device}_discharge_slot1_enable" for device in devices])
+        self.set_arg_auto("battery_rate_max", [f"number.{self.prefix}_solis_{device}_max_charge_power" for device in devices])
+        self.set_arg_auto("inverter_limit", [f"sensor.{self.prefix}_solis_{device}_inverter_size" for device in devices])
+        self.set_arg_auto("export_limit", [f"number.{self.prefix}_solis_{device}_max_export_power" for device in devices])
+
+        self.log("Solis API: Automatic configuration complete")
+        return True
+
+    async def poll_inverter_data(self, inverter_sn, cid_list, batch=True):
+        """Poll CID values for specific inverter"""
+        self.log("Solis API: Polling data for inverter {}".format(inverter_sn))
+        try:
+            if batch:
+                values, infos = await self.read_batch(inverter_sn, cid_list)
+            else:
+                values = {}
+                infos = {}
+                for cid in cid_list:
+                    value, info = await self.read_cid(inverter_sn, cid)
+                    values[cid] = value
+                    infos[cid] = copy.deepcopy(info)
+
+            # Initialise cache for this inverter if not exists
+            if inverter_sn not in self.cached_values:
+                self.cached_values[inverter_sn] = {}
+                self.cached_infos[inverter_sn] = {}
+
+            # Update cached values
+            self.cached_values[inverter_sn].update(values)
+            self.cached_infos[inverter_sn].update(infos)
+
+            return True
+
+        except Exception as e:
+            self.log(f"Warn: Solis API poll failed for {inverter_sn}: {e}")
+            # Preserve old cached values
+            return False
+
+    def _calculate_max_currents(self, inverter_sn):
+        """Calculate maximum charge/discharge currents for inverter"""
+        values = self.cached_values.get(inverter_sn, {})
+        battery_count = self.parallel_battery_count.get(inverter_sn, 1)
+
+        # Calculate max charge current
+        max_charge = 100.0  # Default fallback
+        max_charge_current_str = values.get(SOLIS_CID_BATTERY_MAX_CHARGE_CURRENT)
+        if max_charge_current_str:
+            try:
+                per_battery_max = float(max_charge_current_str)
+                max_charge = float(per_battery_max * battery_count)
+            except (ValueError, TypeError):
+                # On error the default 100A will be used
+                pass
+        self.max_charge_current[inverter_sn] = max_charge
+
+        # Calculate max discharge current
+        max_discharge = 100.0  # Default fallback
+        max_discharge_current_str = values.get(SOLIS_CID_BATTERY_MAX_DISCHARGE_CURRENT)
+        if max_discharge_current_str:
+            try:
+                per_battery_max = float(max_discharge_current_str)
+                max_discharge = float(per_battery_max * battery_count)
+            except (ValueError, TypeError):
+                # On error the default 100A will be used
+                pass
+        self.max_discharge_current[inverter_sn] = max_discharge
+
+        self.log(f"Solis API: Calculated max currents for {inverter_sn}: charge={max_charge}A, discharge={max_discharge}A")
+
+    def get_live_battery_voltage(self, inverter_sn):
+        """
+        Return the live measured pack voltage, or the last one this inverter reported, or None.
+
+        This is the reading that moves with state of charge. It identifies an HV pack and is
+        published as a sensor for display, but must not be used for amp<->watt conversions on an
+        LV pack - see get_nominal_voltage().
+        """
+        detail = self.inverter_details.get(inverter_sn, {})
+        try:
+            voltage = float(detail.get("batteryVoltage"))
+        except (ValueError, TypeError):
+            voltage = None
+        if voltage and voltage > 0:
+            self.live_voltage_last_known[inverter_sn] = voltage
+            return voltage
+        return self.live_voltage_last_known.get(inverter_sn)
+
+    def get_bms_charge_voltage(self, inverter_sn):
+        """
+        Return the BMS-requested charge voltage for this pack, or None if it isn't reported.
+
+        Unlike the live pack voltage this is a setting rather than a measurement, so it holds
+        still, and it is what distinguishes a 15S pack from a 16S one (53.2V vs 56.5-58.4V across
+        14 sampled systems). inverterDetail carries it top level as batteryAcvSet and per battery
+        as batteryList[].batteryChargingVoltage; the two agreed on every system sampled, so either
+        will do and the first non-zero one wins. Some inverters report neither (one S5-EH1P3.6K-L
+        had batteryChargingVoltage absent and batteryAcvSet 0.0), hence the None case.
+        """
+        detail = self.inverter_details.get(inverter_sn, {})
+        candidates = [detail.get("batteryAcvSet")]
+        for entry in detail.get("batteryList") or []:
+            if isinstance(entry, dict):
+                candidates.append(entry.get("batteryChargingVoltage"))
+        for candidate in candidates:
+            try:
+                voltage = float(candidate)
+            except (ValueError, TypeError):
+                continue
+            if voltage > 0:
+                return voltage
+        return None
+
+    def get_nominal_voltage(self, inverter_sn):
+        """
+        Return the voltage to use for amp<->watt conversions on this inverter.
+
+        The inverter holds its limits as currents (CID 7224/7226, and the per-slot currents), so
+        every watt value Predbat sees is derived. Deriving them from the live measured voltage made
+        a fixed 70A limit republish as anything from 3352W to 3726W as the pack moved with state of
+        charge, dragging battery_rate_max, the write tolerance computed from it and the read-back of
+        every rate setpoint along with it (issue #5090). Live voltage swings 10-14% over a month on
+        every system sampled, so this affected all of them, not just edge cases. In priority order:
+
+          1. solis_nominal_voltage from apps.yaml - the pack's real nominal voltage, and the only
+             source here that is a stated physical property rather than an inference;
+          2. a live reading above 60V means an HV pack, where the live voltage continues to be used
+             as it has been since issue #4493. No LV system sampled exceeded 57.5V. HV packs still
+             drift for want of field data to classify them by; solis_nominal_voltage fixes that;
+          3. otherwise an LV pack, classified by the BMS-requested charge voltage: 16S (51.2V
+             nominal) at or above 55V, 15S (48V nominal) below it. Both are settings rather than
+             measurements, so the result holds still across polls;
+          4. otherwise the 48V fallback, for a pack that reports no charge voltage at all.
+
+        The live reading cannot do the classifying itself, which is what made the first attempt at
+        this wrong: 15S packs average 49.3-50.4V and 16S 52.6-54.4V, but a full 15S reaches 53.5V
+        and a low 16S drops to 47.1V, so a single sample lands in the wrong class. batteryType is
+        no help either - it names the BMS protocol, not the pack, and PYLON_LV was reported by both
+        classes.
+        """
+        if self.nominal_pack_voltage:
+            return self.nominal_pack_voltage
+        live_voltage = self.get_live_battery_voltage(inverter_sn)
+        if live_voltage and live_voltage > SOLIS_HV_BATTERY_VOLTAGE:
+            return live_voltage
+        charge_voltage = self.get_bms_charge_voltage(inverter_sn)
+        if charge_voltage:
+            nominal = SOLIS_LV_16S_NOMINAL_VOLTAGE if charge_voltage >= SOLIS_LV_16S_CHARGE_VOLTAGE else SOLIS_LV_15S_NOMINAL_VOLTAGE
+            self.report_nominal_voltage(inverter_sn, nominal, f"a BMS charge voltage of {charge_voltage}V")
+            return nominal
+        self.report_nominal_voltage(inverter_sn, self.nominal_voltage, "no BMS charge voltage being reported, so the pack class is unknown")
+        return self.nominal_voltage
+
+    def report_nominal_voltage(self, inverter_sn, nominal, reason):
+        """Log the conversion voltage chosen for an LV pack, but only when it changes.
+
+        get_nominal_voltage() runs for every published entity, several times a second during a
+        publish cycle, so this cannot log unconditionally. Keyed on the value rather than a
+        once-only flag so that a pack being reclassified - which should not happen, and is worth
+        seeing if it does - is still reported.
+        """
+        if self.nominal_voltage_reported.get(inverter_sn) == nominal:
+            return
+        self.nominal_voltage_reported[inverter_sn] = nominal
+        self.log(f"Solis API: {inverter_sn} will use {nominal}V for amp<->watt conversions, from {reason} - set solis_nominal_voltage in apps.yaml to state the pack's nominal voltage directly")
+
+    def get_capacity_voltage(self, inverter_sn):
+        """
+        Return the configured nominal pack voltage to use for the battery capacity calculation,
+        or None if solis_nominal_voltage isn't set. Separate from get_nominal_voltage() only so
+        that the caller can tell a configured value from an inferred one and flag the published
+        capacity accordingly - when solis_nominal_voltage *is* set, both return it.
+
+        Note on the None case: DEYE's equivalent (nominal_pack_voltage()/derive_battery_capacity()
+        in deye.py) refuses to publish a capacity at all rather than guess, on the basis that a
+        wrong soc_max source is worse than none. Solis instead falls back to get_nominal_voltage()
+        - since #5090 an inferred nominal rather than a live reading on an LV pack, so the published
+        capacity holds still - and flags it unreliable (see the caller in publish_entities) so that
+        existing installs which already had this sensor (using the old, worse, hard-coded 48V)
+        don't lose it outright. A different tradeoff than DEYE's for the same underlying problem,
+        worth reviewer scrutiny.
+        """
+        return self.nominal_pack_voltage
+
+    async def fetch_entity_data(self, sn):
+        """
+        This use to fetch HA data for the charge/discharge windows directly from Home Assistant using get_state_wrapper()
+        It is the opposite of publish_entities() (but only for the time windows)
+        It is needed as we don't re-read the actual values from Solis API all the time and Predbat is in control of the time windows
+
+        If the get_state_wrapper returns None then we will skip this value as its not in HA at the moment.
+
+        Loop over each of the windows (that are present) and get the values from HA
+        """
+
+        sn_lower = sn.lower()
+        for slot in range(1, 7):
+            for direction in ['charge', 'discharge']:
+                if sn not in self.charge_discharge_time_windows:
+                    self.charge_discharge_time_windows[sn] = {}
+                if slot not in self.charge_discharge_time_windows[sn]:
+                    continue
+                # Build the entity IDs
+                enable_entity_id = f"switch.{self.prefix}_solis_{sn_lower}_{direction}_slot{slot}_enable"
+                start_time_entity_id = f"select.{self.prefix}_solis_{sn_lower}_{direction}_slot{slot}_start_time"
+                end_time_entity_id = f"select.{self.prefix}_solis_{sn_lower}_{direction}_slot{slot}_end_time"
+                soc_entity_id = f"number.{self.prefix}_solis_{sn_lower}_{direction}_slot{slot}_soc"
+                power_entity_id = f"number.{self.prefix}_solis_{sn_lower}_{direction}_slot{slot}_power"
+                # Fetch the values from HA
+                enable_state = self.get_state_wrapper(enable_entity_id)
+                start_time_state = self.get_state_wrapper(start_time_entity_id)
+                end_time_state = self.get_state_wrapper(end_time_entity_id)
+                soc_state = self.get_state_wrapper(soc_entity_id)
+                power_state = self.get_state_wrapper(power_entity_id)
+                # Update the internal structure if we got a value
+                if enable_state is not None:
+                    self.charge_discharge_time_windows[sn][slot][f"{direction}_enable"] = 1 if enable_state.lower() == 'on' else 0
+                if start_time_state is not None:
+                    self.charge_discharge_time_windows[sn][slot][f"{direction}_start_time"] = start_time_state[:5]
+                if end_time_state is not None:
+                    self.charge_discharge_time_windows[sn][slot][f"{direction}_end_time"] = end_time_state[:5]
+                if soc_state is not None:
+                    try:
+                        self.charge_discharge_time_windows[sn][slot][f"{direction}_soc"] = int(soc_state)
+                    except (ValueError, TypeError):
+                        pass
+                if power_state is not None:
+                    try:
+                        max_current_amps = self.max_charge_current.get(sn, 100) if direction == 'charge' else self.max_discharge_current.get(sn, 100)
+                        value = max(0, min(int(float(power_state) / self.get_nominal_voltage(sn)), max_current_amps))
+                        self.charge_discharge_time_windows[sn][slot][f"{direction}_current"] = value
+                    except (ValueError, TypeError):
+                        pass
+
+    async def publish_entities(self):
+        """Publish all entities to Home Assistant"""
+        prefix = self.prefix
+
+        for inverter_sn in self.inverter_sn:
+            # Get inverter details for friendly name
+            detail = self.inverter_details.get(inverter_sn, {})
+            inverter_name = detail.get("inverterName", inverter_sn)
+            inverter_sn_lower = inverter_sn.lower()
+
+            # Get cached values for this inverter
+            values = self.cached_values.get(inverter_sn, {})
+
+            # Inverter size
+            power = detail.get("power")
+            powerStr = detail.get("powerStr", "kW")
+            entity_id = f"sensor.{prefix}_solis_{inverter_sn_lower}_inverter_size"
+            self.dashboard_item(
+                entity_id,
+                state=power,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Inverter Size",
+                    "unit_of_measurement": powerStr,
+                    "device_class": "power",
+                    "state_class": "measurement",
+                    "icon": "mdi:solar-power",
+                },
+                app="solis"
+            )
+
+            # Publish sensors from inverter detail API (not CID-based)
+            # Total Load Energy
+            entity_id = f"sensor.{prefix}_solis_{inverter_sn_lower}_total_load_energy"
+            total_load = detail.get("homeLoadTotalEnergy")
+            total_load_units = detail.get("homeLoadTotalEnergyStr", "kWh")
+            try:
+                total_load = float(total_load)
+                if total_load_units == 'MWh':
+                    total_load *= 1000.0
+                    total_load_units = 'kWh'
+            except (ValueError, TypeError):
+                pass
+            self.dashboard_item(
+                entity_id,
+                state=total_load,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Total Load Energy",
+                    "unit_of_measurement": total_load_units,
+                    "device_class": "energy",
+                    "state_class": "total_increasing",
+                    "icon": "mdi:home-lightning-bolt",
+                },
+                app="solis"
+            )
+            total_today = detail.get('homeLoadTodayEnergy')
+            total_load_units = detail.get("homeLoadTodayEnergyStr", "kWh")
+            entity_id = f"sensor.{prefix}_solis_{inverter_sn_lower}_today_load_energy"
+            self.dashboard_item(
+                entity_id,
+                state=total_today,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Today Load Energy",
+                    "unit_of_measurement": total_load_units,
+                    "device_class": "energy",
+                    "state_class": "total_increasing",
+                    "icon": "mdi:home-lightning-bolt",
+                },
+                app="solis"
+            )
+
+            # Total Export Energy
+            entity_id = f"sensor.{prefix}_solis_{inverter_sn_lower}_today_export_energy"
+            total_export = detail.get("gridSellTodayEnergy")
+            total_export_units = detail.get("gridSellTodayEnergyStr", "kWh")
+            self.dashboard_item(
+                entity_id,
+                state=total_export,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Today Export Energy",
+                    "unit_of_measurement": total_export_units,
+                    "device_class": "energy",
+                    "state_class": "total_increasing",
+                    "icon": "mdi:transmission-tower-export",
+                },
+                app="solis"
+            )
+
+            # Total Import Energy
+            entity_id = f"sensor.{prefix}_solis_{inverter_sn_lower}_today_import_energy"
+            total_import = detail.get("gridPurchasedTodayEnergy")
+            total_import_units = detail.get("gridPurchasedTodayEnergyStr", "kWh")
+            self.dashboard_item(
+                entity_id,
+                state=total_import,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Today Import Energy",
+                    "unit_of_measurement": total_import_units,
+                    "device_class": "energy",
+                    "state_class": "total_increasing",
+                    "icon": "mdi:transmission-tower-import",
+                },
+                app="solis"
+            )
+
+            # Battery state of health - published as-is, including a literal 0 (issue #4494): a 0%
+            # reading here can be a flaky/unavailable API response as well as a genuinely unhealthy
+            # battery, and we don't know which, so it's reported honestly rather than guessed at.
+            # Inverter.__init__ is where battery_scaling itself is protected from a 0 or negative
+            # reading (retains the last known-good value rather than collapsing soc_max).
+            battery_soh = detail.get("batteryHealthSoh")
+            try:
+                battery_soh = float(battery_soh) / 100.0
+            except (ValueError, TypeError):
+                battery_soh = None
+            entity_id = f"sensor.{prefix}_solis_{inverter_sn_lower}_battery_soh"
+            self.dashboard_item(
+                entity_id,
+                state=battery_soh,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Battery State of Health",
+                    "unit_of_measurement": "*",
+                    "device_class": "battery",
+                    "state_class": "measurement",
+                    "icon": "mdi:battery-heart",
+                },
+                app="solis"
+            )
+
+            # Battery Capacity SOC (from detail API, not live CID)
+            entity_id = f"sensor.{prefix}_solis_{inverter_sn_lower}_battery_soc"
+            battery_soc = detail.get("batteryCapacitySoc")
+            try:
+                battery_soc = float(battery_soc)
+            except (ValueError, TypeError):
+                pass
+            self.dashboard_item(
+                entity_id,
+                state=battery_soc,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Battery SOC",
+                    "unit_of_measurement": "%",
+                    "device_class": "battery",
+                    "state_class": "measurement",
+                    "icon": "mdi:battery-50",
+                },
+                app="solis"
+            )
+
+            # PV Energy Total
+            entity_id = f"sensor.{prefix}_solis_{inverter_sn_lower}_pv_energy_total"
+            pv_total = detail.get("eTotal")
+            pv_total_unit = detail.get("eTotalStr", "kWh")
+            if pv_total_unit == 'MWh':
+                try:
+                    pv_total = float(pv_total) * 1000.0
+                    pv_total_unit = 'kWh'
+                except (ValueError, TypeError):
+                    pass
+            self.dashboard_item(
+                entity_id,
+                state=pv_total,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} PV Energy Total",
+                    "unit_of_measurement": pv_total_unit,
+                    "device_class": "energy",
+                    "state_class": "total_increasing",
+                    "icon": "mdi:solar-power",
+                },
+                app="solis"
+            )
+
+            # PV Power (Real-time AC output power)
+            entity_id = f"sensor.{prefix}_solis_{inverter_sn_lower}_pv_power"
+            pv_power = detail.get("pac")
+            pv_power_unit = detail.get("pacStr", "kW")
+            self.dashboard_item(
+                entity_id,
+                state=pv_power,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} PV Power",
+                    "unit_of_measurement": pv_power_unit,
+                    "device_class": "power",
+                    "state_class": "measurement",
+                    "icon": "mdi:solar-power",
+                },
+                app="solis"
+            )
+
+            # PV Voltage (from detail)
+            entity_id = f"sensor.{prefix}_solis_{inverter_sn_lower}_pv1_voltage"
+            pv_voltage = detail.get("uPv1")
+            pv_voltage_unit = detail.get("pvVoltageStr", "V")
+            self.dashboard_item(
+                entity_id,
+                state=pv_voltage,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} PV1 Voltage",
+                    "unit_of_measurement": pv_voltage_unit,
+                    "device_class": "voltage",
+                    "state_class": "measurement",
+                    "icon": "mdi:lightning-bolt",
+                },
+                app="solis"
+            )
+
+            # PV Voltage (from detail)
+            entity_id = f"sensor.{prefix}_solis_{inverter_sn_lower}_pv2_voltage"
+            pv_voltage = detail.get("uPv2")
+            pv_voltage_unit = detail.get("pvVoltageStr", "V")
+            self.dashboard_item(
+                entity_id,
+                state=pv_voltage,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} PV2 Voltage",
+                    "unit_of_measurement": pv_voltage_unit,
+                    "device_class": "voltage",
+                    "state_class": "measurement",
+                    "icon": "mdi:lightning-bolt",
+                },
+                app="solis"
+            )
+
+            # Product Model
+            entity_id = f"sensor.{prefix}_solis_{inverter_sn_lower}_product_model"
+            product_model = detail.get("productModel")
+            self.dashboard_item(
+                entity_id,
+                state=product_model,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Product Model",
+                    "icon": "mdi:information-outline",
+                },
+                app="solis"
+            )
+
+            # Inverter Temperature
+            entity_id = f"sensor.{prefix}_solis_{inverter_sn_lower}_inverter_temperature"
+            inverter_temp = detail.get("inverterTemperature")
+            self.dashboard_item(
+                entity_id,
+                state=inverter_temp,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Inverter Temperature",
+                    "unit_of_measurement": "°C",
+                    "device_class": "temperature",
+                    "state_class": "measurement",
+                    "icon": "mdi:thermometer",
+                },
+                app="solis"
+            )
+
+            # Battery Power (from detail)
+            entity_id = f"sensor.{prefix}_solis_{inverter_sn_lower}_battery_power"
+            battery_power = detail.get("batteryPower")
+            battery_power_unit = detail.get("batteryPowerStr", "kW")
+            self.dashboard_item(
+                entity_id,
+                state=battery_power,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Battery Power",
+                    "unit_of_measurement": battery_power_unit,
+                    "device_class": "power",
+                    "state_class": "measurement",
+                    "icon": "mdi:battery-charging",
+                },
+                app="solis"
+            )
+
+            # Battery Daily Energy Charged (from detail)
+            entity_id = f"sensor.{prefix}_solis_{inverter_sn_lower}_battery_energy_charged_today"
+            battery_energy_charged = detail.get("batteryTodayChargeEnergy")
+            battery_energy_charged_unit = detail.get("batteryTodayChargeEnergyStr", "kWh")
+            self.dashboard_item(
+                entity_id,
+                state=battery_energy_charged,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Battery Energy Charged Today",
+                    "unit_of_measurement": battery_energy_charged_unit,
+                    "device_class": "energy",
+                    "state_class": "total_increasing",
+                    "icon": "mdi:battery-charging",
+                },
+                app="solis"
+            )
+
+            # Battery Daily Energy Discharged (from detail)
+            entity_id = f"sensor.{prefix}_solis_{inverter_sn_lower}_battery_energy_discharged_today"
+            battery_energy_discharged = detail.get("batteryTodayDischargeEnergy")
+            battery_energy_discharged_unit = detail.get("batteryTodayDischargeEnergyStr", "kWh")
+            self.dashboard_item(
+                entity_id,
+                state=battery_energy_discharged,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Battery Energy Discharged Today",
+                    "unit_of_measurement": battery_energy_discharged_unit,
+                    "device_class": "energy",
+                    "state_class": "total_increasing",
+                    "icon": "mdi:battery-minus",
+                },
+                app="solis"
+            )
+
+            # Battery Voltage (from detail)
+            entity_id = f"sensor.{prefix}_solis_{inverter_sn_lower}_battery_voltage"
+            battery_voltage = detail.get("batteryVoltage")
+            battery_voltage_unit = detail.get("batteryVoltageStr", "V")
+            self.dashboard_item(
+                entity_id,
+                state=battery_voltage,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Battery Voltage",
+                    "unit_of_measurement": battery_voltage_unit,
+                    "device_class": "voltage",
+                    "state_class": "measurement",
+                    "icon": "mdi:lightning-bolt",
+                },
+                app="solis"
+            )
+
+            # Battery Current (from detail)
+            entity_id = f"sensor.{prefix}_solis_{inverter_sn_lower}_battery_current"
+            battery_current = detail.get("batteryCurrent")
+            battery_current_unit = detail.get("batteryCurrentStr", "A")
+            self.dashboard_item(
+                entity_id,
+                state=battery_current,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Battery Current",
+                    "unit_of_measurement": battery_current_unit,
+                    "device_class": "current",
+                    "state_class": "measurement",
+                    "icon": "mdi:current-dc",
+                },
+                app="solis"
+            )
+
+            # Load Power (from detail)
+            entity_id = f"sensor.{prefix}_solis_{inverter_sn_lower}_load_power"
+            load_power = detail.get("familyLoadPower")
+            load_power_unit = detail.get("familyLoadPowerStr", "kW")
+            self.dashboard_item(
+                entity_id,
+                state=load_power,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Load Power",
+                    "unit_of_measurement": load_power_unit,
+                    "device_class": "power",
+                    "state_class": "measurement",
+                    "icon": "mdi:home-lightning-bolt",
+                },
+                app="solis"
+            )
+
+            # Grid Power (from detail)
+            entity_id = f"sensor.{prefix}_solis_{inverter_sn_lower}_grid_power"
+            grid_power = detail.get("psum")
+            grid_power_unit = detail.get("psumStr", "kW")
+            self.dashboard_item(
+                entity_id,
+                state=grid_power,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Grid Power",
+                    "unit_of_measurement": grid_power_unit,
+                    "device_class": "power",
+                    "state_class": "measurement",
+                    "icon": "mdi:transmission-tower",
+                },
+                app="solis"
+            )
+
+            # Get decoded time windows if available (works with both old and new methods)
+            time_windows = self.charge_discharge_time_windows.get(inverter_sn, {})
+
+            # Publish charge slot controls (only for slots present in decoded data)
+            for slot_num in range(1, 7):
+                # Get slot data from decoded windows - skip if not available
+                slot_data = time_windows.get(slot_num, None)
+                if slot_data is None:
+                    continue
+
+                # Enable switch
+                if "charge_enable" in slot_data:
+                    try:
+                        charge_enable = int(slot_data["charge_enable"])
+                    except (ValueError, TypeError):
+                        charge_enable = 0
+                    entity_id = f"switch.{prefix}_solis_{inverter_sn_lower}_charge_slot{slot_num}_enable"
+                    self.dashboard_item(
+                        entity_id,
+                        state="on" if charge_enable else "off",
+                        attributes={
+                            "friendly_name": f"Solis {inverter_name} Charge Slot {slot_num} Enable",
+                            "icon": "mdi:battery-charging",
+                        },
+                        app="solis"
+                    )
+
+                # Start time selector
+                if "charge_start_time" in slot_data:
+                    entity_id = f"select.{prefix}_solis_{inverter_sn_lower}_charge_slot{slot_num}_start_time"
+                    start_time = slot_data["charge_start_time"]
+                    # Convert HH:MM to HH:MM:00 format
+                    if start_time and ":" in start_time and len(start_time.split(":")) == 2:
+                        time_value = start_time + ":00"
+                    else:
+                        time_value = start_time or "00:00:00"
+                    self.dashboard_item(
+                        entity_id,
+                        state=time_value,
+                        attributes={
+                            "friendly_name": f"Solis {inverter_name} Charge Slot {slot_num} Start Time",
+                            "options": OPTIONS_TIME,
+                            "icon": "mdi:clock-start",
+                        },
+                        app="solis"
+                    )
+
+                # End time selector
+                if "charge_end_time" in slot_data:
+                    entity_id = f"select.{prefix}_solis_{inverter_sn_lower}_charge_slot{slot_num}_end_time"
+                    end_time = slot_data["charge_end_time"]
+                    # Convert HH:MM to HH:MM:00 format
+                    if end_time and ":" in end_time and len(end_time.split(":")) == 2:
+                        end_time_value = end_time + ":00"
+                    else:
+                        end_time_value = end_time or "00:00:00"
+                    self.dashboard_item(
+                        entity_id,
+                        state=end_time_value,
+                        attributes={
+                            "friendly_name": f"Solis {inverter_name} Charge Slot {slot_num} End Time",
+                            "options": OPTIONS_TIME,
+                            "icon": "mdi:clock-end",
+                        },
+                        app="solis"
+                    )
+
+                # SOC target number
+                if "charge_soc" in slot_data:
+                    entity_id = f"number.{prefix}_solis_{inverter_sn_lower}_charge_slot{slot_num}_soc"
+                    try:
+                        soc_value = int(slot_data["charge_soc"])
+                    except (ValueError, TypeError):
+                        soc_value = 0
+                    self.dashboard_item(
+                        entity_id,
+                        state=soc_value,
+                        attributes={
+                            "friendly_name": f"Solis {inverter_name} Charge Slot {slot_num} SOC",
+                            "unit_of_measurement": "%",
+                            "min": 0,
+                            "max": 100,
+                            "step": 1,
+                            "icon": "mdi:battery",
+                        },
+                        app="solis"
+                    )
+
+                # Current limit number (displayed as power in watts)
+                if "charge_current" in slot_data:
+                    entity_id = f"number.{prefix}_solis_{inverter_sn_lower}_charge_slot{slot_num}_power"
+                    current_value_amps = slot_data["charge_current"]
+
+                    # Convert amps to watts for display
+                    current_value_watts = None
+                    if current_value_amps is not None:
+                        try:
+                            current_value_watts = int(float(current_value_amps) * self.get_nominal_voltage(inverter_sn))
+                        except (ValueError, TypeError):
+                            self.log("Warn: Failed to convert charge current to watts for {} slot {}: {}".format(inverter_sn, slot_num, current_value_amps))  # Debug log
+
+                    # Use pre-calculated max current (convert to watts)
+                    max_current_amps = self.max_charge_current.get(inverter_sn, 100)
+                    max_power_watts = int(max_current_amps * self.get_nominal_voltage(inverter_sn))
+
+                    self.dashboard_item(
+                        entity_id,
+                        state=current_value_watts,
+                        attributes={
+                            "friendly_name": f"Solis {inverter_name} Charge Slot {slot_num} Power",
+                            "unit_of_measurement": "W",
+                            "min": 0,
+                            "max": max_power_watts,
+                            "step": self.get_nominal_voltage(inverter_sn),
+                            "device_class": "power",
+                            "icon": "mdi:flash",
+                        },
+                        app="solis"
+                    )
+
+            # Publish discharge slot controls (only for slots present in decoded data)
+            for slot_num in range(1, 7):
+                # Get slot data from decoded windows - skip if not available
+                slot_data = time_windows.get(slot_num, None)
+                if slot_data is None:
+                    continue
+
+                # Enable switch
+                if "discharge_enable" in slot_data:
+                    entity_id = f"switch.{prefix}_solis_{inverter_sn_lower}_discharge_slot{slot_num}_enable"
+                    try:
+                        discharge_enable = int(slot_data["discharge_enable"])
+                    except (ValueError, TypeError):
+                        discharge_enable = 0
+                    self.dashboard_item(
+                        entity_id,
+                        state="on" if discharge_enable else "off",
+                        attributes={
+                            "friendly_name": f"Solis {inverter_name} Discharge Slot {slot_num} Enable",
+                            "icon": "mdi:battery-minus",
+                        },
+                        app="solis"
+                    )
+
+                # Start time selector
+                if "discharge_start_time" in slot_data:
+                    entity_id = f"select.{prefix}_solis_{inverter_sn_lower}_discharge_slot{slot_num}_start_time"
+                    start_time = slot_data["discharge_start_time"]
+                    # Convert HH:MM to HH:MM:00 format
+                    if start_time and ":" in start_time and len(start_time.split(":")) == 2:
+                        time_value = start_time + ":00"
+                    else:
+                        time_value = start_time or "00:00:00"
+                    self.dashboard_item(
+                        entity_id,
+                        state=time_value,
+                        attributes={
+                            "friendly_name": f"Solis {inverter_name} Discharge Slot {slot_num} Start Time",
+                            "options": OPTIONS_TIME,
+                            "icon": "mdi:clock-start",
+                        },
+                        app="solis"
+                    )
+
+                # End time selector
+                if "discharge_end_time" in slot_data:
+                    entity_id = f"select.{prefix}_solis_{inverter_sn_lower}_discharge_slot{slot_num}_end_time"
+                    end_time = slot_data["discharge_end_time"]
+                    # Convert HH:MM to HH:MM:00 format
+                    if end_time and ":" in end_time and len(end_time.split(":")) == 2:
+                        end_time_value = end_time + ":00"
+                    else:
+                        end_time_value = end_time or "00:00:00"
+                    self.dashboard_item(
+                        entity_id,
+                        state=end_time_value,
+                        attributes={
+                            "friendly_name": f"Solis {inverter_name} Discharge Slot {slot_num} End Time",
+                            "options": OPTIONS_TIME,
+                            "icon": "mdi:clock-end",
+                        },
+                        app="solis"
+                    )
+
+                # SOC target number
+                if "discharge_soc" in slot_data:
+                    entity_id = f"number.{prefix}_solis_{inverter_sn_lower}_discharge_slot{slot_num}_soc"
+                    try:
+                        soc_value = int(slot_data["discharge_soc"])
+                    except (ValueError, TypeError):
+                        soc_value = 0
+                    self.dashboard_item(
+                        entity_id,
+                        state=soc_value,
+                        attributes={
+                            "friendly_name": f"Solis {inverter_name} Discharge Slot {slot_num} SOC",
+                            "unit_of_measurement": "%",
+                            "min": 0,
+                            "max": 100,
+                            "step": 1,
+                            "icon": "mdi:battery",
+                        },
+                        app="solis"
+                    )
+
+                # Current limit number (displayed as power in watts)
+                if "discharge_current" in slot_data:
+                    entity_id = f"number.{prefix}_solis_{inverter_sn_lower}_discharge_slot{slot_num}_power"
+                    current_value_amps = slot_data["discharge_current"]
+
+                    # Convert amps to watts for display
+                    current_value_watts = None
+                    if current_value_amps is not None:
+                        try:
+                            current_value_watts = int(float(current_value_amps) * self.get_nominal_voltage(inverter_sn))
+                        except (ValueError, TypeError):
+                            self.log("Warn: Failed to convert discharge current to watts for {} slot {}: {}".format(inverter_sn, slot_num, current_value_amps))  # Debug log
+
+                    # Use pre-calculated max current (convert to watts)
+                    max_current_amps = self.max_discharge_current.get(inverter_sn, 100)
+                    max_power_watts = int(max_current_amps * self.get_nominal_voltage(inverter_sn))
+
+                    self.dashboard_item(
+                        entity_id,
+                        state=current_value_watts,
+                        attributes={
+                            "friendly_name": f"Solis {inverter_name} Discharge Slot {slot_num} Power",
+                            "unit_of_measurement": "W",
+                            "min": 0,
+                            "max": max_power_watts,
+                            "step": self.get_nominal_voltage(inverter_sn),
+                            "device_class": "power",
+                            "icon": "mdi:flash",
+                        },
+                        app="solis"
+                    )
+
+            # Storage mode selector
+            entity_id = f"select.{prefix}_solis_{inverter_sn_lower}_storage_mode"
+            storage_mode_value = self.get_current_solis_mode_value(inverter_sn)
+            mode_enum, mode_str = get_solis_mode_enum(storage_mode_value)
+
+            # Use dynamic storage modes if available, otherwise static
+            mode_options = list(SOLIS_STORAGE_MODES.keys())
+            self.dashboard_item(
+                entity_id,
+                state=mode_str,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Storage Mode",
+                    "options": mode_options,
+                    "icon": "mdi:battery-sync",
+                },
+                app="solis"
+            )
+
+            # Battery reserve switch
+            entity_id = f"switch.{prefix}_solis_{inverter_sn_lower}_battery_reserve"
+            storage_mode_int = self.get_current_solis_mode_value(inverter_sn)
+            reserve_on = (storage_mode_int & (1 << SOLIS_BIT_BACKUP_MODE)) != 0
+            self.dashboard_item(
+                entity_id,
+                state="on" if reserve_on else "off",
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Battery Reserve",
+                    "icon": "mdi:battery-heart-outline",
+                },
+                app="solis"
+            )
+
+            # Allow grid charging switch
+            entity_id = f"switch.{prefix}_solis_{inverter_sn_lower}_allow_grid_charging"
+            storage_mode_int = self.get_current_solis_mode_value(inverter_sn)
+            grid_charging_on = (storage_mode_int & (1 << SOLIS_BIT_GRID_CHARGING)) != 0
+            self.dashboard_item(
+                entity_id,
+                state="on" if grid_charging_on else "off",
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Allow Grid Charging",
+                    "icon": "mdi:battery-charging-outline",
+                },
+                app="solis"
+            )
+
+            # Time of use switch
+            entity_id = f"switch.{prefix}_solis_{inverter_sn_lower}_time_of_use"
+            storage_mode_int = self.get_current_solis_mode_value(inverter_sn)
+            tou_on = (storage_mode_int & (1 << SOLIS_BIT_TOU_MODE)) != 0
+            self.dashboard_item(
+                entity_id,
+                state="on" if tou_on else "off",
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Time of Use Mode",
+                    "icon": "mdi:clock-check-outline",
+                },
+                app="solis"
+            )
+
+            # Allow export switch (inverted logic: "0" = allow, "1" = block)
+            entity_id = f"switch.{prefix}_solis_{inverter_sn_lower}_allow_export"
+            allow_export_value = values.get(SOLIS_CID_ALLOW_EXPORT, None)
+            allow_export_on = (allow_export_value == SOLIS_ALLOW_EXPORT_ON) if allow_export_value is not None else None
+            self.dashboard_item(
+                entity_id,
+                state="on" if allow_export_on else "off" if allow_export_on is not None else None,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Allow Export",
+                    "icon": "mdi:transmission-tower-export",
+                },
+                app="solis"
+            )
+
+            # Battery SOC limit numbers
+            for cid, name, friendly, icon in [
+                (SOLIS_CID_BATTERY_RESERVE_SOC, "reserve_soc", "Battery Reserve SOC", "mdi:battery-50"),
+                (SOLIS_CID_BATTERY_OVER_DISCHARGE_SOC, "over_discharge_soc", "Battery Over Discharge SOC", "mdi:battery-50"),
+                (SOLIS_CID_BATTERY_FORCE_CHARGE_SOC, "force_charge_soc", "Battery Force Charge SOC", "mdi:battery-alert"),
+                (SOLIS_CID_BATTERY_RECOVERY_SOC, "recovery_soc", "Battery Recovery SOC", "mdi:battery-50"),
+                (SOLIS_CID_BATTERY_MAX_CHARGE_SOC, "max_charge_soc", "Battery Max Charge SOC", "mdi:battery"),
+            ]:
+                entity_id = f"number.{prefix}_solis_{inverter_sn_lower}_{name}"
+                soc_value = values.get(cid, None)
+                self.dashboard_item(
+                    entity_id,
+                    state=soc_value,
+                    attributes={
+                        "friendly_name": f"Solis {inverter_name} {friendly}",
+                        "unit_of_measurement": "%",
+                        "min": 0,
+                        "max": 100,
+                        "step": 1,
+                        "device_class": "battery",
+                        "icon": icon,
+                    },
+                    app="solis"
+                )
+
+            # Battery max current numbers (displayed as power in watts)
+            entity_id = f"number.{prefix}_solis_{inverter_sn_lower}_max_charge_power"
+            max_charge_current_amps = values.get(SOLIS_CID_BATTERY_MAX_CHARGE_CURRENT, None)
+
+            # Convert amps to watts for display
+            max_charge_power_watts = None
+            if max_charge_current_amps is not None:
+                try:
+                    max_charge_power_watts = int(float(max_charge_current_amps) * self.get_nominal_voltage(inverter_sn))
+                except (ValueError, TypeError):
+                    self.log("Warn: Failed to convert max charge current to watts for {}: {}".format(inverter_sn, max_charge_current_amps))  # Debug log
+
+            self.dashboard_item(
+                entity_id,
+                state=max_charge_power_watts,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Battery Max Charge Power",
+                    "unit_of_measurement": "W",
+                    "min": 0,
+                    "max": int(1000 * self.get_nominal_voltage(inverter_sn)),
+                    "step": self.get_nominal_voltage(inverter_sn),
+                    "device_class": "power",
+                    "icon": "mdi:battery-arrow-down-outline",
+                },
+                app="solis"
+            )
+
+            entity_id = f"number.{prefix}_solis_{inverter_sn_lower}_max_discharge_power"
+            max_discharge_current_amps = values.get(SOLIS_CID_BATTERY_MAX_DISCHARGE_CURRENT, None)
+
+            # Convert amps to watts for display
+            max_discharge_power_watts = None
+            if max_discharge_current_amps is not None:
+                try:
+                    max_discharge_power_watts = int(float(max_discharge_current_amps) * self.get_nominal_voltage(inverter_sn))
+                except (ValueError, TypeError):
+                    self.log("Warn: Failed to convert max discharge current to watts for {}: {}".format(inverter_sn, max_discharge_current_amps))  # Debug log
+
+            self.dashboard_item(
+                entity_id,
+                state=max_discharge_power_watts,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Battery Max Discharge Power",
+                    "unit_of_measurement": "W",
+                    "min": 0,
+                    "max": int(1000 * self.get_nominal_voltage(inverter_sn)),
+                    "step": self.get_nominal_voltage(inverter_sn),
+                    "device_class": "power",
+                    "icon": "mdi:battery-arrow-up-outline",
+                },
+                app="solis"
+            )
+
+            # Power control numbers
+            entity_id = f"number.{prefix}_solis_{inverter_sn_lower}_power_limit"
+            power_limit_value = values.get(SOLIS_CID_POWER_LIMIT, None)
+            self.dashboard_item(
+                entity_id,
+                state=power_limit_value,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Power Limit",
+                    "unit_of_measurement": "%",
+                    "min": 0,
+                    "max": 110,
+                    "step": 1,
+                    "icon": "mdi:transmission-tower-export",
+                },
+                app="solis"
+            )
+
+            entity_id = f"number.{prefix}_solis_{inverter_sn_lower}_max_output_power"
+            max_output_power_value = values.get(SOLIS_CID_MAX_OUTPUT_POWER, None)
+            self.dashboard_item(
+                entity_id,
+                state=max_output_power_value,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Max Output Power",
+                    "unit_of_measurement": "%",
+                    "min": 0,
+                    "max": 100,
+                    "step": 1,
+                    "icon": "mdi:lightning-bolt-outline",
+                },
+                app="solis"
+            )
+
+            entity_id = f"number.{prefix}_solis_{inverter_sn_lower}_max_export_power"
+            max_export_power_value = values.get(SOLIS_CID_MAX_EXPORT_POWER, None)
+            try:
+                max_export_power_value = float(max_export_power_value)
+            except (ValueError, TypeError):
+                max_export_power_value = 0.0
+            if max_export_power_value == 0.0:
+                max_export_power_value = 99999  # Use large number to indicate no limit
+
+            # Export power seems to be in 100w units, so convert to watts if value is small
+            if max_export_power_value < 200:
+                max_export_power_value *= 100
+
+            self.dashboard_item(
+                entity_id,
+                state=max_export_power_value,
+                attributes={
+                    "friendly_name": f"Solis {inverter_name} Max Export Power",
+                    "unit_of_measurement": "W",
+                    "min": 0,
+                    "max": 1000000,
+                    "step": 100,
+                    "device_class": "power",
+                    "icon": "mdi:transmission-tower-export",
+                },
+                app="solis"
+            )
+
+            battery_capacity_ah = values.get(SOLIS_CID_BATTERY_CAPACITY, None)
+            if battery_capacity_ah is not None:
+                try:
+                    battery_capacity_ah = float(battery_capacity_ah)
+                    # Must account for parallel batteries (issue #4493) - SOLIS_CID_BATTERY_CAPACITY
+                    # is the per-battery Ah rating, same as the max charge/discharge current CIDs
+                    # handled in _calculate_max_currents() above.
+                    battery_count = self.parallel_battery_count.get(inverter_sn, 1)
+                    # Prefer the configured nominal pack voltage. Without it, fall back to the
+                    # inferred conversion voltage rather than dropping the sensor - existing
+                    # installs already have this sensor published (albeit with the old, worse,
+                    # hard-coded 48V figure) and losing it outright with no migration path was too
+                    # disruptive. It's flagged as unreliable via the reliable/voltage_source
+                    # attributes and a warning instead, matching neither "guess silently" nor "go
+                    # unavailable silently" - reviewers may want a different tradeoff here.
+                    capacity_voltage = self.get_capacity_voltage(inverter_sn)
+                    reliable = capacity_voltage is not None
+                    if not reliable:
+                        capacity_voltage = self.get_nominal_voltage(inverter_sn)
+                        # publish_entities() runs roughly once a minute - only warn once per
+                        # inverter rather than forever, so this doesn't drown out the log for the
+                        # many existing installs that haven't set solis_nominal_voltage yet.
+                        if inverter_sn not in self.capacity_voltage_warned:
+                            self.capacity_voltage_warned.add(inverter_sn)
+                            self.log(
+                                f"Warn: Solis API {inverter_name} battery capacity is estimated using an inferred pack voltage ({capacity_voltage}V), which is only within a few percent of the pack's true nominal voltage - "
+                                "set solis_nominal_voltage in apps.yaml for an accurate value (this warning will not repeat)"
+                            )
+                    battery_capacity_kWh = battery_capacity_ah * battery_count * capacity_voltage / 1000.0
+                    entity_id = f"sensor.{prefix}_solis_{inverter_sn_lower}_battery_capacity"
+                    self.dashboard_item(
+                        entity_id,
+                        state=round(battery_capacity_kWh, 2),
+                        attributes={
+                            "friendly_name": f"Solis {inverter_name} Battery Capacity",
+                            "unit_of_measurement": "kWh",
+                            "device_class": "energy",
+                            "state_class": "measurement",
+                            "icon": "mdi:battery" if reliable else "mdi:battery-alert",
+                            "reliable": reliable,
+                            "voltage_source": "configured (solis_nominal_voltage)" if reliable else "estimated using an inferred pack voltage - set solis_nominal_voltage in apps.yaml for an accurate value",
+                        },
+                        app="solis"
+                    )
+                except (ValueError, TypeError):
+                    self.log("Warn: Failed to convert battery capacity for {}: {}".format(inverter_sn, battery_capacity_ah))  # Debug log
+
+            # Data logger timestamp from inverterDetail API (shows when the data logger last reported to SolisCloud)
+            data_timestamp_ms = detail.get("dataTimestamp")
+            if data_timestamp_ms is not None:
+                try:
+                    data_timestamp_dt = datetime.fromtimestamp(int(data_timestamp_ms) / 1000, tz=UTC)
+                    self.dashboard_item(
+                        f"sensor.{prefix}_solis_{inverter_sn_lower}_data_timestamp",
+                        state=data_timestamp_dt.isoformat(),
+                        attributes={
+                            "friendly_name": f"Solis {inverter_name} Data Logger Timestamp",
+                            "device_class": "timestamp",
+                            "icon": "mdi:clock-check-outline",
+                        },
+                        app="solis"
+                    )
+                except (ValueError, TypeError, OSError):
+                    self.log(f"Warn: Failed to parse dataTimestamp for {inverter_sn}: {data_timestamp_ms}")
+
+    def get_current_solis_mode_value(self, inverter_sn):
+        """Get the current solis mode value"""
+        value = self.cached_values.get(inverter_sn, {}).get(SOLIS_CID_STORAGE_MODE, 1<<SOLIS_BIT_SELF_USE)
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            self.log(f"Warn: Failed to parse storage mode value for {inverter_sn}: {value}")
+            return 1<<SOLIS_BIT_SELF_USE
+
+    # ==================== Control Methods ====================
+
+    async def set_storage_mode_if_needed(self, inverter_sn, mode):
+        """Set storage mode (as text) if it differs from cached value"""
+        try:
+            # Convert mode name to value
+            mode_enum = SOLIS_STORAGE_MODES.get(mode)
+            if mode_enum is None:
+                self.log(f"Error: Unknown storage mode '{mode}' for {inverter_sn}")
+                return
+            cached_mode = self.get_current_solis_mode_value(inverter_sn)
+            # TOU V2 firmware dropped bit 1 from the mode table, so asking for it there only
+            # produces a write that reads back without it (issues #4707, #4774)
+            mode_value = compute_solis_mode_value(mode_enum, cached_mode, drop_tou_bit=self.is_tou_v2_mode(inverter_sn))
+
+            # Claimed unconditionally so the claim is spent by whichever write happens this cycle,
+            # rather than being held over and asserting again later in the same window
+            assert_for_window = self.claim_window_mode_assertion(inverter_sn)
+
+            if cached_mode != mode_value or assert_for_window:
+                await self.set_storage_mode_value(inverter_sn, mode_value)
+
+        except Exception as e:
+            self.log(f"Warn: Solis API set storage mode if needed failed for {inverter_sn}: {e}")
+
+    async def set_storage_mode_value(self, inverter_sn, mode_value):
+        """Set storage mode numerical value directly"""
+        try:
+            # Write storage mode CID
+            success = await self.read_and_write_cid(inverter_sn, SOLIS_CID_STORAGE_MODE, mode_value, field_description=f"storage mode to {mode_value}")
+            if not success:
+                self.log(f"Warn: Solis API set storage mode encountered errors for {inverter_sn}")
+
+        except Exception as e:
+            self.log(f"Warn: Solis API set storage mode failed for {inverter_sn}: {e}")
+
+    # ==================== Event Handlers ====================
+
+    def _calculate_toggle_value(self, service, current_value):
+        """Calculate new value based on service and current value"""
+        if service == "turn_on":
+            return "1"
+        elif service == "turn_off":
+            return "0"
+        elif service == "toggle":
+            return "0" if current_value == "1" else "1"
+        else:
+            return None
+
+    # Event stubs: queue for the Solis component loop.
+    #
+    # These are invoked from the HA component's loop (ha.py -> trigger_callback),
+    # not this component's. Doing the API work here would issue requests from a
+    # foreign loop against a ClientSession bound to ours — aiohttp raises, the
+    # handler swallows it, and the user is told a write succeeded that never
+    # reached the inverter. Queue instead, and let run() do the work on the loop
+    # that owns the session. Same approach as Ohme and Octopus.
+    async def select_event(self, entity_id, value):
+        self.queued_events.append((self.select_event_handler, entity_id, value))
+
+    async def number_event(self, entity_id, value):
+        self.queued_events.append((self.number_event_handler, entity_id, value))
+
+    async def switch_event(self, entity_id, service):
+        self.queued_events.append((self.switch_event_handler, entity_id, service))
+
+    async def select_event_handler(self, entity_id, value):
+        """Handle select entity changes"""
+        try:
+            # Parse entity_id: select.{prefix}_solis_{sn}_{field}
+            # Example: select.predbat_solis_123456_charge_slot1_start_time
+            prefix = self.base.get_arg("prefix", "predbat")
+            entity_prefix = f"select.{prefix}_solis_"
+
+            if not entity_id.startswith(entity_prefix):
+                return
+
+            remainder = entity_id[len(entity_prefix):]
+            parts = remainder.split("_")
+
+            if len(parts) < 2:
+                return
+
+            inverter_sn = parts[0]
+            field = "_".join(parts[1:])
+
+            # Validate inverter exists (case-insensitive: HA normalises entity IDs to lowercase,
+            # so SNs containing uppercase hex digits A-F would never match otherwise)
+            inverter_sn = self.find_inverter_by_sn(inverter_sn)
+            if inverter_sn is None:
+                self.log(f"Warn: Solis API: Unknown inverter {parts[0]} in select_event")
+                return
+
+            # Handle storage mode
+            if field == "storage_mode":
+                # Change mode, does a write and updates cache
+                await self.set_storage_mode_if_needed(inverter_sn, value)
+                # Re-publish entities
+                await self.publish_entities()
+                return
+
+            # Handle charge slot times
+            if field.startswith("charge_slot") and ("start_time" in field or "end_time" in field):
+                # Extract slot number
+                slot_match = field.replace("charge_slot", "").split("_")[0]
+                try:
+                    slot_num = int(slot_match)
+                except (ValueError, IndexError):
+                    self.log(f"Warn: Solis API: Cannot parse slot number from {field}")
+                    return
+
+                if slot_num < 1 or slot_num > 6:
+                    return
+
+                # Strip :SS from HH:MM:SS
+                new_hhmm = value[:5] if len(value) >= 5 else value
+
+                # Update charge_discharge_time_windows cache
+                if inverter_sn not in self.charge_discharge_time_windows:
+                    self.charge_discharge_time_windows[inverter_sn] = {}
+                if slot_num not in self.charge_discharge_time_windows[inverter_sn]:
+                    self.charge_discharge_time_windows[inverter_sn][slot_num] = {}
+
+                if "start_time" in field:
+                    self.charge_discharge_time_windows[inverter_sn][slot_num]["charge_start_time"] = new_hhmm
+                elif "end_time" in field:
+                    self.charge_discharge_time_windows[inverter_sn][slot_num]["charge_end_time"] = new_hhmm
+
+                # Write will happen in the main loop
+
+                # Re-publish entities
+                await self.publish_entities()
+                return
+
+            # Handle discharge slot times
+            if field.startswith("discharge_slot") and ("start_time" in field or "end_time" in field):
+                # Extract slot number
+                slot_match = field.replace("discharge_slot", "").split("_")[0]
+                try:
+                    slot_num = int(slot_match)
+                except (ValueError, IndexError):
+                    self.log(f"Warn: Solis API: Cannot parse slot number from {field}")
+                    return
+
+                if slot_num < 1 or slot_num > 6:
+                    return
+
+                # Strip :SS from HH:MM:SS
+                new_hhmm = value[:5] if len(value) >= 5 else value
+
+                # Update charge_discharge_time_windows cache
+                if inverter_sn not in self.charge_discharge_time_windows:
+                    self.charge_discharge_time_windows[inverter_sn] = {}
+                if slot_num not in self.charge_discharge_time_windows[inverter_sn]:
+                    self.charge_discharge_time_windows[inverter_sn][slot_num] = {}
+
+                if "start_time" in field:
+                    self.charge_discharge_time_windows[inverter_sn][slot_num]["discharge_start_time"] = new_hhmm
+                elif "end_time" in field:
+                    self.charge_discharge_time_windows[inverter_sn][slot_num]["discharge_end_time"] = new_hhmm
+
+                # Write will happen in the main loop
+
+                # Re-publish entities
+                await self.publish_entities()
+                return
+
+        except Exception as e:
+            self.log(f"Error: Solis API select_event failed for {entity_id}: {e}")
+
+    async def number_event_handler(self, entity_id, value):
+        """Handle number entity changes"""
+        try:
+            # Parse entity_id: number.{prefix}_solis_{sn}_{field}
+            # Example: number.predbat_solis_123456_charge_slot1_soc
+            prefix = self.base.get_arg("prefix", "predbat")
+            entity_prefix = f"number.{prefix}_solis_"
+
+            if not entity_id.startswith(entity_prefix):
+                return
+
+            remainder = entity_id[len(entity_prefix):]
+            parts = remainder.split("_")
+
+            if len(parts) < 2:
+                return
+
+            inverter_sn = parts[0]
+            field = "_".join(parts[1:])
+
+            # Validate inverter exists (case-insensitive: HA normalises entity IDs to lowercase,
+            # so SNs containing uppercase hex digits A-F would never match otherwise)
+            inverter_sn = self.find_inverter_by_sn(inverter_sn)
+            if inverter_sn is None:
+                self.log(f"Warn: Solis API: Unknown inverter {parts[0]} in number_event")
+                return
+
+            # Convert value to string for API
+            value_str = str(int(value))
+
+            # Handle charge slot SOC
+            if field.startswith("charge_slot") and field.endswith("_soc"):
+                # Extract slot number
+                slot_match = field.replace("charge_slot", "").replace("_soc", "")
+                try:
+                    slot_num = int(slot_match)
+                except (ValueError, IndexError):
+                    self.log(f"Warn: Solis API: Cannot parse slot number from {field}")
+                    return
+
+                if slot_num < 1 or slot_num > 6:
+                    return
+
+                # Update charge_discharge_time_windows cache
+                if inverter_sn not in self.charge_discharge_time_windows:
+                    self.charge_discharge_time_windows[inverter_sn] = {}
+                if slot_num not in self.charge_discharge_time_windows[inverter_sn]:
+                    self.charge_discharge_time_windows[inverter_sn][slot_num] = {}
+
+                self.charge_discharge_time_windows[inverter_sn][slot_num]["charge_soc"] = float(value_str)
+
+                # Write will happen in the main loop
+
+                # Re-publish entities
+                await self.publish_entities()
+                return
+
+            # Handle charge slot power (user provides watts, convert to amps)
+            if field.startswith("charge_slot") and field.endswith("_power"):
+                # Extract slot number
+                slot_match = field.replace("charge_slot", "").replace("_power", "")
+                try:
+                    slot_num = int(slot_match)
+                except (ValueError, IndexError):
+                    self.log(f"Warn: Solis API: Cannot parse slot number from {field}")
+                    return
+
+                if slot_num < 1 or slot_num > 6:
+                    return
+
+                # Convert watts to amps for inverter
+                amps = int(value / self.get_nominal_voltage(inverter_sn))
+
+                # Update charge_discharge_time_windows cache
+                if inverter_sn not in self.charge_discharge_time_windows:
+                    self.charge_discharge_time_windows[inverter_sn] = {}
+                if slot_num not in self.charge_discharge_time_windows[inverter_sn]:
+                    self.charge_discharge_time_windows[inverter_sn][slot_num] = {}
+
+                self.charge_discharge_time_windows[inverter_sn][slot_num]["charge_current"] = float(amps)
+
+                # Write will happen in the main loop
+
+                # Re-publish entities
+                await self.publish_entities()
+                return
+
+            # Handle discharge slot SOC
+            if field.startswith("discharge_slot") and field.endswith("_soc"):
+                # Extract slot number
+                slot_match = field.replace("discharge_slot", "").replace("_soc", "")
+                try:
+                    slot_num = int(slot_match)
+                except (ValueError, IndexError):
+                    self.log(f"Warn: Solis API: Cannot parse slot number from {field}")
+                    return
+
+                if slot_num < 1 or slot_num > 6:
+                    return
+
+                # Update charge_discharge_time_windows cache
+                if inverter_sn not in self.charge_discharge_time_windows:
+                    self.charge_discharge_time_windows[inverter_sn] = {}
+                if slot_num not in self.charge_discharge_time_windows[inverter_sn]:
+                    self.charge_discharge_time_windows[inverter_sn][slot_num] = {}
+
+                self.charge_discharge_time_windows[inverter_sn][slot_num]["discharge_soc"] = float(value_str)
+
+                # Write will happen in the main loop
+
+                # Re-publish entities
+                await self.publish_entities()
+                return
+
+            # Handle discharge slot power (user provides watts, convert to amps)
+            if field.startswith("discharge_slot") and field.endswith("_power"):
+                # Extract slot number
+                slot_match = field.replace("discharge_slot", "").replace("_power", "")
+                try:
+                    slot_num = int(slot_match)
+                except (ValueError, IndexError):
+                    self.log(f"Warn: Solis API: Cannot parse slot number from {field}")
+                    return
+
+                if slot_num < 1 or slot_num > 6:
+                    return
+
+                # Convert watts to amps for inverter
+                amps = round(float(value) / self.get_nominal_voltage(inverter_sn), 1)
+
+                # Update charge_discharge_time_windows cache
+                if inverter_sn not in self.charge_discharge_time_windows:
+                    self.charge_discharge_time_windows[inverter_sn] = {}
+                if slot_num not in self.charge_discharge_time_windows[inverter_sn]:
+                    self.charge_discharge_time_windows[inverter_sn][slot_num] = {}
+
+                self.charge_discharge_time_windows[inverter_sn][slot_num]["discharge_current"] = amps
+
+                # Write will happen in the main loop
+
+                # Re-publish entities
+                await self.publish_entities()
+                return
+
+            # Handle battery SOC limits
+            if field in ["reserve_soc", "over_discharge_soc", "force_charge_soc", "recovery_soc", "max_charge_soc"]:
+                cid_map = {
+                    "reserve_soc": SOLIS_CID_BATTERY_RESERVE_SOC,
+                    "over_discharge_soc": SOLIS_CID_BATTERY_OVER_DISCHARGE_SOC,
+                    "force_charge_soc": SOLIS_CID_BATTERY_FORCE_CHARGE_SOC,
+                    "recovery_soc": SOLIS_CID_BATTERY_RECOVERY_SOC,
+                    "max_charge_soc": SOLIS_CID_BATTERY_MAX_CHARGE_SOC,
+                }
+                cid = cid_map[field]
+
+                # Write to inverter
+                await self.read_and_write_cid(inverter_sn, cid, value_str, field_description=f"{field} to {value_str}%")
+
+                # Re-publish entities
+                await self.publish_entities()
+                return
+
+            # Handle battery max power (user provides watts, convert to amps)
+            if field in ["max_charge_power", "max_discharge_power"]:
+                cid_map = {
+                    "max_charge_power": SOLIS_CID_BATTERY_MAX_CHARGE_CURRENT,
+                    "max_discharge_power": SOLIS_CID_BATTERY_MAX_DISCHARGE_CURRENT,
+                }
+                cid = cid_map[field]
+
+                # Convert watts to amps for inverter
+                amps = round(float(value) / self.get_nominal_voltage(inverter_sn), 1)
+
+                # Write to inverter
+                await self.read_and_write_cid(inverter_sn, cid, amps, field_description=f"{field} to {value_str}W ({amps}A)")
+
+                # Re-calculate max currents after change
+                self._calculate_max_currents(inverter_sn)
+
+                # Re-publish entities
+                await self.publish_entities()
+                return
+
+            # Handle power controls
+            if field in ["power_limit", "max_output_power", "max_export_power"]:
+                cid_map = {
+                    "power_limit": SOLIS_CID_POWER_LIMIT,
+                    "max_output_power": SOLIS_CID_MAX_OUTPUT_POWER,
+                    "max_export_power": SOLIS_CID_MAX_EXPORT_POWER,
+                }
+                cid = cid_map[field]
+
+                if cid == SOLIS_CID_MAX_EXPORT_POWER:
+                    try:
+                        value_str = str(int(value) // 100)  # Convert watts to 100w units for inverter
+                    except (ValueError, TypeError):
+                        self.log(f"Warn: Solis API: Invalid value for max export power: {value}")
+                        return
+
+                # Write to inverter
+                await self.read_and_write_cid(inverter_sn, cid, value_str, field_description=f"{field} to {value_str}")
+
+                # Re-publish entities
+                await self.publish_entities()
+                return
+
+        except Exception as e:
+            self.log(f"Error: Solis API number_event failed for {entity_id}: {e}")
+
+    async def switch_event_handler(self, entity_id, service):
+        """Handle switch entity changes"""
+        try:
+            # Parse entity_id: switch.{prefix}_solis_{sn}_{field}
+            # Example: switch.predbat_solis_123456_charge_slot1_enable
+            prefix = self.base.get_arg("prefix", "predbat")
+            entity_prefix = f"switch.{prefix}_solis_"
+
+            if not entity_id.startswith(entity_prefix):
+                return
+
+            remainder = entity_id[len(entity_prefix):]
+            parts = remainder.split("_")
+
+            if len(parts) < 2:
+                return
+
+            inverter_sn = parts[0]
+            field = "_".join(parts[1:])
+
+            # Validate inverter exists (case-insensitive: HA normalises entity IDs to lowercase,
+            # so SNs containing uppercase hex digits A-F would never match otherwise)
+            inverter_sn = self.find_inverter_by_sn(inverter_sn)
+            if inverter_sn is None:
+                self.log(f"Warn: Solis API: Unknown inverter {parts[0]} in switch_event")
+                return
+
+            # Handle charge slot enables
+            if field.startswith("charge_slot") and field.endswith("_enable"):
+                # Extract slot number
+                slot_match = field.replace("charge_slot", "").replace("_enable", "")
+                try:
+                    slot_num = int(slot_match)
+                except (ValueError, IndexError):
+                    self.log(f"Warn: Solis API: Cannot parse slot number from {field}")
+                    return
+
+                if slot_num < 1 or slot_num > 6:
+                    self.log(f"Warn: Solis API: Slot number {slot_num} out of range in {field}")
+                    return
+
+                # Get enable CID for this slot
+                enable_cid = SOLIS_CID_CHARGE_ENABLE_BASE + (slot_num - 1)
+
+                # Determine value from service
+                current_value = self.cached_values.get(inverter_sn, {}).get(enable_cid, "0")
+                value = self._calculate_toggle_value(service, current_value)
+                if value is None:
+                    self.log(f"Warn: Solis API: Unknown service '{service}' for {entity_id}")
+                    return
+
+                # Update charge_discharge_time_windows cache
+                if inverter_sn not in self.charge_discharge_time_windows:
+                    self.charge_discharge_time_windows[inverter_sn] = {}
+                if slot_num not in self.charge_discharge_time_windows[inverter_sn]:
+                    self.charge_discharge_time_windows[inverter_sn][slot_num] = {}
+
+                self.charge_discharge_time_windows[inverter_sn][slot_num]["charge_enable"] = int(value)
+
+                # Write will happen in the main loop
+
+                # Re-publish entities
+                await self.publish_entities()
+                return
+
+            # Handle discharge slot enables
+            if field.startswith("discharge_slot") and field.endswith("_enable"):
+                # Extract slot number
+                slot_match = field.replace("discharge_slot", "").replace("_enable", "")
+                try:
+                    slot_num = int(slot_match)
+                except (ValueError, IndexError):
+                    self.log(f"Warn: Solis API: Cannot parse slot number from {field}")
+                    return
+
+                if slot_num < 1 or slot_num > 6:
+                    self.log("Warn: Solis API: Slot number out of range in switch_event")
+                    return
+
+                # Get enable CID for this slot
+                enable_cid = SOLIS_CID_DISCHARGE_ENABLE_BASE + (slot_num - 1)
+
+                # Determine value from service
+                current_value = self.cached_values.get(inverter_sn, {}).get(enable_cid, "0")
+                value = self._calculate_toggle_value(service, current_value)
+                if value is None:
+                    self.log(f"Warn: Solis API: Unknown service '{service}' for {entity_id}")
+                    return
+
+                # Update charge_discharge_time_windows cache
+                if inverter_sn not in self.charge_discharge_time_windows:
+                    self.charge_discharge_time_windows[inverter_sn] = {}
+                if slot_num not in self.charge_discharge_time_windows[inverter_sn]:
+                    self.charge_discharge_time_windows[inverter_sn][slot_num] = {}
+
+                self.charge_discharge_time_windows[inverter_sn][slot_num]["discharge_enable"] = int(value)
+
+                # Write will happen in the main loop not here
+
+                # Re-publish entities
+                await self.publish_entities()
+                return
+
+            # Handle battery reserve switch
+            if field == "battery_reserve":
+                # Get current storage mode
+                if inverter_sn not in self.cached_values:
+                    self.cached_values[inverter_sn] = {}
+
+                current_mode = self.get_current_solis_mode_value(inverter_sn)
+
+                # Calculate new value
+                if service == "turn_on":
+                    new_mode = current_mode | (1 << SOLIS_BIT_BACKUP_MODE)
+                elif service == "turn_off":
+                    new_mode = current_mode & ~(1 << SOLIS_BIT_BACKUP_MODE)
+                elif service == "toggle":
+                    new_mode = current_mode ^ (1 << SOLIS_BIT_BACKUP_MODE)
+                else:
+                    self.log(f"Warn: Solis API: Unknown service '{service}' for switch")
+                    return
+
+                # Write to inverter
+                await self.read_and_write_cid(inverter_sn, SOLIS_CID_STORAGE_MODE, str(new_mode), field_description=f"battery reserve to {service} (mode: {current_mode} -> {new_mode})")
+
+                # Re-publish entities
+                await self.publish_entities()
+                return
+
+            # Handle allow grid charging switch
+            if field == "allow_grid_charging":
+                # Get current storage mode
+                if inverter_sn not in self.cached_values:
+                    self.cached_values[inverter_sn] = {}
+
+                current_mode = self.get_current_solis_mode_value(inverter_sn)
+
+                # Calculate new value
+                if service == "turn_on":
+                    new_mode = current_mode | (1 << SOLIS_BIT_GRID_CHARGING)
+                elif service == "turn_off":
+                    new_mode = current_mode & ~(1 << SOLIS_BIT_GRID_CHARGING)
+                elif service == "toggle":
+                    new_mode = current_mode ^ (1 << SOLIS_BIT_GRID_CHARGING)
+                else:
+                    self.log(f"Warn: Solis API: Unknown service '{service}' for switch")
+                    return
+
+                # Write to inverter
+                await self.read_and_write_cid(inverter_sn, SOLIS_CID_STORAGE_MODE, str(new_mode), field_description=f"allow grid charging to {service} (mode: {current_mode} -> {new_mode})")
+
+                # Re-publish entities
+                await self.publish_entities()
+                return
+
+            # Handle time of use switch
+            if field == "time_of_use":
+                # Get current storage mode
+                if inverter_sn not in self.cached_values:
+                    self.cached_values[inverter_sn] = {}
+
+                current_mode = self.get_current_solis_mode_value(inverter_sn)
+
+                # Calculate new value
+                if service == "turn_on":
+                    new_mode = current_mode | (1 << SOLIS_BIT_TOU_MODE)
+                elif service == "turn_off":
+                    new_mode = current_mode & ~(1 << SOLIS_BIT_TOU_MODE)
+                elif service == "toggle":
+                    new_mode = current_mode ^ (1 << SOLIS_BIT_TOU_MODE)
+                else:
+                    self.log(f"Warn: Solis API: Unknown service '{service}' for switch")
+                    return
+
+                # Write to inverter
+                await self.read_and_write_cid(inverter_sn, SOLIS_CID_STORAGE_MODE, str(new_mode), field_description=f"time of use to {service} (mode: {current_mode} -> {new_mode})")
+
+                # Re-publish entities
+                await self.publish_entities()
+                return
+
+            # Handle allow export switch (inverted logic)
+            if field == "allow_export":
+                # Get current value
+                if inverter_sn not in self.cached_values:
+                    self.cached_values[inverter_sn] = {}
+
+                current_value = self.cached_values[inverter_sn].get(SOLIS_CID_ALLOW_EXPORT, SOLIS_ALLOW_EXPORT_OFF)
+
+                # Calculate new value (inverted logic)
+                if service == "turn_on":
+                    new_value = SOLIS_ALLOW_EXPORT_ON  # "0" = allow export
+                elif service == "turn_off":
+                    new_value = SOLIS_ALLOW_EXPORT_OFF  # "1" = block export
+                elif service == "toggle":
+                    new_value = SOLIS_ALLOW_EXPORT_OFF if current_value == SOLIS_ALLOW_EXPORT_ON else SOLIS_ALLOW_EXPORT_ON
+                else:
+                    self.log(f"Warn: Solis API: Unknown service '{service}' for switch")
+                    return
+
+                # Write to inverter
+                await self.read_and_write_cid(inverter_sn, SOLIS_CID_ALLOW_EXPORT, new_value, field_description=f"allow export to {service} (value: {current_value} -> {new_value})")
+
+                # Re-publish entities
+                await self.publish_entities()
+                return
+
+        except Exception as e:
+            self.log(f"Error: Solis API switch_event failed for {entity_id}: {e}")
+
+    async def fetch_inverter_details(self, sn):
+        try:
+            detail = await self.get_inverter_detail(sn)
+            self.inverter_details[sn] = detail
+            # self.log(f"Solis API: Loaded details for inverter {sn} - {detail}")
+
+            # Extract parallel battery count (format: "2.0" means 3 batteries total)
+            parallel_battery = detail.get("parallelBattery", "0")
+            try:
+                self.parallel_battery_count[sn] = int(float(parallel_battery)) + 1
+            except (ValueError, TypeError):
+                self.parallel_battery_count[sn] = 1
+            return True
+
+        except Exception as e:
+            self.log(f"Warn: Solis API failed to load details for {sn}: {e}")
+            return False
+
+    def active_window_key(self, inverter_sn):
+        """Identify the charge or discharge window Predbat has configured for right now.
+
+        Read from charge_discharge_time_windows, which is what Predbat asked for, rather than from
+        the register cache - the point of asking is to find out whether the inverter still agrees.
+
+        The identity carries the slot and its times, so a window rewritten while it is running -
+        which Predbat does whenever the plan moves - is a different window from the one before it.
+
+        Args:
+            inverter_sn: Inverter serial number
+
+        Returns: A key identifying the window in force, or None when there is not one
+        """
+        # Local time, to match the windows Predbat writes (as the V1 control path does)
+        current_time = self.now_utc_exact.strftime("%H:%M")
+        for slot, slot_data in self.charge_discharge_time_windows.get(inverter_sn, {}).items():
+            if not slot_data:
+                continue
+            charge_start = slot_data.get("charge_start_time", "00:00")
+            charge_end = slot_data.get("charge_end_time", "00:00")
+            if slot_data.get("charge_enable", 0) and time_in_window(current_time, charge_start, charge_end):
+                return (slot, "charge", charge_start, charge_end)
+            discharge_start = slot_data.get("discharge_start_time", "00:00")
+            discharge_end = slot_data.get("discharge_end_time", "00:00")
+            if slot_data.get("discharge_enable", 0) and time_in_window(current_time, discharge_start, discharge_end):
+                return (slot, "discharge", discharge_start, discharge_end)
+        return None
+
+    def is_inside_active_window(self, inverter_sn):
+        """True when local time falls inside a charge or discharge window Predbat has configured.
+
+        Args:
+            inverter_sn: Inverter serial number
+
+        Returns: True when a configured window is in force right now
+        """
+        return self.active_window_key(inverter_sn) is not None
+
+    def claim_window_mode_assertion(self, inverter_sn):
+        """True once for each window that comes into force, so the storage mode is re-asserted there.
+
+        The V1 control path picks its mode from the clock, so the value changes as a window opens
+        and CID 636 is written at the boundary as a matter of course. The V2 path picks from
+        slot1_active - whether slot 1 has a window configured at all - so the mode is written when
+        the slot is programmed and nothing happens when the window actually starts. On the night in
+        issue #4774 the last CID 636 write was 22 minutes before the window opened.
+
+        Args:
+            inverter_sn: Inverter serial number
+
+        Returns: True when this window has not been asserted for yet
+        """
+        window = self.active_window_key(inverter_sn)
+        if window is None:
+            # Outside a window, so the next one to start is a fresh claim even if its times repeat
+            self.mode_asserted_for.pop(inverter_sn, None)
+            return False
+        if self.mode_asserted_for.get(inverter_sn) == window:
+            return False
+        self.mode_asserted_for[inverter_sn] = window
+        return True
+
+    def is_tou_v2_mode(self, sn):
+        """
+        Check if Time of Use V2 mode is enabled for the given inverter serial number.
+        Returns "1" if enabled, "0" otherwise.
+        """
+        result = self.cached_values.get(sn, {}).get(SOLIS_CID_TOU_V2_MODE, "0")
+        try:
+            result = int(result)
+        except (ValueError, TypeError):
+            result = 0
+        if result == 43605:
+            return True
+        else:
+            return False
+
+    # ==================== Component Lifecycle ====================
+
+    async def startup_reset_registers(self, device_sn):
+        """
+        Reset the startup registers for the given device serial number.
+        """
+        value = await self.read_cid(device_sn, SOLIS_CID_BATTERY_OVER_DISCHARGE_SOC)
+        try:
+            value = float(value)
+        except (ValueError, TypeError):
+            value = 0
+        # If the value is above 20, reset it to 20 default
+        if value > 20:
+            await self.read_and_write_cid(device_sn, SOLIS_CID_BATTERY_OVER_DISCHARGE_SOC, "20", field_description="Set over discharge soc to 20 default")
+
+    def filter_inverter_sn(self, configured_inverter_sn, all_inverters):
+        """
+        Filter by configured inverter_sn if specified, otherwise use all.
+        """
+        if configured_inverter_sn:
+            # inverter_sn was configured, filter to only those (case-insensitive: user may
+            # type lowercase SNs in apps.yaml while the API returns uppercase hex digits)
+            configured_lower = {sn.lower() for sn in configured_inverter_sn}
+            filtered = [inv for inv in all_inverters if inv.get("sn") and inv.get("sn").lower() in configured_lower]
+            # Warn about any configured SNs that were not found in the account
+            found_lower = {inv.get("sn").lower() for inv in filtered if inv.get("sn")}
+            for sn in configured_inverter_sn:
+                if sn.lower() not in found_lower:
+                    self.log(f"Warn: Solis API: Configured inverter SN '{sn}' not found in account")
+            self.log(f"Solis API: Filtered to {len(filtered)} of {len(all_inverters)} inverter(s) based on config")
+            inverter_sn = [inv.get("sn") for inv in filtered if inv.get("sn")]
+        else:
+            # No filter configured, use all discovered inverters
+            inverter_sn = [inv.get("sn") for inv in all_inverters if inv.get("sn")]
+            self.log(f"Solis API: Using all {len(inverter_sn)} discovered inverter(s)")
+        return inverter_sn
+
+    async def run(self, seconds, first):
+        """Main run cycle called every 5 seconds"""
+        poll_success = True
+
+        # One-time startup configuration
+        if first:
+            # Create aiohttp session. Reused across startup attempts: the component backs off and
+            # re-runs this whole block on every failed start, and a fresh session each time would
+            # leak the previous one - which a spent API allowance makes a routine occurrence.
+            if self.session is None:
+                timeout = aiohttp.ClientTimeout(total=SOLIS_REQUEST_TIMEOUT)
+                self.session = aiohttp.ClientSession(timeout=timeout)
+
+            # Discover inverters - always scan, filter by inverter_sn if specified
+            try:
+                self.log("Solis API: Discovering inverters...")
+                all_inverters = await self.get_inverter_list()
+
+                if all_inverters:
+                    self.inverter_sn = self.filter_inverter_sn(self.configured_inverter_sn, all_inverters)
+                    if not self.inverter_sn:
+                        self.log("Warn: Solis API: No inverters found after filtering")
+                else:
+                    self.log("Warn: Solis API: No inverters discovered")
+
+            except Exception as e:
+                self.log(f"Error: Solis API: Inverter discovery failed: {e}")
+                poll_success = False
+
+            # Get inverter details for all inverters
+            for sn in self.inverter_sn:
+                await self.fetch_inverter_details(sn)
+                await self.poll_inverter_data(sn, [SOLIS_CID_TOU_V2_MODE])  # Get TOU V2 mode status
+                if self.is_tou_v2_mode(sn):
+                    self.log(f"Solis API: Inverter {sn} is in Time of Use V2 mode")
+                else:
+                    self.log(f"Solis API: Inverter {sn} is in standard Time of Use mode")
+                if self.control_enable:
+                    if self.is_battery_inverter(sn):
+                        await self.startup_reset_registers(sn)  # Reset registers on startup to ensure we have write access and correct initial state
+                    else:
+                        # automatic_config() logs its own version of this, but only when auto-config is on
+                        self.log(f"Solis API: Inverter {sn} reports no battery attached, so Predbat will poll it but not write any control registers to it")
+
+            # Keep the fleet for next time, or fall back to it when discovery could not run at all
+            if self.inverter_sn:
+                await self.save_discovery_cache()
+            else:
+                await self.restore_discovery_cache()
+
+            if not self.inverter_sn:
+                self.log("Error: Solis API: No inverters to manage after discovery")
+                return False  # Stop further processing if no inverters
+
+        # Process events queued by the entity callbacks, on this loop. Drained after the
+        # startup block: the handlers need the ClientSession and the discovered inverter
+        # list, which only exist once the first cycle has completed. On a failed startup
+        # (the return above) the queue is left intact and drained on the next attempt.
+        while self.queued_events:
+            handler, *args = self.queued_events.pop(0)
+            try:
+                await handler(*args)
+            except Exception as e:
+                self.log("Warn: Solis API: Event handler error: {}".format(e))
+
+        # Frequent polling (every minute)
+        if first or (seconds % 60 == 0):
+            for sn in self.inverter_sn:
+                if self.datalogger_offline(sn):
+                    # Its datalogger is offline; the cooldown expiring is what re-probes it
+                    poll_success = False
+                    continue
+                success = await self.fetch_inverter_details(sn)  # Get inverter details for all inverters
+                if not success:
+                    poll_success = False
+
+        # Inverters whose slot registers were successfully read this cycle, so the in-window
+        # re-read below does not read them a second time on an hour boundary
+        slot_registers_polled = set()
+
+        # Infrequent polling (every 60 minutes)
+        if first or (seconds % 3600 == 0):
+            for sn in self.inverter_sn:
+                if self.datalogger_offline(sn):
+                    poll_success = False
+                    continue
+                self.log(f"Solis API: Performing infrequent data poll for inverter {sn}...")
+                await self.poll_inverter_data(sn, SOLIS_CID_INFREQUENT)
+                # Read separately, the batch endpoint mis-reports these (see SOLIS_CID_INFREQUENT_SINGLE)
+                await self.poll_inverter_data(sn, SOLIS_CID_INFREQUENT_SINGLE, batch=False)
+                # Recalculate max currents after polling infrequent data
+                self._calculate_max_currents(sn)
+
+                # Read the charge/discharge windows
+                self.log(f"Solis API: Reading charge/discharge time windows for inverter {sn}...")
+                if self.is_tou_v2_mode(sn):
+                    success = await self.poll_inverter_data(sn, SOLIS_CID_LIST_TOU_V2)
+                    if not success:
+                        poll_success = False
+                    # Only decode on first run to establish initial state.
+                    # Subsequent polls update cached_values (for change detection in write_time_windows_if_changed)
+                    # but we retain the local charge_discharge_time_windows to stop Predbat fighting with the inverter
+                    # which may internally adjust CID values (e.g. actual charge current vs configured max).
+                    if first:
+                        await self.decode_time_windows_v2(sn)
+                else:
+                    self.log("Solis API: Inverter is in standard Time of Use mode, polling standard TOU data")
+                    success = await self.poll_inverter_data(sn, SOLIS_CID_SINGLE, batch=False)
+                    if not success:
+                        poll_success = False
+                    # Only decode them once, as for v1 we have to keep extra data that doesn't really exist in the windows
+                    # so we retain our local cache to stop Predbat fighting with us
+                    # The read itself updates the register cache so we will know if we changed anything
+                    if first:
+                        await self.decode_time_windows(sn)
+                    else:
+                        await self.fetch_entity_data(sn)
+
+                # Only when the read actually refreshed the cache - a failed poll preserves the
+                # old values, so the in-window re-read below should still get its turn
+                if success:
+                    slot_registers_polled.add(sn)
+
+        # Inside a live window the slot registers are the ones that decide whether the battery
+        # actually charges, and the hourly poll above can leave the inverter drifting from what
+        # Predbat programmed for most of that window. Re-read them every 5 minutes while a window
+        # is in force so write_time_windows_if_changed() below sees the drift and corrects it in
+        # the same cycle (issue #4774). One batch call, and only while it matters.
+        if seconds % 300 == 0:
+            for sn in self.inverter_sn:
+                if sn in slot_registers_polled or self.datalogger_offline(sn):
+                    continue
+                if not self.is_battery_inverter(sn) or not self.is_inside_active_window(sn):
+                    continue
+                self.log(f"Solis API: Re-reading charge/discharge slot registers for inverter {sn}, a window is in force")
+                if self.is_tou_v2_mode(sn):
+                    success = await self.poll_inverter_data(sn, SOLIS_CID_LIST_TOU_V2)
+                else:
+                    success = await self.poll_inverter_data(sn, SOLIS_CID_SINGLE, batch=False)
+                if not success:
+                    poll_success = False
+
+        # Control mode
+        control_success = True
+        if first or (seconds % 60 == 0):
+            # Write to inverter using new function (handles both V1 and V2)
+            is_readonly = self.get_state_wrapper(f'switch.{self.prefix}_set_read_only', default='off') == 'on'
+            if self.control_enable and not is_readonly:
+                for sn in self.inverter_sn:
+                    if not self.is_battery_inverter(sn) or self.datalogger_offline(sn):
+                        continue
+                    await self.reset_charge_windows_if_needed(sn)
+                    if not await self.write_time_windows_if_changed(sn):
+                        control_success = False
+            else:
+                self.log("Solis API: Control disabled, skipping writing time windows")
+
+        # Publish entities after polling
+        if first or (seconds % 60 == 0):
+            await self.publish_entities()
+
+        # Auto-configure Predbat if enabled. Retried on later cycles rather than being a
+        # first-cycle-only step: when the first cycle can't read the inverter details (an exhausted
+        # API allowance, a cloud outage) there is nothing to bind the args to, and without a retry
+        # load_today and the rest stay unset until Predbat is restarted - which is what left
+        # fetch_sensor_data raising ValueError every cycle in issue #5087.
+        if self.automatic and self.inverter_sn and not self.automatic_config_done:
+            self.automatic_config_done = bool(await self.automatic_config())
+
+        # Return status. A refused control write must not refresh the success timestamp:
+        # components.is_alive() treats a stale timestamp as unhealthy, which surfaces as
+        # "component errors: Solis" in the run status. Without this a register the inverter
+        # keeps rejecting is invisible outside the log (see issue #4702).
+        #
+        # The run itself is still reported as successful, so a control failure does not reach
+        # non_fatal_error_occurred(). That sets base.had_errors, and the had_errors branch in
+        # update_pred() skips record_status() entirely, which would freeze predbat.status on
+        # its last value rather than show an error.
+        if poll_success and control_success:
+            self.update_success_timestamp()
+
+        # Mark API as started after first successful run
+        self.log("Solis API: Run cycle complete with poll_success {} and first {}".format(poll_success, first))
+        return poll_success
+
+    async def final(self):
+        """Cleanup on shutdown"""
+        if self.session:
+            await self.session.close()
+            self.session = None
+        self.log("Solis API: Component stopped")
+
+
+async def test_solis_api(key_id, secret):  # pragma: no cover
+    """
+    Run a test of Solis API
+    """
+    print(f"Testing Solis API with key_id: {key_id[:10]}...")
+
+    # Create a mock base object
+    mock_base = MockBase()
+
+    # Create SolisAPI instance with correct parameter names
+    arg_dict = {"api_key": key_id, "api_secret": secret, "automatic": True, "control_enable": True}
+    solis_api = SolisAPI(mock_base, **arg_dict)
+
+    # Call run() once
+    print("Calling run() once...")
+    await solis_api.run(seconds=0, first=True)
+    for _device_sn, _values in solis_api.cached_values.items():
+        #await solis_api.read_cid(device_sn, SOLIS_CID_STORAGE_MODE)  # Ensure we have the latest value for storage mode
+        #await solis_api.read_cid(device_sn, SOLIS_CID_BATTERY_RESERVE_SOC)  # Ensure we have the latest value for battery reserve SOC
+        #await solis_api.read_and_write_cid(device_sn, SOLIS_CID_BATTERY_OVER_DISCHARGE_SOC, "5", field_description="Test write discharge soc to 5")  # Test writing a value
+        #await solis_api.read_cid(device_sn, SOLIS_CID_BATTERY_OVER_DISCHARGE_SOC)  # Ensure we have the latest value for TOU V2 mode
+        #await solis_api.set_storage_mode_if_needed(device_sn, "Feed-in priority")
+        #await solis_api.set_storage_mode_if_needed(device_sn, "Self-Use")
+        #current_mode = solis_api.get_current_solis_mode_value(device_sn)
+        #new_mode = current_mode | (1 << SOLIS_BIT_BACKUP_MODE)
+        #await solis_api.read_and_write_cid(device_sn, SOLIS_CID_STORAGE_MODE, str(new_mode), field_description=f"battery reserve to (mode: {current_mode} -> {new_mode})")
+        #await solis_api.read_and_write_cid(device_sn, SOLIS_CID_BATTERY_RESERVE_SOC, "5", field_description="Test write reserve SOC to 5%")
+        #new_mode = current_mode & ~(1 << SOLIS_BIT_BACKUP_MODE)
+        #await solis_api.read_and_write_cid(device_sn, SOLIS_CID_STORAGE_MODE, str(new_mode), field_description=f"battery reserve to (mode: {current_mode} -> {new_mode})")
+        pass
+    print("Run completed successfully")
+
+    await solis_api.final()
+
+
+def main():  # pragma: no cover
+    """
+    Main function for command line execution
+    """
+    parser = argparse.ArgumentParser(description="Test Solis Cloud API")
+    parser.add_argument("--key-id", required=True, help="Solis Cloud API Key ID")
+    parser.add_argument("--secret", required=True, help="Solis Cloud API Secret")
+
+    args = parser.parse_args()
+    key_id = args.key_id
+    secret = args.secret
+
+    # Run the test
+    asyncio.run(test_solis_api(key_id, secret))
+
+
+if __name__ == "__main__":
+    main()

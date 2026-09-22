@@ -1,6 +1,6 @@
 # -----------------------------------------------------------------------------
 # Predbat Home Battery System
-# Copyright Trefor Southwell 2024 - All Rights Reserved
+# Copyright Trefor Southwell 2026 - All Rights Reserved
 # This application maybe used for personal use only and not for commercial use
 # -----------------------------------------------------------------------------
 # fmt off
@@ -8,47 +8,38 @@
 # pylint: disable=line-too-long
 # pylint: disable=attribute-defined-outside-init
 
+
+"""Minute-by-minute battery simulation engine.
+
+Implements the core prediction model that simulates energy flows (PV generation,
+load consumption, battery charge/discharge, grid import/export) for each minute
+of the forecast period. Used by the optimiser to evaluate different charge/discharge
+plans and select the one with the lowest cost metric.
+"""
+
 from datetime import timedelta
-from config import PREDICT_STEP, RUN_EVERY, TIME_FORMAT
-from utils import remove_intersecting_windows, get_charge_rate_curve, get_discharge_rate_curve, find_charge_rate, calc_percent_limit, in_iboost_slot, in_car_slot
+from const import PREDICT_STEP, PV_SCENARIO_PV10, PV_SCENARIO_PV90, RUN_EVERY, TIME_FORMAT, EXPORT_LIMIT_FREEZE, EXPORT_LIMIT_IDLE, EXPORT_MODE_TARGET, EXPORT_MODE_FREEZE, EXPORT_MODE_IDLE
 
+from utils import (
+    remove_intersecting_windows,
+    get_charge_rate_curve_cached,
+    get_discharge_rate_curve_cached,
+    find_charge_rate,
+    calc_percent_limit,
+    in_iboost_slot,
+    in_car_slot,
+    charge_curve_to_tuple,
+    export_mode_of,
+    export_power_of,
+    export_target_of,
+    pack_export_limit,
+)
+from prediction_batch import PredictionBatch, prediction_cache_key
+from prediction_kernel import create_kernel_context, kernel_supported, run_prediction_kernel
 
-# Only assign globals once to avoid re-creating them with processes are forked
-if not "PRED_GLOBAL" in globals():
-    PRED_GLOBAL = {}
-
-
-def reset_prediction_globals():
-    global PRED_GLOBAL
-    PRED_GLOBAL = {}
-
-
-def wrapped_run_prediction_single(charge_limit, charge_window, export_window, export_limits, pv10, end_record, step):
-    global PRED_GLOBAL
-    pred = Prediction()
-    pred.__dict__ = PRED_GLOBAL["dict"].copy()
-    return pred.thread_run_prediction_single(charge_limit, charge_window, export_window, export_limits, pv10, end_record, step)
-
-
-def wrapped_run_prediction_charge(try_soc, window_n, charge_limit, charge_window, export_window, export_limits, pv10, all_n, end_record):
-    global PRED_GLOBAL
-    pred = Prediction()
-    pred.__dict__ = PRED_GLOBAL["dict"].copy()
-    return pred.thread_run_prediction_charge(try_soc, window_n, charge_limit, charge_window, export_window, export_limits, pv10, all_n, end_record)
-
-
-def wrapped_run_prediction_charge_min_max(try_soc, window_n, charge_limit, charge_window, export_window, export_limits, pv10, all_n, end_record):
-    global PRED_GLOBAL
-    pred = Prediction()
-    pred.__dict__ = PRED_GLOBAL["dict"].copy()
-    return pred.thread_run_prediction_charge_min_max(try_soc, window_n, charge_limit, charge_window, export_window, export_limits, pv10, all_n, end_record)
-
-
-def wrapped_run_prediction_export(this_export_limit, start, window_n, charge_limit, charge_window, export_window, export_limits, pv10, all_n, end_record):
-    global PRED_GLOBAL
-    pred = Prediction()
-    pred.__dict__ = PRED_GLOBAL["dict"].copy()
-    return pred.thread_run_prediction_export(this_export_limit, start, window_n, charge_limit, charge_window, export_window, export_limits, pv10, all_n, end_record)
+# The limit an inactive export window reads as. Built once at import rather than per minute:
+# run_prediction consults it on every step of the horizon for every simulation.
+IDLE_EXPORT_LIMIT = pack_export_limit(EXPORT_MODE_IDLE)
 
 
 def get_diff(battery_draw, pv_dc, pv_ac, load_yesterday, inverter_loss, inverter_loss_recp):
@@ -78,21 +69,30 @@ def get_total_inverted(battery_draw, pv_dc, pv_ac, inverter_loss, inverter_hybri
     return total_inverted
 
 
-class Prediction:
+class Prediction(PredictionBatch):
     """
     Class to hold prediction input and output data and the run function
     """
 
-    def __init__(self, base=None, pv_forecast_minute_step=None, pv_forecast_minute10_step=None, load_minutes_step=None, load_minutes_step10=None):
-        global PRED_GLOBAL
+    def __init__(
+        self, base=None, pv_forecast_minute_step=None, pv_forecast_minute10_step=None, load_minutes_step=None, load_minutes_step10=None, pv_forecast_minute90_step=None, load_minutes_step90=None, soc_kw=None, soc_max=None, kernel_static_cache=None
+    ):
+        """Build a Prediction, optionally copying simulation state from a base PredBat instance.
+
+        pv_forecast_minute90_step and load_minutes_step90 fall back to the nominal step arrays when None, so
+        every existing call site that never requests the pv90 scenario keeps working unchanged.
+
+        kernel_static_cache is passed straight through to create_kernel_context, for a caller building
+        several Predictions that differ only in their load forecast; see that function for the contract.
+        """
         if base:
             self.minutes_now = base.minutes_now
             self.log = base.log
             self.time_abs_str = base.time_abs_str
             self.forecast_minutes = base.forecast_minutes
             self.midnight_utc = base.midnight_utc
-            self.soc_kw = base.soc_kw
-            self.soc_max = base.soc_max
+            self.soc_kw = soc_kw if soc_kw is not None else base.soc_kw
+            self.soc_max = soc_max if soc_max is not None else base.soc_max
             self.export_today_now = base.export_today_now
             self.import_today_now = base.import_today_now
             self.load_minutes_now = base.load_minutes_now
@@ -107,6 +107,7 @@ class Prediction:
             self.car_charging_soc = base.car_charging_soc
             self.car_charging_soc_next = base.car_charging_soc_next
             self.car_charging_loss = base.car_charging_loss
+            self.car_energy_reported_load = base.car_energy_reported_load
             self.reserve = base.reserve
             self.metric_standing_charge = base.metric_standing_charge
             self.set_charge_freeze = base.set_charge_freeze
@@ -119,9 +120,17 @@ class Prediction:
             self.set_export_low_power = base.set_export_low_power
             self.set_charge_window = base.set_charge_window
             self.set_export_window = base.set_export_window
+            self.calculate_export_on_pv = base.calculate_export_on_pv
             self.charge_low_power_margin = base.charge_low_power_margin
+            self.low_power_pv_threshold_w = base.low_power_pv_threshold_w
+            self.set_charge_low_power_solar_full_rate = base.set_charge_low_power_solar_full_rate
             self.car_charging_slots = base.car_charging_slots
-            self.car_charging_limit = base.car_charging_limit
+            # Model-facing car charge limit (#4967): fetch raises this above the real limit for cars
+            # following an Octopus Intelligent dispatch plan with consider_full off, making the fill
+            # clamp in predict() (and in the C++ kernel, whose context is built from this attribute)
+            # inert for them without predict() knowing anything about the tariff. None - including a
+            # replayed debug dump from before this attribute existed - means use the real limits.
+            self.car_charging_limit = base.car_charging_limit_model if base.car_charging_limit_model is not None else base.car_charging_limit
             self.car_charging_from_battery = base.car_charging_from_battery
             self.iboost_enable = base.iboost_enable
             self.iboost_on_export = base.iboost_on_export
@@ -143,14 +152,16 @@ class Prediction:
             self.iboost_rate_threshold_export = base.iboost_rate_threshold_export
             self.rate_gas = base.rate_gas
             self.inverter_loss = base.inverter_loss
+            self.inverter_freeze_export_discharge_rate = base.inverter_freeze_export_discharge_rate
             self.inverter_hybrid = base.inverter_hybrid
             self.inverter_limit = base.inverter_limit
             self.export_limit = base.export_limit
+            self.pv_ac_limit = base.pv_ac_limit
             self.battery_rate_min = base.battery_rate_min
             self.battery_rate_max_charge = base.battery_rate_max_charge
+            self.battery_rate_max_charge_dc = base.battery_rate_max_charge_dc
             self.battery_rate_max_discharge = base.battery_rate_max_discharge
-            self.battery_rate_max_charge_scaled = base.battery_rate_max_charge_scaled
-            self.battery_rate_max_discharge_scaled = base.battery_rate_max_discharge_scaled
+            self.battery_rate_max_export = base.battery_rate_max_export
             self.battery_charge_power_curve = base.battery_charge_power_curve
             self.battery_discharge_power_curve = base.battery_discharge_power_curve
             self.battery_temperature = base.battery_temperature
@@ -173,57 +184,59 @@ class Prediction:
             self.pv_forecast_minute10_step = pv_forecast_minute10_step
             self.load_minutes_step = load_minutes_step
             self.load_minutes_step10 = load_minutes_step10
+            self.pv_forecast_minute90_step = pv_forecast_minute90_step if pv_forecast_minute90_step is not None else pv_forecast_minute_step
+            self.load_minutes_step90 = load_minutes_step90 if load_minutes_step90 is not None else load_minutes_step
             self.carbon_intensity = base.carbon_intensity
             self.all_active_keep = base.all_active_keep
+            self.all_active_keep_max = base.all_active_keep_max
             self.iboost_running = False
             self.iboost_running_solar = False
             self.iboost_running_full = False
             self.inverter_can_charge_during_export = base.inverter_can_charge_during_export
+            self.inverter_support_feedin_first = base.inverter_support_feedin_first
             self.prediction_cache_enable = base.prediction_cache_enable
             self.prediction_cache = {}
             self.plan_interval_minutes = base.plan_interval_minutes
             self.charge_scaling10 = base.charge_scaling10
 
-            # Store this dictionary in global so we can reconstruct it in the thread without passing the data
-            PRED_GLOBAL["dict"] = self.__dict__.copy()
+            # C++ prediction kernel context (0 = kernel unavailable, Python engine is used)
+            self.prediction_kernel_enable = getattr(base, "prediction_kernel_enable", False)
+            self.kernel_handle = 0
+            if self.prediction_kernel_enable:
+                self.kernel_handle = create_kernel_context(self, static_cache=kernel_static_cache)
 
-    def thread_run_prediction_single(self, charge_limit, charge_window, export_window, export_limits, pv10, end_record, step):
-        """
-        Run single prediction in a thread
-        """
+        # Outside the `if base:` block on purpose: a Prediction built without a base is still a valid
+        # object and its first enqueue_prediction would otherwise raise AttributeError
+        self.pending_batch = []
+        self.batch_threads = 1
 
-        (
-            cost,
-            import_kwh_battery,
-            import_kwh_house,
-            export_kwh,
-            soc_min,
-            soc,
-            soc_min_minute,
-            battery_cycle,
-            metric_keep,
-            final_iboost,
-            final_carbon_g,
-            predict_soc,
-            car_charging_soc_next,
-            iboost_next,
-            iboost_running,
-            iboost_running_solar,
-            iboost_running_full,
-        ) = self.run_prediction(charge_limit, charge_window, export_window, export_limits, pv10, end_record=end_record, step=step, cache=self.prediction_cache_enable)
-        return (cost, import_kwh_battery, import_kwh_house, export_kwh, soc_min, soc, soc_min_minute, battery_cycle, metric_keep, final_iboost, final_carbon_g)
+    def _prepare_single(self, charge_limit, export_limits):
+        """Copy the caller's limit lists for a single-scenario trial - shared by thread_run_prediction_single and the batch path.
 
-    def thread_run_prediction_charge(self, try_soc, window_n, charge_limit, charge_window, export_window, export_limits, pv10, all_n, end_record):
+        The copy used to live in Plan.launch_run_prediction_single. It is kept here because the batch
+        path does not read these lists until the batch is flushed, so a trial has to own the copy it
+        will eventually be simulated from rather than share the caller's list.
         """
-        Run prediction in a thread
-        """
+        return list(charge_limit), list(export_limits)
 
+    def _prepare_charge(self, try_soc, window_n, charge_limit, all_n):
+        """Build the trial charge limits - shared by thread_run_prediction_charge/_charge_min_max and the batch path"""
         try_charge_limit = charge_limit.copy()
         if all_n:
             for set_n in all_n:
                 try_charge_limit[set_n] = try_soc
         else:
             try_charge_limit[window_n] = try_soc
+        return try_charge_limit
+
+    def thread_run_prediction_single(self, charge_limit, charge_window, export_window, export_limits, pv_scenario, end_record, step):
+        """Run one single-scenario prediction now and return its result.
+
+        Nothing runs in a Python thread any more: this is the direct synchronous path, kept as the
+        reference the batch is checked against and as what a queued job falls back to when the kernel
+        will not take it.
+        """
+        charge_limit, export_limits = self._prepare_single(charge_limit, export_limits)
 
         (
             cost,
@@ -243,7 +256,47 @@ class Prediction:
             iboost_running,
             iboost_running_solar,
             iboost_running_full,
-        ) = self.run_prediction(try_charge_limit, charge_window, export_window, export_limits, pv10, end_record=end_record, cache=self.prediction_cache_enable)
+        ) = self.run_prediction(charge_limit, charge_window, export_window, export_limits, pv_scenario, end_record=end_record, step=step, cache=self.prediction_cache_enable)
+        return (cost, import_kwh_battery, import_kwh_house, export_kwh, soc_min, soc, soc_min_minute, battery_cycle, metric_keep, final_iboost, final_carbon_g)
+
+    def queue_run_prediction_single(self, charge_limit, charge_window, export_window, export_limits, pv_scenario, end_record, step):
+        """Queue a single-scenario prediction, returning a handle - the batch runs on the first get().
+
+        The window lists and dicts are read at flush time, not now, so the caller must not mutate
+        anything it passed in before calling get() on the returned handle.
+        """
+        charge_limit, export_limits = self._prepare_single(charge_limit, export_limits)
+        return self.enqueue_prediction(charge_limit, charge_window, export_window, export_limits, pv_scenario, end_record, step, self.prediction_cache_enable)
+
+    def thread_run_prediction_charge(self, try_soc, window_n, charge_limit, charge_window, export_window, export_limits, pv_scenario, all_n, end_record):
+        """Run one charge-window trial prediction now and return its result.
+
+        Nothing runs in a Python thread any more: this is the direct synchronous path, kept as the
+        reference the batch is checked against and as what a queued job falls back to when the kernel
+        will not take it.
+        """
+
+        try_charge_limit = self._prepare_charge(try_soc, window_n, charge_limit, all_n)
+
+        (
+            cost,
+            import_kwh_battery,
+            import_kwh_house,
+            export_kwh,
+            soc_min,
+            soc,
+            soc_min_minute,
+            battery_cycle,
+            metric_keep,
+            final_iboost,
+            final_carbon_g,
+            predict_soc,
+            car_charging_soc_next,
+            iboost_next,
+            iboost_running,
+            iboost_running_solar,
+            iboost_running_full,
+        ) = self.run_prediction(try_charge_limit, charge_window, export_window, export_limits, pv_scenario, end_record=end_record, cache=self.prediction_cache_enable)
         return (
             cost,
             import_kwh_battery,
@@ -258,17 +311,43 @@ class Prediction:
             final_carbon_g,
         )
 
-    def thread_run_prediction_charge_min_max(self, try_soc, window_n, charge_limit, charge_window, export_window, export_limits, pv10, all_n, end_record):
+    def queue_run_prediction_charge(self, try_soc, window_n, charge_limit, charge_window, export_window, export_limits, pv_scenario, all_n, end_record):
+        """Queue a charge-window trial prediction, returning a handle.
+
+        The window lists and dicts are read at flush time, not now, so the caller must not mutate
+        anything it passed in before calling get() on the returned handle.
         """
-        Run prediction in a thread
+        try_charge_limit = self._prepare_charge(try_soc, window_n, charge_limit, all_n)
+        return self.enqueue_prediction(try_charge_limit, charge_window, export_window, export_limits, pv_scenario, end_record, PREDICT_STEP, self.prediction_cache_enable)
+
+    def scan_soc_range(self, predict_soc, window):
+        """Return the (min, max) SoC across a charge window - shared by the direct and batch min/max paths.
+
+        The kernel computes the same range inline (see PkBatchJob.soc_range_start_step), so this is
+        only reached when a job falls back to the Python engine; the two must agree exactly, including
+        the clamping that collapses an empty range to a single value rather than leaving min above max.
+        """
+        min_soc = self.soc_max
+        max_soc = 0
+        predict_minute_start = max(int((window["start"] - self.minutes_now) / 5) * 5, 0)
+        predict_minute_end = int((window["end"] - self.minutes_now) / 5) * 5
+        for minute in range(predict_minute_start, predict_minute_end + 5, 5):
+            if minute in predict_soc:
+                min_soc = min(predict_soc[minute], min_soc)
+                max_soc = max(predict_soc[minute], max_soc)
+        max_soc = max(max_soc, min_soc)
+        min_soc = min(min_soc, max_soc)
+        return min_soc, max_soc
+
+    def thread_run_prediction_charge_min_max(self, try_soc, window_n, charge_limit, charge_window, export_window, export_limits, pv_scenario, all_n, end_record):
+        """Run one charge-window trial prediction now and return its result plus the SoC range.
+
+        Nothing runs in a Python thread any more: this is the direct synchronous path, kept as the
+        reference the batch is checked against and as what a queued job falls back to when the kernel
+        will not take it.
         """
 
-        try_charge_limit = charge_limit.copy()
-        if all_n:
-            for set_n in all_n:
-                try_charge_limit[set_n] = try_soc
-        else:
-            try_charge_limit[window_n] = try_soc
+        try_charge_limit = self._prepare_charge(try_soc, window_n, charge_limit, all_n)
 
         (
             cost,
@@ -288,19 +367,11 @@ class Prediction:
             iboost_running,
             iboost_running_solar,
             iboost_running_full,
-        ) = self.run_prediction(try_charge_limit, charge_window, export_window, export_limits, pv10, end_record=end_record, cache=False)
+        ) = self.run_prediction(try_charge_limit, charge_window, export_window, export_limits, pv_scenario, end_record=end_record, cache=False)
         min_soc = self.soc_max
         max_soc = 0
         if not all_n:
-            window = charge_window[window_n]
-            predict_minute_start = max(int((window["start"] - self.minutes_now) / 5) * 5, 0)
-            predict_minute_end = int((window["end"] - self.minutes_now) / 5) * 5
-            for minute in range(predict_minute_start, predict_minute_end + 5, 5):
-                if minute in predict_soc:
-                    min_soc = min(predict_soc[minute], min_soc)
-                    max_soc = max(predict_soc[minute], max_soc)
-            max_soc = max(max_soc, min_soc)
-            min_soc = min(min_soc, max_soc)
+            min_soc, max_soc = self.scan_soc_range(predict_soc, charge_window[window_n])
 
         return (
             cost,
@@ -318,11 +389,28 @@ class Prediction:
             max_soc,
         )
 
-    def thread_run_prediction_export(self, this_export_limit, start, window_n, charge_limit, charge_window, export_window, export_limits, pv10, all_n, end_record):
+    def queue_run_prediction_charge_min_max(self, try_soc, window_n, charge_limit, charge_window, export_window, export_limits, pv_scenario, all_n, end_record):
+        """Queue a charge-window trial prediction that also reports the SoC range across that window.
+
+        Uncached, exactly as the direct path is: the SoC range is not part of the cached result, so a
+        hit would answer with the wrong shape.
+
+        The window lists and dicts are read at flush time, not now, so the caller must not mutate
+        anything it passed in before calling get() on the returned handle.
         """
-        Run prediction in a thread
+        try_charge_limit = self._prepare_charge(try_soc, window_n, charge_limit, all_n)
+        range_window = None if all_n else charge_window[window_n]
+        return self.enqueue_prediction(try_charge_limit, charge_window, export_window, export_limits, pv_scenario, end_record, PREDICT_STEP, False, want_range=True, range_window=range_window)
+
+    def _prepare_export(self, this_export_limit, start, window_n, export_window, export_limits, all_n):
+        """Build the trial export limits and window list - shared by thread_run_prediction_export and the batch path.
+
+        The trial start is applied to a private copy of the window rather than written into the
+        caller's list: with a process pool each worker mutated its own unpickled copy, but a batched
+        fan-out shares one list across every job in the batch, so an in-place write would corrupt the
+        other trials of the same window. Only ["end"] is ever read back by the caller
+        (optimise_export), so nothing depends on the write being visible.
         """
-        # Store try value into the window
         export_limits = export_limits.copy()
 
         if all_n:
@@ -333,7 +421,19 @@ class Prediction:
             # Adjust start
             window = export_window[window_n]
             start = min(start, window["end"] - 5)
-            export_window[window_n]["start"] = start
+            export_window = list(export_window)
+            export_window[window_n] = dict(window, start=start)
+
+        return export_window, export_limits
+
+    def thread_run_prediction_export(self, this_export_limit, start, window_n, charge_limit, charge_window, export_window, export_limits, pv_scenario, all_n, end_record):
+        """Run one export-window trial prediction now and return its result.
+
+        Nothing runs in a Python thread any more: this is the direct synchronous path, kept as the
+        reference the batch is checked against and as what a queued job falls back to when the kernel
+        will not take it.
+        """
+        export_window, export_limits = self._prepare_export(this_export_limit, start, window_n, export_window, export_limits, all_n)
 
         (
             metricmid,
@@ -353,8 +453,17 @@ class Prediction:
             iboost_running,
             iboost_running_solar,
             iboost_running_full,
-        ) = self.run_prediction(charge_limit, charge_window, export_window, export_limits, pv10, end_record=end_record, cache=self.prediction_cache_enable)
+        ) = self.run_prediction(charge_limit, charge_window, export_window, export_limits, pv_scenario, end_record=end_record, cache=self.prediction_cache_enable)
         return metricmid, import_kwh_battery, import_kwh_house, export_kwh, soc_min, soc, soc_min_minute, battery_cycle, metric_keep, final_iboost, final_carbon_g
+
+    def queue_run_prediction_export(self, this_export_limit, start, window_n, charge_limit, charge_window, export_window, export_limits, pv_scenario, all_n, end_record):
+        """Queue an export-window trial prediction, returning a handle.
+
+        The window lists and dicts are read at flush time, not now, so the caller must not mutate
+        anything it passed in before calling get() on the returned handle.
+        """
+        export_window, export_limits = self._prepare_export(this_export_limit, start, window_n, export_window, export_limits, all_n)
+        return self.enqueue_prediction(charge_limit, charge_window, export_window, export_limits, pv_scenario, end_record, PREDICT_STEP, self.prediction_cache_enable)
 
     def find_charge_window_optimised(self, charge_windows, charge_limit, is_export=False):
         """
@@ -363,33 +472,66 @@ class Prediction:
         """
         charge_window_optimised = {}
         for window_n in range(len(charge_windows)):
+            # Hoisted out of the per-minute loop below: whether a window is active cannot change
+            # within it, and this runs for every minute of every window on the hot path.
+            if is_export:
+                active = export_mode_of(charge_limit[window_n]) != EXPORT_MODE_IDLE
+            else:
+                active = charge_limit[window_n] > 0.0
+            if not active:
+                continue
             for minute in range(charge_windows[window_n]["start"], charge_windows[window_n]["end"], PREDICT_STEP):
-                if is_export and charge_limit[window_n] < 100.0:
-                    charge_window_optimised[minute] = window_n
-                elif not is_export and charge_limit[window_n] > 0.0:
-                    charge_window_optimised[minute] = window_n
+                charge_window_optimised[minute] = window_n
         return charge_window_optimised
 
-    def run_prediction(self, charge_limit, charge_window, export_window, export_limits, pv10, end_record, save=None, step=PREDICT_STEP, cache=False):
+    def run_prediction(self, charge_limit, charge_window, export_window, export_limits, pv_scenario, end_record, save=None, step=PREDICT_STEP, cache=False):
         """
         Run a prediction scenario given a charge limit, return the results
+
+        PARITY RULE: The hot loop below is mirrored by the C++ kernel in prediction_kernel.cpp
+        for the scenarios it supports. Any behavioural change here MUST be mirrored there,
+        KERNEL_PARITY_REVISION (prediction_kernel.py) and PK_PARITY_REVISION (prediction_kernel.cpp)
+        must both be bumped, and the kernel_parity test must pass (cd coverage && ./run_all --test kernel_parity).
         """
-        window_hash = 0
-        for window in charge_window:
-            window_hash ^= hash(window["start"]) ^ hash(window["end"])
-        for window in export_window:
-            window_hash ^= hash(window["start"]) ^ hash(window["end"])
+        # A saving run publishes predict_soc_best and friends, and it is the only run that does. If a
+        # batch were left pending, the next handle read would flush it and reset_kernel_run_state
+        # would blank exactly those attributes, emptying the published plan and the debug HTML; a job
+        # flushed after its inputs were mutated would also be cached under a key hashed from the old
+        # ones, poisoning the shared cache. Draining first makes both impossible. Every fan-out site
+        # already drains its handles before saving, so this is the class defending its own invariant
+        # rather than a live fix - and it costs the ~250k non-save calls a single test of a local.
+        if save and self.pending_batch:
+            self.flush_batch()
 
-        sim_hash = hash(tuple(charge_limit)) ^ window_hash ^ hash(tuple(export_limits)) ^ hash(pv10) ^ hash(end_record) ^ hash(step)
+        # The cache key is only wanted when the cache is actually in play - a saving run always
+        # simulates - so it is not computed otherwise. Building it as one tuple hash keeps the
+        # per-window hashing in C rather than looping in Python, which matters because this runs on
+        # every simulation with a few hundred windows.
+        sim_hash = None
+        if cache and not save:
+            sim_hash = prediction_cache_key(charge_limit, charge_window, export_limits, export_window, pv_scenario, end_record, step)
+            cached_result = self.prediction_cache.get(sim_hash)
+            if cached_result is not None:
+                # Return cached result
+                return cached_result
 
-        if not save and cache and sim_hash in self.prediction_cache:
-            # Return cached result
-            return self.prediction_cache[sim_hash]
+        # Try the C++ prediction kernel first; unsupported scenarios fall through to the Python engine.
+        # The kernel understands all three pv_scenario values (see PkScenario.pv_scenario, ABI 3).
+        if kernel_supported(self, save, step):
+            kernel_result = run_prediction_kernel(self, charge_limit, charge_window, export_window, export_limits, pv_scenario, end_record, step, cache)
+            if kernel_result is not None:
+                if sim_hash is not None:
+                    # Store in cache without the SoC/car data to save memory, mirroring the Python engine
+                    self.prediction_cache[sim_hash] = kernel_result[:11] + ([], []) + kernel_result[13:]
+                return kernel_result
 
         # Fetch data from globals, optimised away from class to avoid passing it between threads
-        if pv10:
+        if pv_scenario == PV_SCENARIO_PV10:
             pv_forecast_minute_step = self.pv_forecast_minute10_step
             load_minutes_step = self.load_minutes_step10
+        elif pv_scenario == PV_SCENARIO_PV90:
+            pv_forecast_minute_step = self.pv_forecast_minute90_step
+            load_minutes_step = self.load_minutes_step90
         else:
             pv_forecast_minute_step = self.pv_forecast_minute_step
             load_minutes_step = self.load_minutes_step
@@ -475,6 +617,7 @@ class Prediction:
         iboost_running = self.iboost_running
         iboost_running_solar = self.iboost_running_solar
         iboost_running_full = self.iboost_running_full
+        car_load_energy_bypass = 0
 
         # Remove intersecting windows and optimise the data format of the charge/discharge window
         charge_limit, charge_window = remove_intersecting_windows(charge_limit, charge_window, export_limits, export_window)
@@ -497,16 +640,20 @@ class Prediction:
         enable_standing_charge = save and (save in ["best", "base", "base10", "best10", "test", "yesterday", "yesterday10"])
         enable_save_stats = save and (save in ["best", "test", "compare", "yesterday"])
         car_enable = self.num_cars > 0
+        car_energy_reported_load = self.car_energy_reported_load
         inverter_limit = self.inverter_limit * step
         export_limit = self.export_limit * step
+        pv_ac_limit = self.pv_ac_limit * step
         set_charge_low_power = self.set_charge_window and self.set_charge_low_power and (save in ["best", "best10", "test"])
         carbon_enable = self.carbon_enable
         reserve = self.reserve
         soc_max = self.soc_max
+        reserve_percent = calc_percent_limit(reserve, soc_max)
         battery_loss = self.battery_loss
         battery_loss_discharge = self.battery_loss_discharge
         battery_temperature_prediction = self.battery_temperature_prediction
         all_active_keep = self.all_active_keep
+        all_active_keep_max = self.all_active_keep_max
         best_soc_keep_weight = self.best_soc_keep_weight
         best_soc_keep_orig = self.best_soc_keep
         debug_enable = self.debug_enable
@@ -516,14 +663,22 @@ class Prediction:
         set_charge_window = self.set_charge_window
         set_export_window = self.set_export_window
         battery_rate_max_charge = self.battery_rate_max_charge
+        battery_rate_max_charge_dc = self.battery_rate_max_charge_dc
         battery_rate_max_discharge = self.battery_rate_max_discharge
-        battery_temperature_charge_curve = self.battery_temperature_charge_curve
+        battery_rate_max_export = self.battery_rate_max_export
         battery_rate_min = self.battery_rate_min
+        inverter_freeze_export_discharge_rate = self.inverter_freeze_export_discharge_rate
         carbon_intensity = self.carbon_intensity
         set_discharge_during_charge = self.set_discharge_during_charge
+        battery_charge_power_curve_tuple = charge_curve_to_tuple(self.battery_charge_power_curve)
+        battery_discharge_power_curve_tuple = charge_curve_to_tuple(self.battery_discharge_power_curve)
+        battery_temperature_charge_curve_tuple = charge_curve_to_tuple(self.battery_temperature_charge_curve)
+        battery_temperature_discharge_curve_tuple = charge_curve_to_tuple(self.battery_temperature_discharge_curve)
+        calculate_export_on_pv = self.calculate_export_on_pv
 
-        # For the PV10 case we apply some de-rating to the battery charge rate to be more pessimistic
-        if pv10:
+        # For the PV10 case we apply some de-rating to the battery charge rate to be more pessimistic.
+        # PV90 is the upside case and gets no de-rate.
+        if pv_scenario == PV_SCENARIO_PV10:
             battery_rate_max_scaling = self.battery_rate_max_scaling * self.charge_scaling10
         else:
             battery_rate_max_scaling = self.battery_rate_max_scaling
@@ -545,6 +700,15 @@ class Prediction:
             pv_forecast_minute_step_flat = pv_forecast_minute_step
             load_minutes_step_flat = load_minutes_step
 
+        # PV forecast remaining from each step to the end of the forecast, used to work out how much PV a charge
+        # window still overlaps with as low power charging must be abandoned when the sun is contributing
+        pv_remaining_kwh = {}
+        if set_charge_low_power:
+            pv_remaining = 0.0
+            for minute_step in range(((self.forecast_minutes - 1) // step) * step, -1, -step):
+                pv_remaining += pv_forecast_minute_step_flat.get(minute_step, 0.0)
+                pv_remaining_kwh[minute_step] = pv_remaining
+
         # Simulate each forward minute
         minute = 0
         while minute < self.forecast_minutes:
@@ -553,12 +717,13 @@ class Prediction:
             prev_soc = soc
             reserve_expected = reserve
             import_rate = rate_import.get(minute_absolute, 0)
-            if io_adjusted.get(minute_absolute, 0) and pv10 and minute > 30:
+            if io_adjusted.get(minute_absolute, 0) and pv_scenario == PV_SCENARIO_PV10 and minute > 30:
                 import_rate = self.rate_max  # Assume in worst case that slot goes away and max rate applies
             export_rate = rate_export.get(minute_absolute, 0)
 
             # Alert?
             alert_keep = all_active_keep.get(minute_absolute, 0)
+            alert_keep_max = all_active_keep_max.get(minute_absolute, -1)
 
             # Project battery temperature
             battery_temperature = battery_temperature_prediction.get(minute, self.battery_temperature)
@@ -577,18 +742,37 @@ class Prediction:
                 keep_minute_scaling = max(keep_minute_scaling, 10.0)
                 best_soc_keep = max(best_soc_keep, min(alert_keep / 100.0 * soc_max, soc_max))
 
+            # Soc max keep is a ceiling rather than a floor (e.g. manual_soc_max). A ceiling of 0% is a
+            # legitimate request (empty the battery for a BMS calibration), so absence is a negative
+            # sentinel rather than 0 - see all_active_keep_max in fetch.py.
+            best_soc_max = -1
+            if alert_keep_max >= 0:
+                keep_minute_scaling = max(keep_minute_scaling, 10.0)
+                best_soc_max = min(alert_keep_max / 100.0 * soc_max, soc_max)
+
             # Find charge & discharge windows
             charge_window_n = charge_window_optimised.get(minute_absolute, -1)
             export_window_n = export_window_optimised.get(minute_absolute, -1)
             charge_window_active = charge_window_n >= 0
             export_window_active = export_window_n >= 0
-            export_limit_now = export_limits[export_window_n] if export_window_active else 100.0
+            export_limit_now = export_limits[export_window_n] if export_window_active else IDLE_EXPORT_LIMIT
+            export_mode_now = export_mode_of(export_limit_now)
+            # The SoC floor this window exports down to. A target exports to its target field - not
+            # to the packed value, which also carries 1 - power in its fraction and so raised the
+            # floor by up to 0.7% of the battery for a slow export, stopping it slightly early for
+            # no reason connected to where the user asked it to stop. The two modes carry no target
+            # of their own and keep the floor their packed sentinels produced: 99% for a freeze
+            # (hold SoC) and 100% for an idle window, where the floor never binds.
+            if export_mode_now == EXPORT_MODE_TARGET:
+                export_limit_percent = export_target_of(export_limit_now)
+            else:
+                export_limit_percent = EXPORT_LIMIT_FREEZE if export_mode_now == EXPORT_MODE_FREEZE else EXPORT_LIMIT_IDLE
 
             # Find charge limit
             charge_limit_n = 0
             if charge_window_active:
                 charge_limit_n = charge_limit[charge_window_n]
-                if self.set_charge_freeze and (charge_limit_n == reserve):
+                if self.set_charge_freeze and (calc_percent_limit(charge_limit_n, soc_max) == reserve_percent):
                     # Charge freeze via reserve
                     charge_limit_n = max(soc, reserve)
 
@@ -639,14 +823,24 @@ class Prediction:
             # Count PV kWh
             pv_kwh += pv_now
 
+            # Clip PV for AC-coupled inverters with a PV AC limit (e.g. microinverters).
+            # For non-hybrid systems pv_dc=0 and inverter_loss_ac=1.0, so pv_ac == pv_now; clipping pv_now here is mathematically equivalent to clipping pv_ac in each branch.
+            if not inverter_hybrid and pv_ac_limit > 0 and pv_now > pv_ac_limit:
+                clipped_today += pv_now - pv_ac_limit
+                pv_now = pv_ac_limit
+
             # Modelling reset of charge/discharge rate
             if set_charge_window or set_export_window:
                 charge_rate_now = battery_rate_max_charge
                 discharge_rate_now = battery_rate_max_discharge
 
+            car_rate_premium = 0  # Extra cost above import_rate for beyond-cap IOG slots
+            car_amount_premium = 0  # Amount of energy in IOG slots that is above import_rate
+            car_load_energy_bypass = 0  # Amount of car energy bypassing the CT clamp
+
             # Simulate car charging
             if car_enable:
-                car_load = in_car_slot(minute_absolute, self.num_cars, self.car_charging_slots)
+                car_load, car_rate_slot = in_car_slot(minute_absolute, self.num_cars, self.car_charging_slots)
 
                 # Car charging?
                 for car_n in range(self.num_cars):
@@ -655,15 +849,25 @@ class Prediction:
                         car_load_scale = car_load_scale * self.car_charging_loss
                         car_load_scale = max(min(car_load_scale, self.car_charging_limit[car_n] - car_soc[car_n]), 0)
                         car_soc[car_n] = car_soc[car_n] + car_load_scale
-                        load_yesterday += car_load_scale / self.car_charging_loss
-                        # Model not allowing the car to charge from the battery
+
+                        # Work out the premium rate for car charging
+                        car_rate_premium = max(car_rate_premium, max(0, car_rate_slot[car_n] - import_rate))
+
+                        if self.car_energy_reported_load:
+                            # Only add load if the car is reporting it as load, otherwise its outside the CT Clamp
+                            car_amount_premium += car_load_scale / self.car_charging_loss
+                            load_yesterday += car_amount_premium
+                        else:
+                            car_load_energy_bypass += car_load_scale / self.car_charging_loss
+
+                        # Model not allowing the car to charge from the battery - applies regardless of
+                        # car_energy_reported_load, which only controls CT-clamp house-load inclusion
                         if (car_load_scale > 0) and (not self.car_charging_from_battery) and set_charge_window:
                             discharge_rate_now = battery_rate_min  # 0
 
             # Iboost
             iboost_rate_okay = True
             iboost_amount = 0
-            iboost_freeze = False
 
             # IBoost energy rate control
             if self.iboost_enable:
@@ -698,7 +902,6 @@ class Prediction:
 
                 # Freeze discharge on iboost
                 if iboost_amount > 0 and self.iboost_prevent_discharge and set_charge_window:
-                    iboost_freeze = True
                     discharge_rate_now = battery_rate_min  # 0
 
                 # Iboost running
@@ -720,12 +923,6 @@ class Prediction:
             # Count load
             load_kwh += load_yesterday
 
-            # discharge freeze, reset charge rate by default
-            if set_export_freeze:
-                # Freeze mode
-                if (export_window_active) and export_limit_now < 100.0 and (set_export_freeze and (export_limit_now == 99.0 or set_export_freeze_only)):
-                    charge_rate_now = battery_rate_min  # 0
-
             # Set discharge during charge?
             if charge_window_active:
                 if not set_discharge_during_charge:
@@ -734,10 +931,12 @@ class Prediction:
                     discharge_rate_now = battery_rate_min
 
             # Current real charge rate
-            charge_rate_now_curve = get_charge_rate_curve(soc, charge_rate_now, soc_max, battery_rate_max_charge, self.battery_charge_power_curve, battery_rate_min, battery_temperature, battery_temperature_charge_curve) * battery_rate_max_scaling
+            charge_rate_now_curve = (
+                get_charge_rate_curve_cached(round(soc, 1), charge_rate_now, soc_max, battery_rate_max_charge, battery_charge_power_curve_tuple, battery_rate_min, battery_temperature, battery_temperature_charge_curve_tuple) * battery_rate_max_scaling
+            )
             charge_rate_now_curve_step = charge_rate_now_curve * step
             discharge_rate_now_curve = (
-                get_discharge_rate_curve(soc, discharge_rate_now, soc_max, battery_rate_max_discharge, self.battery_discharge_power_curve, battery_rate_min, battery_temperature, self.battery_temperature_discharge_curve)
+                get_discharge_rate_curve_cached(round(soc, 1), discharge_rate_now, soc_max, battery_rate_max_discharge, battery_discharge_power_curve_tuple, battery_rate_min, battery_temperature, battery_temperature_discharge_curve_tuple)
                 * self.battery_rate_max_scaling_discharge
             )
             discharge_rate_now_curve_step = discharge_rate_now_curve * step
@@ -747,18 +946,17 @@ class Prediction:
 
             discharge_min = reserve
             if export_window_active:
-                discharge_min = max(soc_max * export_limit_now / 100.0, reserve, self.best_soc_min)
+                discharge_min = max(soc_max * export_limit_percent / 100.0, reserve, self.best_soc_min)
 
-            if not set_export_freeze_only and export_window_active and export_limit_now < 99.0 and (soc > discharge_min):
-                # Discharge enable
-                discharge_rate_now = battery_rate_max_discharge  # Assume discharge becomes enabled here
+            if not set_export_freeze_only and export_window_active and export_mode_now == EXPORT_MODE_TARGET and (soc > discharge_min):
+                # Discharge enable, capped at export limit
                 if self.set_export_low_power:
-                    export_rate_adjust = 1 - (export_limit_now - int(export_limit_now))
+                    export_rate_adjust = export_power_of(export_limit_now)
                 else:
                     export_rate_adjust = 1.0
-                discharge_rate_now = battery_rate_max_discharge * export_rate_adjust
+                discharge_rate_now = battery_rate_max_export * export_rate_adjust
                 discharge_rate_now_curve = (
-                    get_discharge_rate_curve(soc, discharge_rate_now, soc_max, battery_rate_max_discharge, self.battery_discharge_power_curve, battery_rate_min, battery_temperature, self.battery_temperature_discharge_curve)
+                    get_discharge_rate_curve_cached(round(soc, 1), discharge_rate_now, soc_max, battery_rate_max_export, battery_discharge_power_curve_tuple, battery_rate_min, battery_temperature, battery_temperature_discharge_curve_tuple)
                     * self.battery_rate_max_scaling_discharge
                 )
                 discharge_rate_now_curve_step = discharge_rate_now_curve * step
@@ -774,14 +972,39 @@ class Prediction:
                     over_limit = abs(diff) - export_limit
                     reduce_by = over_limit
 
-                    if reduce_by > battery_draw:
+                    # Compare the AC over-export against the battery's AC export contribution (battery_draw is DC,
+                    # so that is battery_draw * inverter_loss). If the surplus is larger then even stopping the
+                    # battery leaves PV over the limit, so we must charge to absorb it rather than clip the solar.
+                    if reduce_by > battery_draw * inverter_loss:
                         if self.inverter_can_charge_during_export:
-                            reduce_by = reduce_by - battery_draw
-                            battery_draw = max(-reduce_by * inverter_loss, -battery_to_min, -charge_rate_now_curve_step)
+                            # Stopping the battery only removes its AC export contribution (battery_draw is DC, so
+                            # that is battery_draw * inverter_loss). Whatever AC export is still over the limit has
+                            # to be absorbed by charging the battery.
+                            reduce_by = reduce_by - battery_draw * inverter_loss
+
+                            if inverter_hybrid:
+                                charge_rate_now_curve_dc = (
+                                    get_charge_rate_curve_cached(soc, battery_rate_max_charge_dc, soc_max, battery_rate_max_charge_dc, battery_charge_power_curve_tuple, battery_rate_min, battery_temperature, battery_temperature_charge_curve_tuple)
+                                    * battery_rate_max_scaling
+                                )
+                                charge_rate_now_curve_dc_step = charge_rate_now_curve_dc * step
+                                # Hybrid charges from PV on the DC side (see pv_dc below), so the AC surplus maps
+                                # back to DC through the loss reciprocal. Clamp by battery_to_max (remaining charge
+                                # headroom), not battery_to_min, otherwise a near-full battery is asked to absorb
+                                # more than it can hold and the surplus is mis-accounted instead of clipped.
+                                battery_draw = max(-reduce_by * inverter_loss_recp, -battery_to_max, -charge_rate_now_curve_dc_step)
+                            else:
+                                # Non-hybrid charges from the grid (AC), so the DC charge is the AC surplus * loss.
+                                battery_draw = max(-reduce_by * inverter_loss, -battery_to_max, -charge_rate_now_curve_step)
                         else:
                             battery_draw = 0
                     else:
-                        battery_draw = battery_draw - reduce_by
+                        # reduce_by is an AC over-export figure but battery_draw is DC and exports through
+                        # the inverter, so scale by the loss reciprocal to remove the right amount of grid
+                        # export. Subtracting the raw AC figure under-reduces the battery and leaves a small
+                        # residual that gets clipped off the solar later. Clamp at zero so we never flip to
+                        # charging here (that case is handled by the inverter_can_charge_during_export branch).
+                        battery_draw = max(battery_draw - reduce_by * inverter_loss_recp, 0)
 
                     if inverter_hybrid and battery_draw < 0:
                         pv_dc = min(abs(battery_draw), pv_now)
@@ -797,7 +1020,19 @@ class Prediction:
                             reduce_by = reduce_by - battery_draw
                             battery_draw = 0
                             if self.inverter_can_charge_during_export:
-                                battery_draw = max(-reduce_by * inverter_loss, -battery_to_min, -charge_rate_now_curve_step)
+                                charge_rate_now_curve_dc = (
+                                    get_charge_rate_curve_cached(soc, battery_rate_max_charge_dc, soc_max, battery_rate_max_charge_dc, battery_charge_power_curve_tuple, battery_rate_min, battery_temperature, battery_temperature_charge_curve_tuple)
+                                    * battery_rate_max_scaling
+                                )
+                                charge_rate_now_curve_dc_step = charge_rate_now_curve_dc * step
+                                # reduce_by here is in the same DC-equivalent throughput units as total_inverted
+                                # (get_total_inverted counts the battery and the PV diverted to DC 1:1), so the
+                                # battery must charge by reduce_by directly to bring total_inverted onto the
+                                # inverter limit - no inverter_loss factor. Multiplying by inverter_loss under-
+                                # charges and leaves PV to be clipped that the battery could have absorbed. Clamp
+                                # by battery_to_max (remaining charge headroom) so a near-full battery is not
+                                # asked to absorb more than it can hold.
+                                battery_draw = max(-reduce_by, -battery_to_max, -charge_rate_now_curve_dc_step)
                         else:
                             battery_draw = battery_draw - reduce_by
 
@@ -809,6 +1044,11 @@ class Prediction:
                         over_limit = total_inverted - inverter_limit
                         battery_draw = max(battery_draw - over_limit * inverter_loss, 0)
 
+                # If the configuration is to not calculate export on PV then score
+                # against this forced export to prevent it from appearing in the plan
+                if not calculate_export_on_pv and battery_draw > 0:
+                    metric_keep += pv_ac * export_rate * 5  # Give a strong incentive to use PV in this case
+
                 if battery_draw < 0:
                     battery_state = "f/"
                 else:
@@ -819,12 +1059,25 @@ class Prediction:
             elif charge_window_active and soc < charge_limit_n:
                 # Charge enable
                 # Only tune charge rate on final plan not every simulation
+                if inverter_hybrid and (battery_rate_max_charge_dc > battery_rate_max_charge):
+                    # For a hybrid inverter if the DC rate is higher than the max charge rate then we can use some of the extra for PV charging.
+                    pv_above = max((pv_now / step) - battery_rate_max_charge, 0)
+                    battery_rate_max_charge_combined = battery_rate_max_charge + min(battery_rate_max_charge_dc - battery_rate_max_charge, pv_above)
+                else:
+                    battery_rate_max_charge_combined = battery_rate_max_charge
+
+                # How much PV is still to come before this charge window closes?
+                pv_window_kwh = 0.0
+                if set_charge_low_power:
+                    window_end_step = min(max(((charge_window[charge_window_n]["end"] - self.minutes_now) // step) * step, minute), self.forecast_minutes)
+                    pv_window_kwh = pv_remaining_kwh.get(minute, 0.0) - pv_remaining_kwh.get(window_end_step, 0.0)
+
                 charge_rate_now, charge_rate_now_curve = find_charge_rate(
                     minute_absolute,
                     soc,
                     charge_window[charge_window_n],
                     charge_limit_n,
-                    battery_rate_max_charge,
+                    battery_rate_max_charge_combined,
                     soc_max,
                     self.battery_charge_power_curve,
                     set_charge_low_power,
@@ -834,7 +1087,10 @@ class Prediction:
                     battery_loss,
                     None,
                     battery_temperature,
-                    battery_temperature_charge_curve,
+                    self.battery_temperature_charge_curve,
+                    pv_window_kwh=pv_window_kwh,
+                    low_power_pv_threshold_w=self.low_power_pv_threshold_w,
+                    solar_full_rate=self.set_charge_low_power_solar_full_rate,
                 )
                 charge_rate_now_curve_step = charge_rate_now_curve * step
 
@@ -859,10 +1115,19 @@ class Prediction:
                         potential_import = min((charge_rate_now_curve * charge_time_remains) - pv_in_period, (charge_limit_n - soc))
                         metric_keep += max(potential_import * import_rate, 0)
             else:
-                # ECO Mode
+                # ECO Mode.
+                #
+                # Freeze Export is the same inverter mode with charging disabled: execute.py sets
+                # the charge rate to 0 (or pauses charging via the timed pause) and otherwise
+                # leaves the inverter in Demand/ECO mode, never touching the discharge rate. So it
+                # shares this flow with the charge rate zeroed, rather than being modelled by a
+                # parallel branch that has to re-derive the same AC balance. The old duplicate
+                # branch had drifted and pinned battery_draw at 0, wrongly modelling Freeze Export
+                # as Freeze Charge whenever load exceeded PV - see #4676.
+                freeze_export = set_export_freeze and export_window_active and export_mode_now != EXPORT_MODE_IDLE and (export_mode_now == EXPORT_MODE_FREEZE or set_export_freeze_only)
+
                 pv_ac = pv_now * inverter_loss_ac
                 pv_dc = 0
-                diff = get_diff(0, pv_dc, pv_ac, load_yesterday, inverter_loss, inverter_loss_recp)
 
                 potential_to_charge = pv_ac
                 required_for_load = load_yesterday
@@ -876,7 +1141,26 @@ class Prediction:
                     battery_draw = min(diff, discharge_rate_now_curve_step, inverter_limit, battery_to_min)
                     battery_state = "e-"
                 else:
-                    battery_draw = max(diff, -charge_rate_now_curve_step, -inverter_limit, -battery_to_max)
+                    # Battery draw is only subject to inverter limit for the AC part.
+                    # Freeze Export disables charging, so the battery holds rather than absorbing
+                    # the surplus - the #4207 recapture below is the only way it charges, and only
+                    # for the part of the surplus the export limit cannot take.
+                    charge_rate_scale = 0 if freeze_export else 1
+
+                    if inverter_hybrid:
+                        charge_rate_now_dc = battery_rate_max_charge_dc
+
+                        charge_rate_now_curve_dc = (
+                            get_charge_rate_curve_cached(soc, charge_rate_now_dc, soc_max, battery_rate_max_charge_dc, battery_charge_power_curve_tuple, battery_rate_min, battery_temperature, battery_temperature_charge_curve_tuple)
+                            * battery_rate_max_scaling
+                        )
+                        charge_rate_now_curve_dc_step = charge_rate_now_curve_dc * step * charge_rate_scale
+
+                        virtual_inverter_limit = inverter_limit + pv_now
+                        battery_draw = max(diff, -charge_rate_now_curve_dc_step, -virtual_inverter_limit, -battery_to_max)
+                    else:
+                        battery_draw = max(diff, -charge_rate_now_curve_step * charge_rate_scale, -inverter_limit, -battery_to_max)
+
                     if battery_draw < 0:
                         battery_state = "e+"
                     else:
@@ -887,6 +1171,52 @@ class Prediction:
                     else:
                         pv_dc = 0
                     pv_ac = (pv_now - pv_dc) * inverter_loss_ac
+
+                if freeze_export:
+                    # Genuine PV surplus beyond what load+export_limit can absorb still charges the
+                    # battery on inverters that implement a real "Feed-in First" mode (#4207) - e.g.
+                    # FoxESS prioritises load, then export, then the battery. Gated on
+                    # inverter_support_feedin_first: most inverters merely disable charging for
+                    # Freeze Export, so their surplus really is clipped and recapturing it here would
+                    # invent energy that never reaches the battery. Only the genuine overflow is
+                    # charged (not the full charge rate), so freeze still holds SoC flat whenever the
+                    # export limit alone can absorb all the surplus - matching the equivalent
+                    # recapture logic in the force export branch above.
+                    if diff < 0 and abs(diff) > export_limit and self.inverter_can_charge_during_export and self.inverter_support_feedin_first:
+                        over_limit = abs(diff) - export_limit
+                        if inverter_hybrid:
+                            charge_rate_now_curve_dc = (
+                                get_charge_rate_curve_cached(soc, battery_rate_max_charge_dc, soc_max, battery_rate_max_charge_dc, battery_charge_power_curve_tuple, battery_rate_min, battery_temperature, battery_temperature_charge_curve_tuple)
+                                * battery_rate_max_scaling
+                            )
+                            charge_rate_now_curve_dc_step = charge_rate_now_curve_dc * step
+                            battery_draw = max(-over_limit * inverter_loss_recp, -battery_to_max, -charge_rate_now_curve_dc_step)
+                        else:
+                            battery_draw = max(-over_limit * inverter_loss, -battery_to_max, -charge_rate_now_curve_step)
+
+                        if battery_draw < 0:
+                            pv_dc = min(abs(battery_draw), pv_now)
+                            pv_ac = (pv_now - pv_dc) * inverter_loss_ac
+
+                    # Some inverters (observed on AlphaESS) continue a small residual battery
+                    # discharge during Freeze Export instead of covering house load. Treat the
+                    # configured value as battery-side power and feed it into the normal AC balance:
+                    # house load consumes it first and any surplus may reach the grid. Configuring
+                    # this rate says the inverter leaks only this much rather than covering load, so
+                    # it replaces the shortfall discharge computed above.
+                    if inverter_freeze_export_discharge_rate > 0 and battery_draw >= 0:
+                        freeze_draw = min(inverter_freeze_export_discharge_rate * step * battery_loss_discharge, battery_to_min)
+                        freeze_diff = get_diff(freeze_draw, pv_dc, pv_ac, load_yesterday, inverter_loss, inverter_loss_recp)
+                        if freeze_diff < 0 and abs(freeze_diff) > export_limit:
+                            freeze_draw = max(freeze_draw - (abs(freeze_diff) - export_limit) * inverter_loss_recp, 0)
+                        battery_draw = freeze_draw
+
+                    if battery_draw < 0:
+                        battery_state = "fz+"
+                    elif battery_draw > 0:
+                        battery_state = "fz-"
+                    else:
+                        battery_state = "fz~"
 
             # Clamp at inverter limit
             if inverter_hybrid:
@@ -926,8 +1256,11 @@ class Prediction:
                 total_inverted = get_total_inverted(battery_draw, pv_dc, pv_ac, inverter_loss, inverter_hybrid)
                 if total_inverted > inverter_limit:
                     over_limit = total_inverted - inverter_limit
-                    clipped_today += over_limit
+                    pv_ac_before = pv_ac
                     pv_ac = max(pv_ac - over_limit * inverter_loss, 0)
+                    pv_ac_no_loss = max(pv_ac_before - over_limit, 0)
+                    clipped_today += pv_ac_before - pv_ac_no_loss
+                    total_inverted = get_total_inverted(battery_draw, pv_dc, pv_ac, inverter_loss, inverter_hybrid)
             else:
                 total_inverted = get_total_inverted(battery_draw, pv_dc, pv_ac, inverter_loss, inverter_hybrid)
                 if total_inverted > inverter_limit:
@@ -941,15 +1274,16 @@ class Prediction:
             diff = get_diff(battery_draw, pv_dc, pv_ac, load_yesterday, inverter_loss, inverter_loss_recp)
             if diff < 0 and abs(diff) > export_limit:
                 over_limit = abs(diff) - export_limit
-                clipped_today += over_limit
+                # Only solar PV is truly "clipped" (lost energy); excess battery discharge just gets limited
+                pv_ac_before = pv_ac
                 pv_ac = max(pv_ac - over_limit, 0)
+                clipped_today += pv_ac_before - pv_ac
 
             # Adjust battery soc
             if battery_draw > 0:
                 soc = max(soc - battery_draw / battery_loss_discharge, reserve_expected)
             else:
                 soc = min(soc - battery_draw * battery_loss, soc_max)
-            soc = round(soc, 6)
 
             # Iboost finally count
             if self.iboost_enable:
@@ -989,6 +1323,10 @@ class Prediction:
             if best_soc_keep > 0 and soc <= best_soc_keep:
                 metric_keep += (best_soc_keep - soc) * import_rate * keep_minute_scaling * step / 60.0
 
+            # Metric keep max - pretend the excess above the ceiling should have been exported instead of held
+            if best_soc_max >= 0 and soc >= best_soc_max:
+                metric_keep += (soc - best_soc_max) * export_rate * keep_minute_scaling * step / 60.0
+
             if diff > 0:
                 # Import
                 # All imports must go to home (no inverter loss) or to the battery (inverter loss accounted before above)
@@ -1004,7 +1342,10 @@ class Prediction:
                     # self.log("importing to minute %s amount %s kW total %s kWh total draw %s" % (minute, energy, import_kwh_house, diff))
                     import_kwh_house += diff
 
-                metric += import_rate * diff
+                # Account for premium for car charging in import metric
+                # but it can't be more than we actually imported from the grid.
+                car_amount_premium = min(diff, car_amount_premium)
+                metric += import_rate * diff + car_rate_premium * car_amount_premium
                 grid_state = "<"
             else:
                 # Export
@@ -1013,7 +1354,15 @@ class Prediction:
                 if carbon_enable:
                     carbon_g -= energy * carbon_intensity.get(minute, 0)
 
-                metric -= export_rate * energy
+                if not car_energy_reported_load:
+                    # If the car is not reporting load, but we export then this export can
+                    # end up in the car meaning we don't get the export profit.
+                    # We can't really value the car charging amount so we just assume its 0 value
+                    metric -= export_rate * max(0, energy - car_load_energy_bypass)
+                else:
+                    metric -= export_rate * energy
+
+                # Show the symbol
                 if diff != 0:
                     grid_state = ">"
                 else:
@@ -1067,8 +1416,11 @@ class Prediction:
                 predict_state[stamp] = "g" + grid_state + "b" + battery_state
                 predict_battery_power[stamp] = round(battery_draw * (60 / step), 3)
                 predict_battery_cycle[stamp] = round(battery_cycle, 3)
-                # Use plan_interval_minutes instead of hardcoded 30 for scaling
-                predict_pv_power[stamp] = round((pv_forecast_minute_step[minute] + pv_forecast_minute_step.get(minute + step, 0)) * (self.plan_interval_minutes / step), 3)
+                # Two consecutive `step`-sized energy chunks cover 2*step minutes; convert to an
+                # instantaneous kW reading with 60/(2*step) - a constant derived from `step` (the
+                # simulation's fixed PREDICT_STEP), not plan_interval_minutes, which is unrelated
+                # to how many raw steps are being summed here.
+                predict_pv_power[stamp] = round((pv_forecast_minute_step[minute] + pv_forecast_minute_step.get(minute + step, 0)) * (60 / (2 * step)), 3)
                 predict_grid_power[stamp] = round(diff * (60 / step), 3)
                 predict_load_power[stamp] = round(load_yesterday * (60 / step), 3)
                 if carbon_enable:
@@ -1119,12 +1471,12 @@ class Prediction:
             self.import_kwh_time = import_kwh_time
             self.export_kwh_time = export_kwh_time
 
-        if not save and cache:
+        if sim_hash is not None:
             self.prediction_cache[sim_hash] = (
                 round(final_metric, 4),
-                round(import_kwh_battery, 4),
-                round(import_kwh_house, 4),
-                round(export_kwh, 4),
+                round(final_import_kwh_battery, 4),
+                round(final_import_kwh_house, 4),
+                round(final_export_kwh, 4),
                 round(soc_min, 4),
                 round(final_soc, 4),
                 soc_min_minute,
@@ -1142,9 +1494,9 @@ class Prediction:
 
         return (
             round(final_metric, 4),
-            round(import_kwh_battery, 4),
-            round(import_kwh_house, 4),
-            round(export_kwh, 4),
+            round(final_import_kwh_battery, 4),
+            round(final_import_kwh_house, 4),
+            round(final_export_kwh, 4),
             round(soc_min, 4),
             round(final_soc, 4),
             soc_min_minute,
