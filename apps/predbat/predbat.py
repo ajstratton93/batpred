@@ -34,13 +34,13 @@ import hass as hass
 import pytz
 import asyncio
 
-THIS_VERSION = "v26.9.22.4"
+THIS_VERSION = "v26.9.23.0"
 
 # fmt: off
 PREDBAT_FILES = ["predbat.py", "hass.py", "config.py", "prediction.py", "gecloud.py", "utils.py", "inverter.py", "ha.py", "download.py", "web.py", "web_helper.py", "predheat.py", "futurerate.py", "octopus.py", "solcast.py", "execute.py", "plan.py", "fetch.py", "output.py", "userinterface.py", "energydataservice.py", "alertfeed.py", "compare.py", "db_manager.py", "db_engine.py", "plugin_system.py", "ohme.py", "components.py", "fox.py", "carbon.py", "web_mcp.py", "component_base.py"]
 # fmt: on
 
-from download import predbat_update_move, predbat_update_download, check_install
+from download import DEFAULT_PREDBAT_REPOSITORY, check_install, predbat_update_download, predbat_update_move, read_deploy_git_version
 
 # Only do the self-install/self-update logic if we are NOT compiled.
 if not IS_COMPILED:
