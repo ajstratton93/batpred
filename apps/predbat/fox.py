@@ -2361,8 +2361,7 @@ class FoxAPI(ComponentBase, OAuthMixin):
             if not pvs and not third_party:
                 self.set_arg("pv_power", [0])
             else:
-                self.set_arg("pv_today", [f"sensor.fox{n}_energy_generated" for n in [2,3]])
-                # self.set_arg("pv_power", [f"sensor.{self.prefix}_fox_{device}_pvpower" for device in pvs] + [f"sensor.{self.prefix}_fox_{device}_meterpower2" for device in third_party])
+                self.set_arg("pv_power", [f"sensor.{self.prefix}_fox_{device}_pvpower" for device in pvs] + [f"sensor.{self.prefix}_fox_{device}_meterpower2" for device in third_party])
         self.set_arg("load_power", [f"sensor.{self.prefix}_fox_{device}_loadspower" for device in batteries])
         self.set_arg("soc_percent", [f"sensor.{self.prefix}_fox_{device}_soc" for device in batteries])
         self.set_arg("soc_max", [f"sensor.{self.prefix}_fox_{device}_battery_capacity" for device in batteries])
