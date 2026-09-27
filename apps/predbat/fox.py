@@ -2343,7 +2343,7 @@ class FoxAPI(ComponentBase, OAuthMixin):
         # stays visible and manually settable. The modbus path is unaffected - it drives the work
         # mode through the service templates in templates/fox.yaml, which never set inverter_mode.
         # MAY NEED TO UNCOMMENT self.set_arg("inverter_mode", [f"select.{self.prefix}_fox_{device}_setting_workmode" for device in batteries])
-        self.set_arg("load_today", "sensor.daily_load_2")
+        self.set_arg("load_today", "sensor.house_load_today")
         # self.set_arg("load_today", [f"sensor.{self.prefix}_fox_{device}_loads" for device in batteries])
         self.set_arg("import_today", [f"sensor.{self.prefix}_fox_{device}_gridconsumption" for device in batteries])
         self.set_arg("export_today", [f"sensor.{self.prefix}_fox_{device}_feedin" for device in batteries])
