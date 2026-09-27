@@ -34,7 +34,7 @@ import hass as hass
 import pytz
 import asyncio
 
-THIS_VERSION = "v26.9.27.0"
+THIS_VERSION = "v26.9.27.1"
 THIS_VERSION_DISPLAY = THIS_VERSION
 
 # fmt: off
@@ -42,6 +42,7 @@ PREDBAT_FILES = ["predbat.py", "hass.py", "config.py", "prediction.py", "gecloud
 # fmt: on
 
 from download import DEFAULT_PREDBAT_REPOSITORY, check_install, predbat_update_download, predbat_update_move, read_deploy_git_version
+from const import MINUTE_WATT
 
 # Only do the self-install/self-update logic if we are NOT compiled.
 if not IS_COMPILED:
