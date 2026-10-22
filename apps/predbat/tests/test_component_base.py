@@ -343,9 +343,13 @@ def test_component_base_first_cleared_when_run_presets_api_started(my_predbat):
 
             task = asyncio.create_task(component.start())
 
-            # Wait long enough (sped up 100x by fast_sleep → ~2s real) for the component
-            # loop to advance past simulated seconds=60 so a steady-state run can occur.
-            await asyncio.sleep(200)
+            # Wait for the component loop to advance past simulated seconds=60 so a steady-state
+            # run can occur - polled, so it ends as soon as one has (about 0.65s real via
+            # fast_sleep) instead of always sitting out the full 200 simulated seconds.
+            for _ in range(200):
+                if any(flag is False for flag in component.first_flags):
+                    break
+                await asyncio.sleep(1)
 
             assert component.api_started, "Component should be started"
 
@@ -816,6 +820,27 @@ def test_component_base_discovery_entities_keeps_only_what_exists(my_predbat):
     return False
 
 
+def test_component_base_request_replan(my_predbat):
+    """
+    ComponentBase.request_replan() is how a component asks for the plan to be recomputed on the next
+    15 second tick, rather than a component reaching into base.update_pending itself. It sets only
+    update_pending - not plan_valid - so the recompute still weighs the current plan against the new one.
+    """
+    print("\n*** Test: ComponentBase.request_replan sets update_pending and logs why ***")
+    base = MockBase()
+    base.update_pending = False
+    base.plan_valid = True
+    component = TestComponent(base)
+
+    component.request_replan("dispatches changed")
+
+    assert base.update_pending is True, "request_replan should set update_pending"
+    assert base.plan_valid is True, "request_replan must not invalidate the current plan"
+    assert any("TestComponent" in msg and "dispatches changed" in msg for msg in base.log_messages), "request_replan should log the component and reason, got {}".format(base.log_messages)
+    print("PASS: request_replan sets update_pending, leaves plan_valid and logs the reason")
+    return False
+
+
 def test_component_base_all(my_predbat):
     """Run all component_base tests"""
     tests = [
@@ -840,6 +865,7 @@ def test_component_base_all(my_predbat):
         ("discovery_refresh_no_init", test_component_base_refresh_discovery_survives_a_component_built_without_init, "refresh_discovery does not raise on a component built without __init__"),
         ("discovery_refresh_live_state", test_component_base_refresh_discovery_refiles_when_live_state_behind_inverter_record_grows, "a report built from live state is re-filed when that state grows"),
         ("discovery_entities_filter", test_component_base_discovery_entities_keeps_only_what_exists, "discovery_entities keeps only entities that exist"),
+        ("request_replan", test_component_base_request_replan, "request_replan sets update_pending without invalidating the plan"),
     ]
 
     failed = []
