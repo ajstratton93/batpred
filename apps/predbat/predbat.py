@@ -36,7 +36,7 @@ import hass as hass
 import pytz
 import asyncio
 
-THIS_VERSION = "v26.10.22.0"
+THIS_VERSION = "v26.10.31.0"
 THIS_VERSION_DISPLAY = THIS_VERSION
 
 # fmt: off
