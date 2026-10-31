@@ -189,6 +189,7 @@ This setting will not impact the real calculated costs and is only used for plan
 **switch.predbat_metric_dynamic_load_adjust** (default False) is a toggle that when enabled allows Predbat to take into account your energy consumption within the last 5 minutes.
 If the load is above what your battery can deliver the plan is updated to predict this load will continue during the current slot, thus preventing forced export in the plan.
 If the load remains high for two checks in a row, this prediction is extended into the following slot too, so the plan stays up to date across the slot boundary.
+When **load_power** is set in apps.yaml, a high reading is only acted on if the live load power confirms it (at least 90% of the battery rate). Load energy sensors that only move in whole kWh, such as Solis, otherwise make each step look like a 12kW spike; the cost is that a genuine high load your load power sensor under-reads is ignored too. If the load power sensor has no reading, the energy sensor is used on its own as before.
 
 Checking Octopus Intelligent slots against whether the car is actually charging is a separate switch, **switch.predbat_octopus_intelligent_dynamic** - see [Checking Intelligent dispatches against the car](car-charging.md#checking-intelligent-dispatches-against-the-car).<BR>
 Whether or not this switch is On, if **car_charging_now** reports your car charging but no charging slot covers the current time, Predbat predicts the car's load at **input_number.predbat_car_charging_rate** until the end of the current slot, with the battery held for the car (unless **switch.predbat_car_charging_from_battery** is On) and no export planned over it. With the switch On, that load is also taken out of the recent-load reading above, so it is not counted twice.<BR>
@@ -256,6 +257,12 @@ A value of 0.1 assumes that 1 in every 10 times we will get the Solcast 10% scen
 Predbat estimates solar generation for each half-hour slot to be a pv_metric10_weight weighting of the Solcast 10% PV forecast to the Solcast Median forecast.<BR>
 A value of 0.15 (the default) is recommended. Do not enter a value above 1.0 (e.g. 30 for "30%") - Predbat will clamp it back into range and log a warning, but the resulting plan is likely to look very wrong in the meantime.
 
+When Predbat scores a forced export in the PV10% scenario it assumes the export stops at the target it would send to your inverter - the battery
+level the central forecast reaches by the end of that export - rather than draining the battery as far as the export rate allows.
+This matches what really happens: if the battery is lower than planned when the export starts, it reaches its target sooner, and the next replan
+shortens it. It lets Predbat keep some battery back from an evening export to cover a higher-load evening, where the central forecast alone would
+have exported it all. The PV90% scenario is not limited this way, as on a sunnier day a replan would export more rather than less.
+
 **switch.predbat_calculate_pv90_plan** (_performance tweaks_) enables the PV90% upside scenario described below - it is **On by default**.
 Turn it Off (after turning on **switch.predbat_performance_tweaks** to reveal it) and the PV90% scenario is not simulated at all, saving that
 planning time, regardless of what `pv_metric90_weight` is set to.
@@ -282,7 +289,10 @@ The history is scaled by `pv_scaling` before the comparison, so both sides are o
 (equivalently, divide your actual-over-raw ratio by `pv_scaling`); comparing against the raw figure on its own leaves your answer out by a factor of `pv_scaling`.<BR>
 Do not use if you are using the [Solcast integration and have turned on the integration's auto dampening](https://github.com/BJReplay/ha-solcast-solar?tab=readme-ov-file#dampening-configuration).<BR>
 PV production calibration relies upon your actual solar generation reflecting the maximum your panels could produce. If your inverter can curtail or clip your solar generation, either through export limits (including zero-export setups) where generation is throttled because your battery is full and there is nowhere for the excess to go, or under instruction from your electricity supplier in periods when there is excess electricity in the grid,
-then you must turn PV calibration Off. Otherwise, Predbat will model the chopped solar generation as a PV calibration factor and will significantly reduce your forecast PV generation, leading to a very inaccurate plan.
+then you must turn PV calibration Off. Otherwise, Predbat will model the chopped solar generation as a PV calibration factor and will significantly reduce your forecast PV generation, leading to a very inaccurate plan.<BR>
+Clipping at your inverter's own limit, where your panels can produce more than the inverter can pass, is handled automatically and does not need calibration turned off:
+generation at the inverter limit (`inverter_limit` for a hybrid inverter, or `pv_ac_limit` for an AC-coupled system) under a higher forecast is taken as the forecast having been right, rather than as the forecast being too high,
+so the forecast keeps the excess and Predbat can plan to make room in the battery for it. This relies on `inverter_limit` and `pv_ac_limit` being set correctly for your system.
 
 Note: If you change the PV calibration enable switch (to On or Off), you will need to restart Predbat for the change to take effect.
 
@@ -316,9 +326,9 @@ These are described in detail in [Car Charging](car-charging.md) and are listed 
 - **switch.predbat_car_charging_plan_smart** - allows Predbat to allocate car charging slots to the cheapest times rather than all low-rate slots in time order (default On)
 - **input_number.predbat_car_charging_plan_max_price** - maximum price per kWh to pay when charging your car
 - **switch.predbat_car_charging_from_battery** - prevent the car from draining the home battery when charging
-- **switch.predbat_car_charging_manual_soc** - ignore the **car_charging_soc** car SoC sensor set in `apps.yaml` (car 0)
+- **switch.predbat_car_charging_manual_soc** - ignore the **car_charging_soc** car SoC sensor set in `apps.yaml` and use the manual SoC instead (car 0)
 - **switch.predbat_car_charging_manual_soc_1/2/3** - ignore the **car_charging_soc** car SoC sensor for cars 1/2/3
-- **input_number.predbat_car_charging_manual_soc_kwh** - manually maintained car SoC in kWh (car 0, used if car SoC sensor is not available)
+- **input_number.predbat_car_charging_manual_soc_kwh** - manually maintained car SoC in kWh (car 0), used when the switch above is on, or when **car_charging_soc** is not set for the car and its charger has energy and plugged-in (**car_charging_plugged**) sensors. Otherwise, with a car SoC sensor, it shows the sensor's reading
 - **input_number.predbat_car_charging_manual_soc_kwh_1/2/3** - manually maintained car SoC in kWh for cars 1/2/3
 
 ## Calculation options
@@ -948,4 +958,4 @@ These are described in detail in [Updating Predbat](install.md#predbat-built-in-
 - **select.predbat_update** - List of Predbat software versions you can select to update Predbat to
 - **switch.predbat_auto_update** - When On, Predbat will automatically update itself as new releases are published on GitHub.
 
-Advanced: set `predbat_repository` in `apps.yaml` (format `owner/repo`) to source **main** updates from a fork instead of the default upstream repository. Versioned release options still use the official upstream repository.
+Advanced: the `predbat_repository` and `predbat_branch` settings in `apps.yaml` change where **main** is downloaded from and add branches to this drop-down, to test a fork or a branch. See [predbat_repository](apps-yaml.md#predbat_repository) and [predbat_branch](apps-yaml.md#predbat_branch). Versioned release options still use the official upstream repository.
